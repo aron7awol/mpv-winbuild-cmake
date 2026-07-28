@@ -1,0 +1,164 @@
+From 1fbd4c93aa4aba28d0549153988c5dfa11a0a534 Mon Sep 17 00:00:00 2001
+From: SK Player <noreply@example.com>
+Date: Mon, 27 Jul 2026 14:03:05 -0400
+Subject: [PATCH] video: expose Dolby Vision enhancement layer type as a
+ video-params property
+
+Profile 7 Dolby Vision streams carry an enhancement layer next to the HDR10
+base layer, in one of two forms: a MEL (minimum) EL carries only the
+metadata path and can be discarded without any visible change, while a FEL
+(full) EL carries real residual picture data and discarding it visibly
+alters the image.
+
+Nothing currently exposed distinguishes the two. The container-level
+configuration record only has el_present_flag, which is set for both, so
+track-list/N/dolby-vision-profile cannot answer the question either. Telling
+them apart today requires demuxing the RPU and running an external parser
+over it, which is a heavyweight answer to a question the decoder already has
+in hand -- the RPU header is already parsed by FFmpeg and handed to mpv on
+every frame.
+
+The distinguishing signal is the non-linear quantizer: a MEL EL omits NLQ
+entirely (AV_DOVI_NLQ_NONE) because it has no residual to quantize.
+
+Read it in mp_image_copy_attributes_from_av_frame() alongside the existing
+Dolby Vision handling, and surface it as video-params/dolby-vision-el-type,
+which reports fel or mel and is unavailable when the stream carries no
+enhancement layer.
+
+The field is dynamic per-frame metadata, like color.hdr, so it is
+deliberately excluded from mp_image_params_equal() -- it must not provoke a
+VO reconfigure -- and is propagated by mp_image_params_update_dynamic(),
+without which the property would keep reporting the first frame's value for
+the whole stream.
+---
+ DOCS/interface-changes/dovi-el-type.txt |  1 +
+ DOCS/man/input.rst                      | 10 ++++++++++
+ player/command.c                        |  3 +++
+ video/mp_image.c                        | 18 ++++++++++++++++++
+ video/mp_image.h                        | 16 ++++++++++++++++
+ 5 files changed, 48 insertions(+)
+ create mode 100644 DOCS/interface-changes/dovi-el-type.txt
+
+diff --git a/DOCS/interface-changes/dovi-el-type.txt b/DOCS/interface-changes/dovi-el-type.txt
+new file mode 100644
+index 000000000..bd0621ea3
+--- /dev/null
++++ b/DOCS/interface-changes/dovi-el-type.txt
+@@ -0,0 +1 @@
++add `video-params/dolby-vision-el-type` sub-property (`fel` or `mel`)
+diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
+index 2de04ff28..2c6dae9ac 100644
+--- a/DOCS/man/input.rst
++++ b/DOCS/man/input.rst
+@@ -2903,6 +2903,15 @@ Property list
+     ``video-params/avg-pq-y``
+         Average PQ luminance of a frame, as reported by peak detection (in PQ, 0-1)
+ 
++    ``video-params/dolby-vision-el-type``
++        Dolby Vision enhancement layer type of the current frame, as signalled
++        by the RPU. Either ``fel`` (full enhancement layer: carries residual
++        picture data, so discarding it visibly changes the image) or ``mel``
++        (minimum enhancement layer: metadata path only, discarding it is
++        visually lossless). Unavailable when the stream carries no enhancement
++        layer. Note ``track-list/N/dolby-vision-profile`` and the container's
++        ``el_present_flag`` cannot distinguish the two -- only the RPU can.
++
+     ``video-params/prim-red-x``, ``video-params/prim-red-y``
+         Red primary chromaticity coordinates, available only if differs from ``video-params/primaries``
+ 
+@@ -2951,6 +2960,7 @@ Property list
+             "scene-max-b"       MPV_FORMAT_DOUBLE
+             "max-pq-y"          MPV_FORMAT_DOUBLE
+             "avg-pq-y"          MPV_FORMAT_DOUBLE
++            "dolby-vision-el-type" MPV_FORMAT_STRING
+             "prim-red-x"        MPV_FORMAT_DOUBLE
+             "prim-red-y"        MPV_FORMAT_DOUBLE
+             "prim-green-x"      MPV_FORMAT_DOUBLE
+diff --git a/player/command.c b/player/command.c
+index a0dccf4a3..41c9b675b 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -2570,6 +2570,9 @@ static int property_imgparams(const struct mp_image_params *p, int action, void
+         {"scene-avg",   SUB_PROP_FLOAT(hdr->scene_avg),    .unavailable = !has_hdr10plus},
+         {"max-pq-y",    SUB_PROP_FLOAT(hdr->max_pq_y),     .unavailable = !has_cie_y},
+         {"avg-pq-y",    SUB_PROP_FLOAT(hdr->avg_pq_y),     .unavailable = !has_cie_y},
++        {"dolby-vision-el-type",
++            SUB_PROP_STR(p->dovi_el_type == MP_DOVI_EL_FEL ? "fel" : "mel"),
++            .unavailable = p->dovi_el_type == MP_DOVI_EL_NONE},
+         {"prim-red-x",   SUB_PROP_FLOAT(hdr->prim.red.x),  .unavailable = !custom_prim },
+         {"prim-red-y",   SUB_PROP_FLOAT(hdr->prim.red.y),  .unavailable = !custom_prim },
+         {"prim-green-x", SUB_PROP_FLOAT(hdr->prim.green.x),.unavailable = !custom_prim },
+diff --git a/video/mp_image.c b/video/mp_image.c
+index 1ce055580..5720f716c 100644
+--- a/video/mp_image.c
++++ b/video/mp_image.c
+@@ -900,6 +900,10 @@ void mp_image_params_update_dynamic(struct mp_image_params *dst,
+                                     bool has_peak_detect_values)
+ {
+     dst->repr.dovi = src->repr.dovi;
++    // EL type is per-frame RPU metadata, so it travels with the dynamic
++    // update rather than the static params; without this the property would
++    // keep reporting the value from the first frame of the stream.
++    dst->dovi_el_type = src->dovi_el_type;
+     // Don't overwrite peak-detected HDR metadata if available.
+     float max_pq_y = dst->color.hdr.max_pq_y;
+     float avg_pq_y = dst->color.hdr.avg_pq_y;
+@@ -1185,6 +1189,20 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
+     if (sd) {
+ #ifdef PL_HAVE_LAV_DOLBY_VISION
+         const AVDOVIMetadata *metadata = (const AVDOVIMetadata *)sd->buf->data;
++        // FEL vs MEL: the RPU's NLQ signalling is the only thing that
++        // distinguishes them. A MEL EL omits the non-linear quantizer
++        // entirely (AV_DOVI_NLQ_NONE) because it carries no residual;
++        // anything else means residual picture data is present, i.e. FEL.
++        // Read unconditionally -- it is independent of whether libplacebo
++        // ends up mapping the metadata below.
++        {
++            const AVDOVIRpuDataHeader *hdr = av_dovi_get_header(metadata);
++            if (hdr) {
++                dst->params.dovi_el_type =
++                    hdr->nlq_method_idc == AV_DOVI_NLQ_NONE ? MP_DOVI_EL_MEL
++                                                            : MP_DOVI_EL_FEL;
++            }
++        }
+ #if PL_API_VER < 364
+         const AVDOVIRpuDataHeader *header = av_dovi_get_header(metadata);
+         if (header->disable_residual_flag)
+diff --git a/video/mp_image.h b/video/mp_image.h
+index f5c156281..daf843ea1 100644
+--- a/video/mp_image.h
++++ b/video/mp_image.h
+@@ -38,6 +38,18 @@
+ #define MP_IMGFIELD_REPEAT_FIRST 0x04
+ #define MP_IMGFIELD_INTERLACED 0x20
+ 
++// Dolby Vision enhancement-layer type, as signalled by the RPU of the current
++// frame. A profile 7 stream carries an EL next to the HDR10 base layer: a MEL
++// ("minimum") EL carries only the metadata path, so dropping it costs nothing
++// visually, while a FEL ("full") EL carries real residual picture data. The
++// two cannot be told apart from the container-level configuration record --
++// el_present_flag is set for both -- only from the RPU's NLQ signalling.
++enum mp_dovi_el_type {
++    MP_DOVI_EL_NONE = 0,        // no EL, or not a Dolby Vision stream
++    MP_DOVI_EL_MEL,             // EL present, no residual (NLQ absent)
++    MP_DOVI_EL_FEL,             // EL present, carries residual picture data
++};
++
+ // Describes image parameters that usually stay constant.
+ // New fields can be added in the future. Code changing the parameters should
+ // usually copy the whole struct, so that fields added later will be preserved.
+@@ -63,6 +75,10 @@ struct mp_image_params {
+     int rotate;
+     enum mp_stereo3d_mode stereo3d; // image is encoded with this mode
+     struct mp_rect crop;        // crop applied on image
++    // Dolby Vision EL type of the current frame. Dynamic per-frame metadata
++    // like color.hdr, so it is deliberately NOT part of
++    // mp_image_params_equal() -- it must not trigger a VO reconfigure.
++    enum mp_dovi_el_type dovi_el_type;
+     // Flags for f_enhancement_pair.c to not inherit flags from EL.
+     bool no_dovi;
+     bool no_enhancement_layer;
+-- 
+2.54.0.windows.1
+
