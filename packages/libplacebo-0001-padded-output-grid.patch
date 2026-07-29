@@ -1,0 +1,50 @@
+From 88f7f89161a8e3efca20b304778ea3b05549bd38 Mon Sep 17 00:00:00 2001
+From: SK_Player <noreply@example.com>
+Date: Wed, 29 Jul 2026 13:26:20 -0400
+Subject: [PATCH] renderer: quantize padded output consistently
+
+The MSB-aligned output path explicitly rounds to the storage grid, while
+LSB-aligned padded output relies on the render target's implicit UNORM
+conversion. On Vulkan and D3D11, the two rounding operations can disagree by
+one code value, breaking the guarantee that equivalent 10-bit encodings
+produce identical values.
+
+Quantize both alignments explicitly when color depth is smaller than sample
+depth. The resulting storage values remain aligned correctly and the P010 low
+padding bits remain zero.
+---
+ src/renderer.c | 20 ++++++++++++++------
+ 1 file changed, 14 insertions(+), 6 deletions(-)
+
+diff --git a/src/renderer.c b/src/renderer.c
+index df206b2b..f2fa8913 100644
+--- a/src/renderer.c
++++ b/src/renderer.c
+@@ -3060,13 +3060,21 @@ static bool pass_output_target(struct pass_state *pass)
+         const int bit_shift = target->repr.bits.bit_shift;
+         const int sample_depth = PL_DEF(target->repr.bits.sample_depth,
+                                         target->repr.bits.color_depth);
+-        // Snap MSB-aligned formats (e.g. P010) to the sample grid, so the unused
+-        // low bits are zero instead of carrying sub-LSB error.
+-        if (bit_shift > 0 && bit_shift < sample_depth) {
+-            const float grid = ((1ull << sample_depth) - 1) /
+-                               (float) (1ull << bit_shift);
++        const int color_depth = PL_DEF(target->repr.bits.color_depth,
++                                       target->repr.bits.sample_depth);
++        // Snap padded formats to their storage grid explicitly. Doing this for
++        // both LSB- and MSB-aligned encodings avoids backend-dependent ties
++        // between GLSL round() and the render target's implicit UNORM
++        // conversion, while keeping unused low bits zero for formats like P010.
++        if (color_depth < sample_depth && bit_shift >= 0 &&
++            bit_shift + color_depth <= sample_depth)
++        {
++            const uint64_t alignment = 1ull << bit_shift;
++            const float storage_max = (1ull << sample_depth) - 1;
++            const float grid = storage_max / alignment;
+             GLSL("color.%s = round(color.%s * "$") * "$"; \n",
+-                 comps, comps, SH_FLOAT(grid / scale), SH_FLOAT(1.0f / grid));
++                 comps, comps, SH_FLOAT(grid / scale),
++                 SH_FLOAT(alignment / storage_max));
+         } else {
+             GLSL("color.%s *= vec%d(1.0 / "$"); \n",
+                  comps, num_comps, SH_FLOAT(scale));
