@@ -1,0 +1,213 @@
+From 638162bb1e94fe4d8a84b8dd2c31ab87a3422397 Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Wed, 29 Jul 2026 16:20:53 -0400
+Subject: [PATCH] screenshot: optionally preserve native colorspace in raw
+ output
+
+---
+ DOCS/interface-changes.rst |  1 +
+ DOCS/man/input.rst         | 13 ++++++++++++-
+ player/command.c           |  2 ++
+ player/screenshot.c        | 38 +++++++++++++++++++++++++++++---------
+ player/screenshot.h        |  3 ++-
+ video/image_loader.c       |  2 +-
+ 6 files changed, 47 insertions(+), 12 deletions(-)
+
+diff --git a/DOCS/interface-changes.rst b/DOCS/interface-changes.rst
+index 230a5b5..ffaffd5 100644
+--- a/DOCS/interface-changes.rst
++++ b/DOCS/interface-changes.rst
+@@ -184,6 +184,7 @@ Interface changes
+     - add `hearing-impaired`, `visual-impaired` and `attached-picture` flags to
+       track add command
+     - add `format` argument to `screenshot-raw` command
++    - add `native_csp` argument and color-space fields to `screenshot-raw`
+     - add `display-page-n-toggle` script bindings to stats.lua, where n is a
+       page number
+     - add `demuxer-mkv-crop-compat` option
+diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
+index 5d3b9e4..397be36 100644
+--- a/DOCS/man/input.rst
++++ b/DOCS/man/input.rst
+@@ -1520,7 +1520,7 @@ Screenshot Commands
+     Like all input command parameters, the filename is subject to property
+     expansion as described in `Property Expansion`_.
+ 
+-``screenshot-raw [<flags> [<format>]]``
++``screenshot-raw [<flags> [<format> [<native_csp>]]]``
+     Return a screenshot in memory. This can be used only through the client API
+     or from a script using ``mp.command_native``. The MPV_FORMAT_NODE_MAP
+     returned by this command has the ``w``, ``h``, ``stride`` fields set to
+@@ -1543,10 +1543,21 @@ Screenshot Commands
+         When this format is used, the image data will be high bit depth, and
+         ``--screenshot-high-bit-depth`` is ignored.
+ 
++    If ``native_csp`` is set to ``yes``, preserve the video's native color
++    space when converting the screenshot to RGB instead of converting it to
++    sRGB. For HDR analysis, use this with ``rgba64`` and
++    ``--screenshot-sw=yes``. For example, PQ video is returned as PQ-encoded
++    RGB and can be converted to absolute luminance with the ST 2084 EOTF.
++    The default is ``no``, which preserves the command's existing behavior.
++
+     The ``data`` field is of type MPV_FORMAT_BYTE_ARRAY with the actual image
+     data. The image is freed as soon as the result mpv_node is freed. As usual
+     with client API semantics, you are not allowed to write to the image data.
+ 
++    The ``colormatrix``, ``colorlevels``, ``primaries``, ``gamma``, and
++    ``light`` fields describe the returned RGB data using the same names as
++    the corresponding ``video-params`` sub-properties.
++
+     The ``stride`` is the number of bytes from a pixel at ``(x0, y0)`` to the
+     pixel at ``(x0, y0 + 1)``. This can be larger than ``w * bpp`` if the image
+     was cropped, or if there is padding. This number can be negative as well.
+diff --git a/player/command.c b/player/command.c
+index 5df0837..98173f4 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -7732,6 +7732,8 @@ const struct mp_cmd_def mp_cmds[] = {
+                 {"rgba", 2},
+                 {"rgba64", 3}),
+                 OPTDEF_INT(0)},
++             {"native_csp", OPT_BOOL(v.b), OPTDEF_INT(0),
++                .flags = MP_CMD_OPT_ARG},
+         },
+     },
+     { "loadfile", cmd_loadfile,
+diff --git a/player/screenshot.c b/player/screenshot.c
+index d21a53a..c51c6cb 100644
+--- a/player/screenshot.c
++++ b/player/screenshot.c
+@@ -339,7 +339,7 @@ static void add_osd(struct MPContext *mpctx, struct mp_image *image, int mode)
+ }
+ 
+ static struct mp_image *screenshot_get(struct MPContext *mpctx, int mode,
+-                                       bool high_depth)
++                                       bool high_depth, bool native_csp)
+ {
+     struct mp_image *image = NULL;
+     const struct image_writer_opts *imgopts = mpctx->opts->screenshot_image_opts;
+@@ -360,7 +360,7 @@ static struct mp_image *screenshot_get(struct MPContext *mpctx, int mode,
+         .subs = subs,
+         .osd = osd,
+         .high_bit_depth = high_depth && imgopts->high_bit_depth,
+-        .native_csp = image_writer_flexible_csp(imgopts),
++        .native_csp = native_csp || image_writer_flexible_csp(imgopts),
+     };
+     if (!use_sw)
+         vo_control(mpctx->video_out, VOCTRL_SCREENSHOT, &ctrl);
+@@ -426,7 +426,8 @@ static struct mp_image *screenshot_get(struct MPContext *mpctx, int mode,
+ }
+ 
+ struct mp_image *convert_image(struct mp_image *image, int destfmt,
+-                               struct mpv_global *global, struct mp_log *log)
++                               bool native_csp, struct mpv_global *global,
++                               struct mp_log *log)
+ {
+     int d_w, d_h;
+     mp_image_params_get_dsize(&image->params, &d_w, &d_h);
+@@ -438,6 +439,12 @@ struct mp_image *convert_image(struct mp_image *image, int destfmt,
+         .p_w = 1,
+         .p_h = 1,
+     };
++    if (native_csp) {
++        p.color = image->params.color;
++        p.repr = image->params.repr;
++        p.chroma_location = image->params.chroma_location;
++        p.crop = (struct mp_rect){0, 0, d_w, d_h};
++    }
+     mp_image_params_guess_csp(&p);
+ 
+     if (mp_image_params_equal(&p, &image->params))
+@@ -470,12 +477,13 @@ struct mp_image *convert_image(struct mp_image *image, int destfmt,
+ 
+ // mode is the same as in screenshot_get()
+ static struct mp_image *screenshot_get_rgb(struct MPContext *mpctx, int mode,
+-                                           bool high_depth, enum mp_imgfmt format)
++                                           bool high_depth, bool native_csp,
++                                           enum mp_imgfmt format)
+ {
+-    struct mp_image *mpi = screenshot_get(mpctx, mode, high_depth);
++    struct mp_image *mpi = screenshot_get(mpctx, mode, high_depth, native_csp);
+     if (!mpi)
+         return NULL;
+-    struct mp_image *res = convert_image(mpi, format, mpctx->global,
++    struct mp_image *res = convert_image(mpi, format, native_csp, mpctx->global,
+                                          mpctx->log);
+     talloc_free(mpi);
+     return res;
+@@ -493,7 +501,7 @@ void cmd_screenshot_to_file(void *p)
+     if (format)
+         opts.format = format;
+     bool high_depth = image_writer_high_depth(&opts);
+-    struct mp_image *image = screenshot_get(mpctx, mode, high_depth);
++    struct mp_image *image = screenshot_get(mpctx, mode, high_depth, false);
+     if (!image) {
+         mp_cmd_msg(cmd, MSGL_ERR, "Taking screenshot failed.");
+         cmd->success = false;
+@@ -537,7 +545,7 @@ void cmd_screenshot(void *p)
+     struct image_writer_opts *opts = mpctx->opts->screenshot_image_opts;
+     bool high_depth = image_writer_high_depth(opts);
+ 
+-    struct mp_image *image = screenshot_get(mpctx, mode, high_depth);
++    struct mp_image *image = screenshot_get(mpctx, mode, high_depth, false);
+ 
+     if (image) {
+         char *filename = gen_fname(cmd, image_writer_file_ext(opts));
+@@ -568,8 +576,10 @@ void cmd_screenshot_raw(void *p)
+     mp_assert(idx >= 0 && idx <= 3);
+ 
+     bool high_depth = formats[idx] == IMGFMT_RGBA64;
++    bool native_csp = cmd->args[2].v.b;
+     struct mp_image *img = screenshot_get_rgb(mpctx, cmd->args[0].v.i,
+-                                              high_depth, formats[idx]);
++                                              high_depth, native_csp,
++                                              formats[idx]);
+     if (!img) {
+         cmd->success = false;
+         return;
+@@ -580,6 +590,16 @@ void cmd_screenshot_raw(void *p)
+     node_map_add_int64(res, "h", img->h);
+     node_map_add_int64(res, "stride", img->stride[0]);
+     node_map_add_string(res, "format", format_names[idx]);
++    node_map_add_string(res, "colormatrix",
++        m_opt_choice_str(pl_csp_names, img->params.repr.sys));
++    node_map_add_string(res, "colorlevels",
++        m_opt_choice_str(pl_csp_levels_names, img->params.repr.levels));
++    node_map_add_string(res, "primaries",
++        m_opt_choice_str(pl_csp_prim_names, img->params.color.primaries));
++    node_map_add_string(res, "gamma",
++        m_opt_choice_str(pl_csp_trc_names, img->params.color.transfer));
++    node_map_add_string(res, "light",
++        m_opt_choice_str(mp_csp_light_names, img->params.light));
+     struct mpv_byte_array *ba =
+         node_map_add(res, "data", MPV_FORMAT_BYTE_ARRAY)->u.ba;
+     *ba = (struct mpv_byte_array){
+diff --git a/player/screenshot.h b/player/screenshot.h
+index 97abc79..2638c4b 100644
+--- a/player/screenshot.h
++++ b/player/screenshot.h
+@@ -36,7 +36,8 @@ void handle_each_frame_screenshot(struct MPContext *mpctx);
+  * If global!=NULL, use command line scaler options etc.
+  */
+ struct mp_image *convert_image(struct mp_image *image, int destfmt,
+-                               struct mpv_global *global, struct mp_log *log);
++                               bool native_csp, struct mpv_global *global,
++                               struct mp_log *log);
+ 
+ // Handlers for the user-facing commands.
+ void cmd_screenshot(void *p);
+diff --git a/video/image_loader.c b/video/image_loader.c
+index ba4d62a..26e4362 100644
+--- a/video/image_loader.c
++++ b/video/image_loader.c
+@@ -38,7 +38,7 @@ struct mp_image *load_image_png_buf(void *buffer, size_t buffer_size, int imgfmt
+     if (frame && avcodec_receive_frame(avctx, frame) >= 0) {
+         struct mp_image *r = mp_image_from_av_frame(frame);
+         if (r)
+-            res = convert_image(r, imgfmt, NULL, mp_null_log);
++            res = convert_image(r, imgfmt, false, NULL, mp_null_log);
+         talloc_free(r);
+     }
+     av_frame_free(&frame);
+-- 
+2.55.0
