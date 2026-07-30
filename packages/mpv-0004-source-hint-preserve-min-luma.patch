@@ -1,0 +1,34 @@
+From 8c0ff53d4295fa05901404a85d769b1380aef00d Mon Sep 17 00:00:00 2001
+From: MPV-SK <mpv-sk@local>
+Date: Thu, 30 Jul 2026 00:00:00 -0400
+Subject: [PATCH] vo_gpu_next: preserve source hint minimum luminance
+
+target-contrast describes the target display and is useful for rendering,
+notably target-contrast=inf for an OLED. Applying it to a source colorspace
+hint also rewrites the source mastering-display minimum luminance to 1e-7,
+which violates the documented source passthrough behavior.
+
+Continue applying target contrast to target-mode hints, but leave source and
+source-dynamic metadata unchanged. Target contrast remains active on the
+render target through apply_target_options().
+---
+ video/out/vo_gpu_next.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -1412,7 +1412,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+         }
+         if (hint.hdr.max_cll && hint.hdr.max_fall > hint.hdr.max_cll)
+             hint.hdr.max_fall = 0;
+-        apply_target_contrast(p, &hint, hint.hdr.min_luma);
++        // Source hint modes promise source metadata passthrough. Target
++        // contrast still applies to rendering via apply_target_options().
++        if (p->next_opts->target_hint_mode == 0)
++            apply_target_contrast(p, &hint, hint.hdr.min_luma);
+         if (p->icc_profile)
+             hint = p->icc_profile->csp;
+         if (opts->icc_opts->icc_use_luma) {
+-- 
+2.50.1

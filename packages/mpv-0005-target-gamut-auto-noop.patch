@@ -1,0 +1,56 @@
+From 4b1f7c9d0e2a3b5c6d7e8f9a0b1c2d3e4f5a6b70 Mon Sep 17 00:00:00 2001
+From: MPV-SK <mpv-sk@local>
+Date: Thu, 30 Jul 2026 00:00:00 -0400
+Subject: [PATCH] vo_gpu_next: ignore unparsable --target-gamut values
+
+--target-gamut is a string option and both use sites gate on
+`if (opts->target_gamut)`, so any non-empty value is an active override.
+`auto` parses to PL_COLOR_PRIM_UNKNOWN, which has no entry in libplacebo's
+raw-primaries table, so mp_parse_raw_primaries() yields all-zero primaries.
+Those zeros are written into the render target and into the colorspace hint,
+and the hint's mastering-display primaries are forwarded to the display (on
+Windows through SetHDRMetaData), producing invalid HDR metadata rather than
+the intended "no gamut constraint".
+
+Parse into a temporary and assign only when the result is a valid primaries
+triangle, so `--target-gamut=auto` - and any other unrecognised value - is a
+no-op instead of silent metadata corruption.
+---
+ video/out/vo_gpu_next.c | 16 ++++++++++++----
+ 1 file changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -1112,8 +1112,12 @@ static void apply_target_options(struct priv *p, struct pl_frame *target,
+     }
+     if ((!target->color.hdr.min_luma || !hint))
+         apply_target_contrast(p, &target->color, min_luma);
+-    if (opts->target_gamut)
+-        mp_parse_raw_primaries(mp_null_log, opts->target_gamut, &target->color.hdr.prim);
++    if (opts->target_gamut) {
++        struct pl_raw_primaries tmp = {0};
++        mp_parse_raw_primaries(mp_null_log, opts->target_gamut, &tmp);
++        if (pl_primaries_valid(&tmp))
++            target->color.hdr.prim = tmp;
++    }
+     int dither_depth = opts->dither_depth;
+     if (dither_depth == 0) {
+         struct ra_swapchain *sw = p->ra_ctx->swapchain;
+@@ -1390,8 +1394,12 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+         }
+         if (opts->target_prim)
+             hint.primaries = opts->target_prim;
+-        if (opts->target_gamut)
+-            mp_parse_raw_primaries(mp_null_log, opts->target_gamut, &hint.hdr.prim);
++        if (opts->target_gamut) {
++            struct pl_raw_primaries tmp = {0};
++            mp_parse_raw_primaries(mp_null_log, opts->target_gamut, &tmp);
++            if (pl_primaries_valid(&tmp))
++                hint.hdr.prim = tmp;
++        }
+         if (opts->target_trc)
+             hint.transfer = opts->target_trc;
+         if (opts->target_peak)
+-- 
+2.50.1
