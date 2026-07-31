@@ -28,7 +28,9 @@ ExternalProject_Add(mpv
     GIT_TAG 74356c0fc669d21af9daac5a11f296123efd0684
     SOURCE_DIR ${SOURCE_LOCATION}
     GIT_CLONE_FLAGS "--filter=tree:0"
-    PATCH_COMMAND ${EXEC} git am --3way ${CMAKE_CURRENT_SOURCE_DIR}/mpv-*.patch
+    PATCH_COMMAND bash -c "git am --abort 2>/dev/null || true"
+    COMMAND ${EXEC} git reset --hard 74356c0fc669d21af9daac5a11f296123efd0684
+    COMMAND ${EXEC} git am --3way ${CMAKE_CURRENT_SOURCE_DIR}/mpv-*.patch
     UPDATE_COMMAND ""
     CONFIGURE_COMMAND ${EXEC} CONF=1 meson setup <BINARY_DIR> <SOURCE_DIR>
         --prefix=${MINGW_INSTALL_PREFIX}
