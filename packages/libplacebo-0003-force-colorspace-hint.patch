@@ -1,0 +1,130 @@
+From cf7c982ec8e9be9741dd974bba127dd23758d4e4 Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Sat, 1 Aug 2026 01:58:40 -0400
+Subject: [PATCH] d3d11: allow forcing an unchanged colorspace hint
+
+---
+ src/d3d11/swapchain.c              | 16 ++++++++++++----
+ src/include/libplacebo/swapchain.h |  5 +++++
+ src/swapchain.c                    | 21 +++++++++++++++++++++
+ src/swapchain.h                    |  1 +
+ 4 files changed, 39 insertions(+), 4 deletions(-)
+
+diff --git a/src/d3d11/swapchain.c b/src/d3d11/swapchain.c
+index 33237041..66250d9e 100644
+--- a/src/d3d11/swapchain.c
++++ b/src/d3d11/swapchain.c
+@@ -377,7 +377,7 @@ static enum DXGI_FORMAT pick_format(pl_swapchain sw,
+ 
+ static void update_swapchain_color_config(pl_swapchain sw,
+                                           const struct pl_color_space *csp,
+-                                          bool is_internal)
++                                          bool is_internal, bool force)
+ {
+     struct priv *p = PL_PRIV(sw);
+     struct d3d11_ctx *ctx = p->ctx;
+@@ -403,7 +403,7 @@ static void update_swapchain_color_config(pl_swapchain sw,
+ 
+     pick_colorspace(sw, &csp_map, csp, swapchain3);
+ 
+-    if (p->csp_map.d3d11_fmt == csp_map.d3d11_fmt &&
++    if (!force && p->csp_map.d3d11_fmt == csp_map.d3d11_fmt &&
+         p->csp_map.d3d11_csp == csp_map.d3d11_csp &&
+         pl_color_space_equal(&p->csp_map.out_csp, &csp_map.out_csp))
+         goto cleanup;
+@@ -432,7 +432,14 @@ static void d3d11_sw_colorspace_hint(pl_swapchain sw,
+                                      const struct pl_color_space *csp)
+ {
+     if (csp->transfer != PL_COLOR_TRC_UNKNOWN)
+-        update_swapchain_color_config(sw, csp, false);
++        update_swapchain_color_config(sw, csp, false, false);
++}
++
++static void d3d11_sw_colorspace_hint_force(pl_swapchain sw,
++                                           const struct pl_color_space *csp)
++{
++    if (csp->transfer != PL_COLOR_TRC_UNKNOWN)
++        update_swapchain_color_config(sw, csp, false, true);
+ }
+ 
+ IDXGISwapChain *pl_d3d11_swapchain_unwrap(pl_swapchain sw)
+@@ -447,6 +454,7 @@ static const struct pl_sw_fns d3d11_swapchain = {
+     .latency         = d3d11_sw_latency,
+     .resize          = d3d11_sw_resize,
+     .colorspace_hint = d3d11_sw_colorspace_hint,
++    .colorspace_hint_force = d3d11_sw_colorspace_hint_force,
+     .start_frame     = d3d11_sw_start_frame,
+     .submit_frame    = d3d11_sw_submit_frame,
+     .swap_buffers    = d3d11_sw_swap_buffers,
+@@ -658,7 +666,7 @@ pl_swapchain pl_d3d11_create_swapchain(pl_d3d11 d3d11,
+ 
+     p->csp_map.d3d11_fmt = scd.BufferDesc.Format;
+ 
+-    update_swapchain_color_config(sw, &pl_color_space_srgb, true);
++    update_swapchain_color_config(sw, &pl_color_space_srgb, true, false);
+ 
+     success = true;
+ error:
+diff --git a/src/include/libplacebo/swapchain.h b/src/include/libplacebo/swapchain.h
+index b53aa5c1..0f25cae0 100644
+--- a/src/include/libplacebo/swapchain.h
++++ b/src/include/libplacebo/swapchain.h
+@@ -80,6 +80,11 @@ PL_API bool pl_swapchain_resize(pl_swapchain sw, int *width, int *height);
+ // PL_COLOR_TRC_UNKNOWN, then it instead defaults to PL_COLOR_TRC_PQ.
+ PL_API void pl_swapchain_colorspace_hint(pl_swapchain sw, const struct pl_color_space *csp);
+ 
++// Reapply an unchanged colorspace and its HDR metadata. This is useful after
++// downstream presentation state has been invalidated without a new hint.
++PL_API void pl_swapchain_colorspace_hint_force(pl_swapchain sw,
++                                               const struct pl_color_space *csp);
++
+ // The struct used to hold the results of `pl_swapchain_start_frame`
+ struct pl_swapchain_frame {
+     // A texture representing the framebuffer users should use for rendering.
+diff --git a/src/swapchain.c b/src/swapchain.c
+index 47faf7ba..1a62ad3c 100644
+--- a/src/swapchain.c
++++ b/src/swapchain.c
+@@ -72,6 +72,27 @@ void pl_swapchain_colorspace_hint(pl_swapchain sw, const struct pl_color_space *
+     impl->colorspace_hint(sw, &fix);
+ }
+ 
++void pl_swapchain_colorspace_hint_force(pl_swapchain sw,
++                                        const struct pl_color_space *csp)
++{
++    const struct pl_sw_fns *impl = PL_PRIV(sw);
++    if (!impl->colorspace_hint)
++        return;
++
++    struct pl_swapchain_colors fix = pl_color_space_srgb;
++    if (csp) {
++        fix = *csp;
++        if (fix.primaries != PL_COLOR_PRIM_UNKNOWN ||
++            fix.transfer != PL_COLOR_TRC_UNKNOWN)
++            pl_color_space_infer(&fix);
++    }
++
++    if (impl->colorspace_hint_force)
++        impl->colorspace_hint_force(sw, &fix);
++    else
++        impl->colorspace_hint(sw, &fix);
++}
++
+ bool pl_swapchain_start_frame(pl_swapchain sw,
+                               struct pl_swapchain_frame *out_frame)
+ {
+diff --git a/src/swapchain.h b/src/swapchain.h
+index 934a2b98..dae2892f 100644
+--- a/src/swapchain.h
++++ b/src/swapchain.h
+@@ -32,6 +32,7 @@ struct pl_sw_fns {
+     SW_PFN(latency); // optional
+     SW_PFN(resize); // optional
+     SW_PFN(colorspace_hint); // optional
++    SW_PFN(colorspace_hint_force); // optional
+     SW_PFN(start_frame);
+     SW_PFN(submit_frame);
+     SW_PFN(swap_buffers);
+-- 
+2.54.0.windows.1
+
