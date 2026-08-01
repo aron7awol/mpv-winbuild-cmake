@@ -1,0 +1,66 @@
+From c38854d7decc56f3b76c1e9e974c1602d6a2e5a3 Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Fri, 31 Jul 2026 22:31:03 -0400
+Subject: [PATCH] win32: force dark theme for native menus
+
+---
+ video/out/w32_common.c | 21 ++++++++-------------
+ 1 file changed, 8 insertions(+), 13 deletions(-)
+
+diff --git a/video/out/w32_common.c b/video/out/w32_common.c
+index ba4f382..2245f23 100644
+--- a/video/out/w32_common.c
++++ b/video/out/w32_common.c
+@@ -79,7 +79,6 @@ EXTERN_C IMAGE_DOS_HEADER __ImageBase;
+ #define WM_SHOWMENU (WM_USER + 1)
+ 
+ struct w32_api {
+-    BOOLEAN (WINAPI *pShouldAppsUseDarkMode)(void);
+     DWORD (WINAPI *pSetPreferredAppMode)(DWORD mode);
+ };
+ 
+@@ -1161,25 +1160,23 @@ static void update_corners_pref(const struct vo_w32_state *w32)
+                           &pref, sizeof(pref));
+ }
+ 
+-// Follow Windows settings and update dark mode state
++// Force dark mode and update dark mode state
+ // Microsoft documented how to enable dark mode for title bar:
+ // https://learn.microsoft.com/windows/apps/desktop/modernize/apply-windows-themes
+ // https://learn.microsoft.com/windows/win32/api/dwmapi/ne-dwmapi-dwmwindowattribute
+ // Documentation says to set the DWMWA_USE_IMMERSIVE_DARK_MODE attribute to
+ // TRUE to honor dark mode for the window, FALSE to always use light mode. While
+ // in fact setting it to TRUE causes dark mode to be always enabled, regardless
+-// of the settings. Since it is quite unlikely that it will be fixed, just use
+-// UxTheme API to check if dark mode should be applied and while at it enable it
+-// fully. Ideally this function should only call the DwmSetWindowAttribute(),
+-// but it just doesn't work as documented.
++// of the settings. Since it is quite unlikely that it will be fixed, use the
++// UxTheme API to force dark mode for native controls and popup menus as well.
++// High-contrast mode remains authoritative and disables the forced theme.
+ static void update_dark_mode(const struct vo_w32_state *w32)
+ {
+-    if (w32->api.pSetPreferredAppMode)
+-        w32->api.pSetPreferredAppMode(1); // allow dark mode
++    const BOOL use_dark_mode = !is_high_contrast();
+ 
+-    // if pShouldAppsUseDarkMode is not available, just assume it to be true
+-    const BOOL use_dark_mode = !is_high_contrast() && (!w32->api.pShouldAppsUseDarkMode ||
+-                                                       w32->api.pShouldAppsUseDarkMode());
++    if (w32->api.pSetPreferredAppMode)
++        // PreferredAppMode: Default = 0, ForceDark = 2.
++        w32->api.pSetPreferredAppMode(use_dark_mode ? 2 : 0);
+ 
+     SetWindowTheme(w32->window, use_dark_mode ? L"DarkMode_Explorer" : L"", NULL);
+ 
+@@ -2028,8 +2025,6 @@ static void w32_api_load(struct vo_w32_state *w32)
+     // number is good enough check.
+     HMODULE uxtheme_dll = !check_windows10_build(17763) ? NULL :
+                 GetModuleHandle(L"uxtheme.dll");
+-    w32->api.pShouldAppsUseDarkMode = !uxtheme_dll ? NULL :
+-                (void *)GetProcAddress(uxtheme_dll, MAKEINTRESOURCEA(132));
+     w32->api.pSetPreferredAppMode = !uxtheme_dll ? NULL :
+                 (void *)GetProcAddress(uxtheme_dll, MAKEINTRESOURCEA(135));
+ }
+-- 
+2.55.0
