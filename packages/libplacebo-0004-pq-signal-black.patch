@@ -1,0 +1,31 @@
+From cac28699a9f8766a6d28cd5737b8b43f4531b1f0 Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Sun, 2 Aug 2026 00:52:48 -0400
+Subject: [PATCH] colorspace: use PQ signal black for tone input
+
+---
+ src/shaders/colorspace.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
+index 4a1fa61c..7821c84d 100644
+--- a/src/shaders/colorspace.c
++++ b/src/shaders/colorspace.c
+@@ -1835,6 +1835,15 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+         .out_avg    = &tone.input_avg,
+     ));
+ 
++    // HDR10 mastering-display minimum luminance describes the mastering
++    // display, not the darkest representable PQ signal. Do not use MinMDL as
++    // a hard lower bound for the tone-mapping curve: PQ code zero is absolute
++    // black. Keep src.hdr.min_luma intact for metadata propagation.
++    if (src.transfer == PL_COLOR_TRC_PQ) {
++        tone.input_min = pl_hdr_rescale(PL_HDR_NITS, tone.input_scaling,
++                                        PL_COLOR_HDR_BLACK);
++    }
++
+     pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
+         .color      = &dst,
+         .metadata   = PL_HDR_METADATA_HDR10,
+-- 
+2.54.0.windows.1
