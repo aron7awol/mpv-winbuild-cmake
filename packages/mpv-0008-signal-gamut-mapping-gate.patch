@@ -1,0 +1,56 @@
+From b2dfbe050e84f393d1e787c2070f931e52ed8c2b Mon Sep 17 00:00:00 2001
+From: MPV-SK <mpv-sk@local>
+Date: Sat, 1 Aug 2026 23:54:21 -0400
+Subject: [PATCH] vo_gpu_next: gate gamut mapping on signal primaries
+
+---
+ video/out/vo_gpu_next.c | 34 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 33 insertions(+), 1 deletion(-)
+
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index f84d73d..48dd15d 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -1484,7 +1484,39 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+     bool strict_sw_params = target_hint && p->next_opts->target_hint_strict;
+     apply_target_options(p, &target, hint.hdr.min_luma, strict_sw_params,
+                          target_ref_luma, &target_csp);
+-    bool clip_gamut = pl_primaries_valid(&target.color.hdr.prim);
++
++    // Mastering primaries describe the source, not a requested output gamut.
++    // When the signal gamuts match and --target-gamut was not explicitly set,
++    // keep the renderer's destination gamut identical to the source mastering
++    // gamut. This prevents metadata alone from activating gamut mapping while
++    // leaving real signal-gamut conversions and explicit target constraints
++    // on the existing path below.
++    bool explicit_target_gamut = false;
++    if (opts->target_gamut) {
++        struct pl_raw_primaries gamut = {0};
++        mp_parse_raw_primaries(mp_null_log, opts->target_gamut, &gamut);
++        explicit_target_gamut = pl_primaries_valid(&gamut);
++    }
++
++    bool preserve_source_gamut = false;
++    if (!explicit_target_gamut && frame->current) {
++        struct pl_color_space source_color = frame->current->params.color;
++        struct pl_color_space target_color = target.color;
++        pl_color_space_infer(&source_color);
++        pl_color_space_infer(&target_color);
++
++        const struct pl_raw_primaries source_signal =
++            *pl_raw_primaries_get(source_color.primaries);
++        const struct pl_raw_primaries target_signal =
++            *pl_raw_primaries_get(target_color.primaries);
++        if (pl_raw_primaries_equal(&source_signal, &target_signal)) {
++            target.color.hdr.prim = source_color.hdr.prim;
++            preserve_source_gamut = true;
++        }
++    }
++
++    bool clip_gamut = !preserve_source_gamut &&
++                      pl_primaries_valid(&target.color.hdr.prim);
+ #if PL_API_VER >= 362
+     clip_gamut = clip_gamut && target.color.transfer != PL_COLOR_TRC_SCRGB;
+ #endif
+-- 
+2.55.0
