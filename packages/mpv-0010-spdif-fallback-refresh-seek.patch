@@ -1,0 +1,36 @@
+From bb3a30196a90930bbb450853307e1153759cdf2e Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Mon, 3 Aug 2026 12:00:00 -0400
+Subject: [PATCH] audio: refresh input after passthrough fallback
+
+When an audio endpoint rejects an SPDIF format, the packet used to establish
+that format has already been consumed by the passthrough decoder. Reinitializing
+the decoder for PCM and resetting the output chain can then leave startup
+waiting indefinitely for new decoder input. A user seek incidentally recovers
+playback by supplying that input.
+
+Queue an exact refresh seek after the one-way SPDIF-to-PCM fallback. This
+replays from the current position, lets the PCM decoder initialize immediately,
+and cannot loop because spdif_passthrough is disabled before the seek.
+---
+ player/audio.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/player/audio.c b/player/audio.c
+index b3e975d..bb3a301 100644
+--- a/player/audio.c
++++ b/player/audio.c
+@@ -475,6 +475,11 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
+                 goto init_error;
+             reset_audio_state(mpctx);
+             mp_output_chain_reset_harder(ao_c->filter);
++            // The packet which established the passthrough format was consumed
++            // by the old decoder. Replay from the current position so the new
++            // PCM decoder always receives input, even if no later packet wakes
++            // the output chain on its own.
++            issue_refresh_seek(mpctx, MPSEEK_EXACT);
+             mp_wakeup_core(mpctx); // reinit with new format next time
+             return 0;
+         }
+-- 
+2.50.1.windows.1
