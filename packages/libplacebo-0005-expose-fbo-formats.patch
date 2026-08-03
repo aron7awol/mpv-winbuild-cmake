@@ -1,0 +1,63 @@
+From 4c5ff1080df34a3694ea50c2eb9c7901f8fbe2e8 Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Sun, 2 Aug 2026 16:35:00 -0400
+Subject: [PATCH] renderer: expose effective intermediate FBO formats
+
+---
+ src/include/libplacebo/renderer.h |  5 +++++
+ src/renderer.c                    | 10 ++++++++++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/src/include/libplacebo/renderer.h b/src/include/libplacebo/renderer.h
+index 08466bd3..e5751998 100644
+--- a/src/include/libplacebo/renderer.h
++++ b/src/include/libplacebo/renderer.h
+@@ -73,6 +73,11 @@ PL_API void pl_renderer_destroy(pl_renderer *rr);
+ // Returns current renderer state, see pl_render_errors.
+ PL_API struct pl_render_errors pl_renderer_get_errors(pl_renderer rr);
+ 
++// Returns the effective intermediate FBO formats selected by the most recent
++// render pass, indexed by component count minus one. Entries are NULL until a
++// render pass initializes them, or when FBO rendering is unavailable.
++PL_API void pl_renderer_get_fbo_formats(pl_renderer rr, pl_fmt out_formats[4]);
++
+ // Clears errors state of renderer. If `errors` is NULL, all render errors will
+ // be cleared. Otherwise only selected errors/hooks will be cleared.
+ // If `PL_RENDER_ERR_HOOKS` is set and `num_disabled_hooks` is 0, clear all hooks.
+diff --git a/src/renderer.c b/src/renderer.c
+index f2fa8913..31b7e20f 100644
+--- a/src/renderer.c
++++ b/src/renderer.c
+@@ -61,6 +61,9 @@ struct pl_renderer_t {
+     // Cached feature checks (inverted)
+     enum pl_render_error errors;
+ 
++    // Effective intermediate formats from the most recently initialized pass.
++    pl_fmt fbo_formats[4];
++
+     // List containing signatures of disabled hooks
+     PL_ARRAY(uint64_t) disabled_hooks;
+ 
+@@ -3541,6 +3544,8 @@ static bool pass_init(struct pass_state *pass, bool acquire_image)
+         goto error;
+ 
+     find_fbo_format(pass);
++    memcpy(pass->rr->fbo_formats, &pass->fbofmt[1],
++           sizeof(pass->rr->fbo_formats));
+     pass_fix_frames(pass);
+ 
+     pass->tmp = pl_tmp(NULL);
+@@ -4392,6 +4397,11 @@ struct pl_render_errors pl_renderer_get_errors(pl_renderer rr)
+     };
+ }
+ 
++void pl_renderer_get_fbo_formats(pl_renderer rr, pl_fmt out_formats[4])
++{
++    memcpy(out_formats, rr->fbo_formats, sizeof(rr->fbo_formats));
++}
++
+ void pl_renderer_reset_errors(pl_renderer rr,
+                               const struct pl_render_errors *errors)
+ {
+-- 
+2.54.0.windows.1

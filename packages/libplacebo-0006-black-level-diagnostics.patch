@@ -1,0 +1,380 @@
+From 261f82d381fd0b5eda33939822ac45ab53e297d0 Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Sun, 2 Aug 2026 16:37:14 -0400
+Subject: [PATCH] colorspace: add opt-in black-level diagnostics
+
+---
+ meson.build              |   1 +
+ meson_options.txt        |   3 +
+ src/shaders/colorspace.c | 312 +++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 316 insertions(+)
+
+diff --git a/meson.build b/meson.build
+index 7801d57a..3832230b 100644
+--- a/meson.build
++++ b/meson.build
+@@ -407,6 +407,7 @@ conf_public.set('apiver', apiver)
+ conf_internal.set('BUILD_API_VER', apiver)
+ conf_internal.set('BUILD_FIX_VER', fixver)
+ conf_internal.set('PL_DEBUG_ABORT', get_option('debug-abort'))
++conf_internal.set('PL_BLACK_LEVEL_DIAGNOSTICS', get_option('black-level-diagnostics'))
+ 
+ 
+ ### Global build options
+diff --git a/meson_options.txt b/meson_options.txt
+index 95a96c73..d5754471 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -56,3 +56,6 @@ option('xxhash', type: 'feature', value: 'auto',
+ 
+ option('debug-abort', type: 'boolean', value: false,
+        description: 'abort() on most runtime errors (only for debugging purposes)')
++
++option('black-level-diagnostics', type: 'boolean', value: false,
++       description: 'enable private black-level diagnostics (development only)')
+diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
+index 7821c84d..8fc3363b 100644
+--- a/src/shaders/colorspace.c
++++ b/src/shaders/colorspace.c
+@@ -1056,6 +1056,13 @@ static const struct pl_buffer_var peak_buf_vars[] = {
+ };
+ 
+ struct sh_color_map_obj {
++#ifdef PL_BLACK_LEVEL_DIAGNOSTICS
++    struct {
++        uint64_t signature;
++        bool valid;
++    } blkdiag;
++#endif
++
+     // Tone map state
+     struct {
+         struct pl_tone_map_params params;
+@@ -1094,6 +1101,303 @@ static uint64_t gamut_map_signature(const struct pl_gamut_map_params *par)
+     return sig;
+ }
+ 
++#ifdef PL_BLACK_LEVEL_DIAGNOSTICS
++// Private MPV-SK diagnostic. These are synthetic neutral PQ signals injected
++// after decoding/range reconstruction; they are not source YUV or DV codes.
++struct blkdiag_probe {
++    float tone;
++    float direct[3];
++    float lut[3];
++    float encoded[3];
++};
++
++static bool blkdiag_finite3(const float v[3])
++{
++    return isfinite(v[0]) && isfinite(v[1]) && isfinite(v[2]);
++}
++
++static bool blkdiag_tone(float *out, float x,
++                         const struct pl_tone_map_params *tone,
++                         bool need, bool can_fast)
++{
++    if (!isfinite(x) || !isfinite(tone->input_min) ||
++        !isfinite(tone->input_max) || !isfinite(tone->output_min) ||
++        !isfinite(tone->output_max))
++        return false;
++    if (!need) {
++        *out = x;
++        return true;
++    }
++    if (tone->function == &pl_tone_map_clip && can_fast) {
++        *out = PL_CLAMP(x, tone->input_min, tone->input_max);
++        return isfinite(*out);
++    }
++    if (tone->function == &pl_tone_map_linear && can_fast) {
++        const float range = tone->input_max - tone->input_min;
++        if (!(range > 0.0f) || !isfinite(range) ||
++            !isfinite(tone->constants.exposure))
++            return false;
++        const float gain = tone->constants.exposure / range;
++        x = PL_CLAMP(gain * (x - tone->input_min), 0.0f, 1.0f);
++        *out = x * (tone->output_max - tone->output_min) + tone->output_min;
++        return isfinite(*out);
++    }
++    const float range = tone->input_max - tone->input_min;
++    if (!(range > 0.0f) || !isfinite(range) || tone->lut_size < 2 ||
++        tone->lut_size > (1 << 20))
++        return false;
++    float *lut = pl_alloc(NULL, (size_t) tone->lut_size * sizeof(*lut));
++    pl_tone_map_generate(lut, tone);
++    const float pos = PL_CLAMP((x - tone->input_min) / range, 0.0f, 1.0f);
++    const float grid = pos * (tone->lut_size - 1);
++    const int lo = floorf(grid);
++    const int hi = PL_MIN(lo + 1, tone->lut_size - 1);
++    *out = PL_MIX(lut[lo], lut[hi], grid - lo);
++    pl_free(lut);
++    return isfinite(*out);
++}
++
++static float blkdiag_unpack(const float *lut, size_t idx, int comp)
++{
++    const float x = lut[idx + comp];
++    if (comp == 0)
++        return roundf(x * UINT16_MAX) / UINT16_MAX;
++    const uint16_t q = roundf(x * UINT16_MAX + (UINT16_MAX >> 1));
++    return q / (float) UINT16_MAX - 32768.0f / 65535.0f;
++}
++
++static bool blkdiag_gamut_lut(float out[3], const float *lut,
++                              const struct pl_gamut_map_params *gamut,
++                              const float ipt[3])
++{
++    const float range = gamut->max_luma - gamut->min_luma;
++    const int size[3] = {gamut->lut_size_I, gamut->lut_size_C,
++                         gamut->lut_size_h};
++    if (!(range > 0.0f) || !isfinite(range) || !blkdiag_finite3(ipt) ||
++        size[0] < 2 || size[1] < 2 || size[2] < 2 ||
++        gamut->lut_stride < 3)
++        return false;
++    float pos[3] = {
++        (ipt[0] - gamut->min_luma) / range,
++        2.0f * hypotf(ipt[1], ipt[2]),
++        0.5f / M_PI * atan2f(ipt[2], ipt[1]) + 0.5f,
++    };
++    if (!blkdiag_finite3(pos))
++        return false;
++    int lo[3], hi[3];
++    float mix[3];
++    for (int d = 0; d < 3; d++) {
++        const float grid = PL_CLAMP(pos[d], 0.0f, 1.0f) * (size[d] - 1);
++        lo[d] = floorf(grid);
++        hi[d] = PL_MIN(lo[d] + 1, size[d] - 1);
++        mix[d] = grid - lo[d];
++    }
++    for (int comp = 0; comp < 3; comp++) {
++        out[comp] = 0.0f;
++        for (int z = 0; z < 2; z++) for (int y = 0; y < 2; y++)
++            for (int x = 0; x < 2; x++) {
++                const int ii = x ? hi[0] : lo[0];
++                const int cc = y ? hi[1] : lo[1];
++                const int hh = z ? hi[2] : lo[2];
++                const float w = (x ? mix[0] : 1.0f - mix[0]) *
++                                (y ? mix[1] : 1.0f - mix[1]) *
++                                (z ? mix[2] : 1.0f - mix[2]);
++                const size_t idx = (((size_t) hh * size[1] + cc) * size[0] + ii) *
++                                   (size_t) gamut->lut_stride;
++                out[comp] += w * blkdiag_unpack(lut, idx, comp);
++            }
++    }
++    return blkdiag_finite3(out);
++}
++
++static void blkdiag_ipt_to_output(float rgb[3],
++                                  const struct pl_color_space *dst)
++{
++    pl_matrix3x3_apply(&pl_ipt_ipt2lms, rgb);
++    for (int i = 0; i < 3; i++) {
++        float x = powf(PL_MAX(rgb[i], 0.0f), 1.0f / PQ_M2);
++        x = PL_MAX(x - PQ_C1, 0.0f) / (PQ_C2 - PQ_C3 * x);
++        rgb[i] = powf(x, 1.0f / PQ_M1) * (10000 / PL_COLOR_SDR_WHITE);
++    }
++    pl_matrix3x3 lms2rgb = pl_ipt_lms2rgb(pl_raw_primaries_get(dst->primaries));
++    pl_matrix3x3_apply(&lms2rgb, rgb);
++    pl_color_delinearize(dst, rgb);
++}
++
++static bool blkdiag_probe(struct blkdiag_probe *p, float source,
++                          const struct pl_tone_map_params *tone,
++                          const struct pl_gamut_map_params *gamut,
++                          const struct pl_color_space *dst, bool need_tone,
++                          bool need_gamut, bool can_fast, const float *lut)
++{
++    memset(p, 0, sizeof(*p));
++    if (!blkdiag_tone(&p->tone, source, tone, need_tone, can_fast))
++        return false;
++    p->direct[0] = p->tone;
++    if (need_gamut)
++        pl_gamut_map_sample(p->direct, gamut);
++    if (!blkdiag_finite3(p->direct))
++        return false;
++    if (need_gamut) {
++        if (!lut || !blkdiag_gamut_lut(p->lut, lut, gamut,
++                                       (float[3]) {p->tone, 0, 0}))
++            return false;
++    } else {
++        memcpy(p->lut, p->direct, sizeof(p->lut));
++    }
++    memcpy(p->encoded, p->lut, sizeof(p->encoded));
++    blkdiag_ipt_to_output(p->encoded, dst);
++    return blkdiag_finite3(p->encoded);
++}
++
++static float blkdiag_min_delta(const float hi[3], const float lo[3])
++{
++    return PL_MIN(hi[0] - lo[0], PL_MIN(hi[1] - lo[1], hi[2] - lo[2]));
++}
++
++static bool blkdiag_lut_elements(size_t *elems,
++                                 const struct pl_gamut_map_params *gamut)
++{
++    if (gamut->lut_size_I < 2 || gamut->lut_size_C < 2 ||
++        gamut->lut_size_h < 2 || gamut->lut_stride < 3)
++        return false;
++    size_t n = (size_t) gamut->lut_size_I;
++    const size_t factors[] = {(size_t) gamut->lut_size_C,
++                              (size_t) gamut->lut_size_h,
++                              (size_t) gamut->lut_stride};
++    for (int i = 0; i < 3; i++) {
++        if (factors[i] > SIZE_MAX / n)
++            return false;
++        n *= factors[i];
++    }
++    if (n > SIZE_MAX / sizeof(float) || n > (1u << 28))
++        return false;
++    *elems = n;
++    return true;
++}
++
++static void blkdiag_identity(pl_shader sh, struct sh_color_map_obj *obj,
++                             const struct pl_color_space *src,
++                             const struct pl_color_space *dst)
++{
++    uint64_t sig = 0x424c4b4944454e54ULL; // "BLKIDENT"
++    pl_hash_merge(&sig, pl_var_hash(*src));
++    pl_hash_merge(&sig, pl_var_hash(*dst));
++    if (obj && obj->blkdiag.valid && obj->blkdiag.signature == sig)
++        return;
++    if (obj) {
++        obj->blkdiag.signature = sig;
++        obj->blkdiag.valid = true;
++    }
++    const float black = PL_COLOR_HDR_BLACK;
++    const float code65 = 1.0f / 876.0f;
++    const float code68 = 4.0f / 876.0f;
++    PL_INFO(sh, "BLKDIAG v=1 main id=%016" PRIx64 " "
++            "scope=post-reconstruction-pq validity=valid reason=identity "
++            "interpolation=none code64=%.9g code65=%.9g code68=%.9g "
++            "tone_d65=%.9g raw_d65=%.9g lut_d65=%.9g final_d65=%.9g "
++            "crush65 tone=0 raw=0 lut=0 final=0",
++            sig, black, code65, code68, code65 - black, code65 - black,
++            code65 - black, code65 - black);
++}
++
++static void blkdiag_mapping(pl_shader sh, struct sh_color_map_obj *obj,
++                            const struct pl_color_map_params *params,
++                            const struct pl_color_map_args *args,
++                            const struct pl_color_space *src,
++                            const struct pl_color_space *dst,
++                            const struct pl_tone_map_params *tone,
++                            const struct pl_gamut_map_params *gamut,
++                            bool need_tone, bool need_gamut, bool can_fast)
++{
++    uint64_t sig = 0x424c4b4d41505631ULL; // "BLKMAPV1"
++    pl_hash_merge(&sig, pl_var_hash(*params));
++    pl_hash_merge(&sig, pl_var_hash(*src));
++    pl_hash_merge(&sig, pl_var_hash(*dst));
++    pl_hash_merge(&sig, pl_var_hash(*tone));
++    pl_hash_merge(&sig, pl_var_hash(*gamut));
++    pl_hash_merge(&sig, need_tone);
++    pl_hash_merge(&sig, need_gamut);
++    pl_hash_merge(&sig, can_fast);
++    pl_hash_merge(&sig, args->prelinearized);
++    pl_hash_merge(&sig, !!args->feature_map);
++    if (obj && obj->blkdiag.valid && obj->blkdiag.signature == sig)
++        return;
++    if (obj) {
++        obj->blkdiag.signature = sig;
++        obj->blkdiag.valid = true;
++    }
++
++    const float black = PL_COLOR_HDR_BLACK;
++    const float code65 = 1.0f / 876.0f;
++    const float code68 = 4.0f / 876.0f;
++    const bool recovery = need_tone && tone->input_max >= tone->output_max &&
++                          params->contrast_recovery && args->feature_map;
++    const char *reason = NULL;
++    if (params->lut3d_tricubic && need_gamut)
++        reason = "tricubic-unemulated";
++    else if (recovery)
++        reason = "contrast-recovery-content-dependent";
++    else if (params->visualize_lut || params->show_clipping)
++        reason = "diagnostic-visualization-active";
++
++    float *lut = NULL;
++    size_t elems = 0;
++    if (!reason && need_gamut) {
++        if (!blkdiag_lut_elements(&elems, gamut)) {
++            reason = "invalid-gamut-lut";
++        } else {
++            lut = pl_alloc(NULL, elems * sizeof(*lut));
++            pl_gamut_map_generate(lut, gamut);
++        }
++    }
++
++    struct blkdiag_probe p64, p65, p68;
++    const bool valid = !reason &&
++        blkdiag_probe(&p64, black, tone, gamut, dst, need_tone,
++                      need_gamut, can_fast, lut) &&
++        blkdiag_probe(&p65, code65, tone, gamut, dst, need_tone,
++                      need_gamut, can_fast, lut) &&
++        blkdiag_probe(&p68, code68, tone, gamut, dst, need_tone,
++                      need_gamut, can_fast, lut);
++    pl_free(lut);
++
++    if (!valid) {
++        PL_INFO(sh, "BLKDIAG v=1 main id=%016" PRIx64 " "
++                "scope=post-reconstruction-pq validity=unavailable reason=%s "
++                "interpolation=%s code64=%.9g code65=%.9g code68=%.9g "
++                "tone_d65=unknown raw_d65=unknown lut_d65=unknown "
++                "final_d65=unknown crush65 tone=unknown raw=unknown "
++                "lut=unknown final=unknown",
++                sig, reason ? reason : "invalid-or-nonfinite",
++                params->lut3d_tricubic ? "tricubic" : "linear",
++                black, code65, code68);
++        return;
++    }
++
++    const float tone_d65 = p65.tone - p64.tone;
++    const float raw_d65 = p65.direct[0] - p64.direct[0];
++    const float lut_d65 = p65.lut[0] - p64.lut[0];
++    const float final_d65 = blkdiag_min_delta(p65.encoded, p64.encoded);
++    const bool tone_crush = !isfinite(tone_d65) || tone_d65 <= 1e-9f;
++    const bool raw_crush = !isfinite(raw_d65) || raw_d65 <= 1e-9f;
++    const bool lut_crush = !isfinite(lut_d65) || lut_d65 <= 1e-9f;
++    const bool final_crush = !isfinite(final_d65) || final_d65 <= 1e-9f;
++    PL_INFO(sh, "BLKDIAG v=1 main id=%016" PRIx64 " "
++            "scope=post-reconstruction-pq validity=valid reason=sampled "
++            "interpolation=%s code64=%.9g code65=%.9g code68=%.9g "
++            "tone_d65=%.9g raw_d65=%.9g lut_d65=%.9g final_d65=%.9g "
++            "final_rgb_d65=[%.9g,%.9g,%.9g] "
++            "crush65 tone=%d raw=%d lut=%d final=%d",
++            sig, need_gamut ? "linear" : "none", black, code65, code68,
++            tone_d65, raw_d65, lut_d65, final_d65,
++            p65.encoded[0] - p64.encoded[0],
++            p65.encoded[1] - p64.encoded[1],
++            p65.encoded[2] - p64.encoded[2],
++            tone_crush, raw_crush, lut_crush, final_crush);
++}
++#endif
++
+ static void sh_color_map_uninit(pl_gpu gpu, void *ptr)
+ {
+     struct sh_color_map_obj *obj = ptr;
+@@ -1807,6 +2111,9 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+ 
+     pl_color_space_infer_map(&src, &dst);
+     if (pl_color_space_equal(&src, &dst)) {
++#ifdef PL_BLACK_LEVEL_DIAGNOSTICS
++        blkdiag_identity(sh, obj, &src, &dst);
++#endif
+         if (args->prelinearized)
+             pl_shader_delinearize(sh, &dst);
+         return;
+@@ -1977,6 +2284,11 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+         need_gamut_map = false;
+     }
+ 
++#ifdef PL_BLACK_LEVEL_DIAGNOSTICS
++    blkdiag_mapping(sh, obj, params, args, &src, &dst, &tone, &gamut,
++                    need_tone_map, need_gamut_map, can_fast);
++#endif
++
+     // Fast path: simply convert between primaries (if needed)
+     if (!need_tone_map && !need_gamut_map) {
+         if (src.primaries != dst.primaries) {
+-- 
+2.54.0.windows.1

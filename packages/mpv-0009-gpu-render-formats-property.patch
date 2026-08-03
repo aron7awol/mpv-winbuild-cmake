@@ -1,0 +1,146 @@
+From d0636712289838dc5026930333a8ad4e70251e58 Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Sun, 2 Aug 2026 16:36:00 -0400
+Subject: [PATCH] gpu-next: expose effective render formats
+
+---
+ player/command.c        | 28 ++++++++++++++++++++++++++--
+ video/out/vo.h          | 11 +++++++++++
+ video/out/vo_gpu_next.c | 35 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 72 insertions(+), 2 deletions(-)
+
+diff --git a/player/command.c b/player/command.c
+index 5df0837..9dac03c 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -2637,6 +2637,28 @@ static int mp_property_vo_imgparams(void *ctx, struct m_property *prop,
+     return property_imgparams(&p, action, arg);
+ }
+ 
++static int mp_property_gpu_render_formats(void *ctx, struct m_property *prop,
++                                          int action, void *arg)
++{
++    MPContext *mpctx = ctx;
++    struct voctrl_render_formats formats = {0};
++    if (!mpctx->video_out ||
++        vo_control(mpctx->video_out, VOCTRL_GET_RENDER_FORMATS, &formats) <= 0)
++        return M_PROPERTY_UNAVAILABLE;
++
++    char *summary = mp_tprintf(256, "%s (%s) | output: %s",
++                               formats.precision, formats.internal,
++                               formats.output);
++    struct m_sub_property props[] = {
++        {"precision", SUB_PROP_STR(formats.precision)},
++        {"internal",  SUB_PROP_STR(formats.internal)},
++        {"output",    SUB_PROP_STR(formats.output)},
++        {"summary",   SUB_PROP_STR(summary)},
++        {0}
++    };
++    return m_property_read_sub(props, action, arg);
++}
++
+ static int mp_property_tgt_imgparams(void *ctx, struct m_property *prop,
+                                      int action, void *arg)
+ {
+@@ -4715,6 +4737,7 @@ static const struct m_property mp_properties_base[] = {
+     // Video
+     {"video-target-params", mp_property_tgt_imgparams},
+     {"video-out-params", mp_property_vo_imgparams},
++    {"gpu-render-formats", mp_property_gpu_render_formats},
+     {"video-dec-params", mp_property_dec_imgparams},
+     {"video-params", mp_property_vd_imgparams},
+     {"video-frame-info", mp_property_video_frame_info},
+@@ -4869,13 +4892,14 @@ static const char *const *const mp_event_property_change[] = {
+       "decoder-frame-drop-count", "frame-drop-count", "video-frame-info",
+       "vf-metadata", "af-metadata", "sub-start", "sub-end", "secondary-sub-start",
+       "secondary-sub-end", "sub-lines", "secondary-sub-lines", "video-out-params",
+-      "video-dec-params", "video-params", "deinterlace-active", "video-target-params"),
++      "video-dec-params", "video-params", "deinterlace-active", "video-target-params",
++      "gpu-render-formats"),
+     E(MP_EVENT_DURATION_UPDATE, "duration"),
+     E(MPV_EVENT_VIDEO_RECONFIG, "video-out-params", "video-params",
+       "video-format", "video-codec", "video-bitrate", "dwidth", "dheight",
+       "width", "height", "container-fps", "aspect", "aspect-name", "vo-configured", "current-vo",
+       "video-dec-params", "osd-dimensions", "hwdec", "hwdec-current", "hwdec-interop",
+-      "window-id", "track-list", "current-tracks"),
++      "window-id", "track-list", "current-tracks", "gpu-render-formats"),
+     E(MPV_EVENT_AUDIO_RECONFIG, "audio-format", "audio-codec", "audio-bitrate",
+       "samplerate", "channels", "audio", "volume", "volume-gain", "mute",
+       "current-ao", "audio-codec-name", "audio-params", "track-list", "current-tracks",
+diff --git a/video/out/vo.h b/video/out/vo.h
+index f24918d..f9c0365 100644
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -85,6 +85,9 @@ enum mp_voctrl {
+ 
+     VOCTRL_PERFORMANCE_DATA,            // struct voctrl_performance_data*
+ 
++    // Effective gpu-next intermediate and output texture formats.
++    VOCTRL_GET_RENDER_FORMATS,          // struct voctrl_render_formats*
++
+     VOCTRL_SET_CURSOR_VISIBILITY,       // bool*
+ 
+     VOCTRL_CONTENT_TYPE,                // enum mp_content_type*
+@@ -135,6 +138,14 @@ enum mp_voctrl {
+     VOCTRL_SET_CLIPBOARD,
+ };
+ 
++#define VO_RENDER_FORMAT_NAME_MAX 32
++#define VO_RENDER_FORMAT_CHAIN_MAX 80
++struct voctrl_render_formats {
++    char precision[VO_RENDER_FORMAT_NAME_MAX];
++    char internal[VO_RENDER_FORMAT_CHAIN_MAX];
++    char output[VO_RENDER_FORMAT_NAME_MAX];
++};
++
+ // Helper to expose what kind of content is currently playing to the VO.
+ enum mp_content_type {
+     MP_CONTENT_NONE, // used for force-window
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index bf4f80b..37fd0bd 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -2089,6 +2089,41 @@ static int control(struct vo *vo, uint32_t request, void *data)
+         return true;
+     }
+ 
++    case VOCTRL_GET_RENDER_FORMATS: {
++        struct voctrl_render_formats *out = data;
++        pl_fmt formats[4] = {0};
++        pl_renderer_get_fbo_formats(p->rr, formats);
++        pl_fmt representative = formats[3] ? formats[3] : formats[2];
++        if (!representative)
++            return VO_FALSE;
++
++        const char *prefix = "OTHER";
++        switch (representative->type) {
++        case PL_FMT_FLOAT: prefix = "FP"; break;
++        case PL_FMT_UNORM: prefix = "UNORM"; break;
++        case PL_FMT_SNORM: prefix = "SNORM"; break;
++        case PL_FMT_UINT:  prefix = "UINT"; break;
++        case PL_FMT_SINT:  prefix = "SINT"; break;
++        default: break;
++        }
++        snprintf(out->precision, sizeof(out->precision), "%s%d", prefix,
++                 representative->component_depth[0]);
++
++        const char *rgb = formats[2] ? formats[2]->name : NULL;
++        const char *rgba = formats[3] ? formats[3]->name : NULL;
++        if (rgb && rgba && strcmp(rgb, rgba) != 0) {
++            snprintf(out->internal, sizeof(out->internal), "%s/%s", rgb, rgba);
++        } else {
++            snprintf(out->internal, sizeof(out->internal), "%s",
++                     rgb ? rgb : (rgba ? rgba : "unknown"));
++        }
++
++        snprintf(out->output, sizeof(out->output), "%s",
++                 p->target_params.imgfmt_name
++                    ? p->target_params.imgfmt_name : "unknown");
++        return VO_TRUE;
++    }
++
+     case VOCTRL_SCREENSHOT:
+         video_screenshot(vo, data);
+         return true;
+-- 
+2.54.0.windows.1

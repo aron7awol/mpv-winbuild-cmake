@@ -237,4 +237,3 @@ index 27567827e..f84d73d74 100644
      p->log = vo->log;
 -- 
 2.54.0.windows.1
-
