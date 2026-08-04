@@ -1,0 +1,621 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Mon, 3 Aug 2026 22:44:30 -0400
+Subject: [PATCH] shaders: add smoothed private DTM metrics
+
+---
+ meson.build                                 |   1 +
+ src/include/libplacebo/shaders/colorspace.h |  30 ++
+ src/renderer.c                              |   5 +-
+ src/shaders/colorspace.c                    | 316 +++++++++++++++++++-
+ 4 files changed, 339 insertions(+), 13 deletions(-)
+
+diff --git a/meson.build b/meson.build
+index 3832230b..d73bbfbc 100644
+--- a/meson.build
++++ b/meson.build
+@@ -12,6 +12,7 @@ project('libplacebo', ['c', 'cpp'],
+     7,
+     # API version
+     {
++      '373': 'add BT.2020 perceptual detector tone-map range',
+       '372': 'add pl_{renderer_,}get_peak_detect_metrics',
+       '371': 'input frame.hdr.max_luma is now respecte when frame has ICC profile',
+       '370': 'deprecate pl_avdovi_metadata_supported and pl_avframe_params.map_dovi_force',
+diff --git a/src/include/libplacebo/shaders/colorspace.h b/src/include/libplacebo/shaders/colorspace.h
+index 373e3f6b..2bfa2cb5 100644
+--- a/src/include/libplacebo/shaders/colorspace.h
++++ b/src/include/libplacebo/shaders/colorspace.h
+@@ -123,6 +123,18 @@ PL_API void pl_shader_sigmoidize(pl_shader sh, const struct pl_sigmoid_params *p
+ // This performs the inverse operation to `pl_shader_sigmoidize`.
+ PL_API void pl_shader_unsigmoidize(pl_shader sh, const struct pl_sigmoid_params *params);
+ 
++// Brightness domain for renderer-generated, detector-driven tone mapping.
++// Public HDR metadata and CIE Y/maxRGB measurements stay physical.
++enum pl_tone_map_metric {
++    PL_TONE_MAP_METRIC_STANDARD = 0,
++    PL_TONE_MAP_METRIC_BT2020_ITP,
++    PL_TONE_MAP_METRIC_BT2020_ADAPTIVE,
++    PL_TONE_MAP_METRIC_BT2020_RGB,
++    PL_TONE_MAP_METRIC_MAXRGB_ITP,
++    PL_TONE_MAP_METRIC_MAXRGB_ADAPTIVE,
++    PL_TONE_MAP_METRIC_MAXRGB_RGB,
++};
++
+ struct pl_peak_detect_params {
+     // Smoothing coefficient for the detected values. This controls the time
+     // parameter (tau) of an IIR low pass filter. In other words, it represent
+@@ -173,6 +185,9 @@ struct pl_peak_detect_params {
+     // that metadata for tone mapping. Disabled by default.
+     bool force;
+ 
++    // Set internally by the renderer only for generic pixel DTM.
++    enum pl_tone_map_metric metric;
++
+     // --- Deprecated / removed fields
+     PL_DEPRECATED_IN(v6.313) float minimum_peak;
+ };
+@@ -222,12 +237,17 @@ PL_API bool pl_shader_detect_peak(pl_shader sh, struct pl_color_space csp,
+ // both controls. They are frame measurements, not static MaxCLL/MaxFALL
+ // metadata.
+ struct pl_peak_detect_metrics {
++    // Selected private metric and its raw/smoothed PQ-domain statistics,
++    // expressed as cd/m². Private fields are zero in standard mode.
++    enum pl_tone_map_metric metric;
+     float raw_max_pq_y;
+     float raw_avg_pq_y;
+     float smoothed_max_pq_y;
+     float smoothed_avg_pq_y;
+     float raw_max_rgb;
+     float raw_avg_rgb;
++    float raw_max_metric, raw_avg_metric;
++    float smoothed_max_metric, smoothed_avg_metric;
+ };
+ 
+ // Returns false until a peak-detection dispatch has completed. With
+@@ -235,6 +255,12 @@ struct pl_peak_detect_metrics {
+ PL_API bool pl_get_peak_detect_metrics(const pl_shader_obj state,
+                                        struct pl_peak_detect_metrics *metrics);
+ 
++// The private dynamic range for the selected detector metric. Unlike
++// pl_get_detected_hdr_metadata it never re-labels physical CIE Y metadata.
++PL_API bool pl_get_detected_tone_map_range(const pl_shader_obj state,
++                                           enum pl_tone_map_metric metric,
++                                           float *max_pq, float *avg_pq);
++
+ // After dispatching the above shader, this function can be used to retrieve
+ // the detected dynamic HDR10+ metadata parameters. The other fields of
+ // `metadata` are not written to. Returns whether or not any values were
+@@ -317,6 +343,10 @@ struct pl_color_map_params {
+     // value allows overriding the default metadata preference logic.
+     enum pl_hdr_metadata_type metadata;
+ 
++    // Private brightness metrics are valid only if a matching pixel detector
++    // result is present. They are intentionally ignored for authored metadata.
++    enum pl_tone_map_metric tone_mapping_metric;
++
+     // Tone mapping LUT size. Defaults to 256.
+     int lut_size;
+ 
+diff --git a/src/renderer.c b/src/renderer.c
+index 5d70743d..fb5065d3 100644
+--- a/src/renderer.c
++++ b/src/renderer.c
+@@ -1241,8 +1241,11 @@ static void hdr_update_peak(struct pass_state *pass)
+         goto cleanup;
+     }
+ 
++    struct pl_peak_detect_params peak_params = *params->peak_detect_params;
++    peak_params.metric = cpars ? cpars->tone_mapping_metric
++                               : PL_TONE_MAP_METRIC_STANDARD;
+     bool ok = pl_shader_detect_peak(img_sh(pass, &pass->img), pass->img.color,
+-                                    &rr->tone_map_state, params->peak_detect_params);
++                                    &rr->tone_map_state, &peak_params);
+     if (!ok) {
+         PL_WARN(rr, "Failed creating HDR peak detection shader.. disabling");
+         rr->errors |= PL_RENDER_ERR_PEAK_DETECT;
+diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
+index 8fc3363b..bcca0575 100644
+--- a/src/shaders/colorspace.c
++++ b/src/shaders/colorspace.c
+@@ -979,7 +979,8 @@ static bool peak_detect_params_eq(const struct pl_peak_detect_params *a,
+     return a->smoothing_period     == b->smoothing_period     &&
+            a->scene_threshold_low  == b->scene_threshold_low  &&
+            a->scene_threshold_high == b->scene_threshold_high &&
+-           a->percentile           == b->percentile;
++           a->percentile           == b->percentile &&
++           a->metric               == b->metric;
+     // don't compare `allow_delayed` because it doesn't change measurement
+ }
+ 
+@@ -1025,6 +1026,9 @@ struct peak_buf_data {
+     unsigned frame_max_rgb_pq[SLICES]; // maximum PQ maxRGB value (PQ_BITS)
+     unsigned frame_hist[SLICES][HIST_BINS]; // always allocated, conditionally used
+     unsigned frame_hist_rgb[SLICES][HIST_BINS];
++    unsigned frame_sum_metric[SLICES];
++    unsigned frame_max_metric[SLICES];
++    unsigned frame_hist_metric[SLICES][HIST_BINS];
+ };
+ 
+ static const struct pl_buffer_var peak_buf_vars[] = {
+@@ -1052,6 +1056,9 @@ static const struct pl_buffer_var peak_buf_vars[] = {
+     VAR(frame_max_rgb_pq),
+     VAR(frame_hist),
+     VAR(frame_hist_rgb),
++    VAR(frame_sum_metric),
++    VAR(frame_max_metric),
++    VAR(frame_hist_metric),
+ #undef VAR
+ };
+ 
+@@ -1085,6 +1092,8 @@ struct sh_color_map_obj {
+         float raw_max_pq;
+         float raw_avg_rgb;                      // linear cd/m²
+         float raw_max_rgb;
++        float raw_avg_metric, raw_max_metric;
++        float avg_metric, max_metric;
+     } peak;
+ };
+ 
+@@ -1415,6 +1424,58 @@ static inline float iir_coeff(float rate)
+     return 1.0f - expf(-1.0f / rate);
+ }
+ 
++// Smooth, homogeneous approximation of the selected literal p=1 BT.2020
++// perceptual coordinate. The fitted degree-seven triangular Bernstein surface
++// is symmetric in red/green and exact at RGBCMYW. On the simplex it is
++// evaluated as four Horner polynomials in blue fraction and R*G, avoiding the
++// max-channel branches and derivative ridges of the literal test model.
++static ident_t emit_bt2020_metric(pl_shader sh, enum pl_color_primaries prim)
++{
++    const struct pl_raw_primaries *src = pl_raw_primaries_get(prim);
++    const struct pl_raw_primaries *bt2020 =
++        pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020);
++    const pl_matrix3x3 rgb2bt2020 = pl_get_color_mapping_matrix(
++        src, bt2020, PL_INTENT_RELATIVE_COLORIMETRIC);
++    ident_t metric = sh_fresh(sh, "bt2020_perceptual_metric");
++    GLSLH("float "$"(vec3 rgb) {                                      \n"
++          " vec3 c = max("$" * rgb, vec3(0.0));                       \n"
++          " float total = c.r + c.g + c.b;                               \n"
++          " if (total <= 1e-12) return 0.0;                              \n"
++          " vec3 n = c / total;                                          \n"
++          " float w = n.b;                                               \n"
++          " float p = n.r * n.g;                                         \n"
++          " float q0 = (((((((14.5330356895*w - 25.5682414785)*w         \n"
++          "     - 13.7465695335)*w + 56.3828756991)*w - 42.760790975)*w  \n"
++          "     + 13.1725257153)*w - 2.51283511691)*w + 1.0);            \n"
++          " float q1 = (((((-31.3753030053*w - 16.6730639549)*w          \n"
++          "     + 125.654298402)*w - 103.378434394)*w                    \n"
++          "     + 22.7623461176)*w - 1.53706708322);                     \n"
++          " float q2 = (((140.435403979*w + 97.2794791377)*w             \n"
++          "     - 114.074511803)*w + 7.67118553227);                     \n"
++          " float q3 = 73.1408564899*w - 38.0916687975;                  \n"
++          " float perceptual = total * (((q3*p + q2)*p + q1)*p + q0);   \n"
++          " float pq = pow(clamp(perceptual * (203.0/10000.0),           \n"
++          "                      0.0, 1.0), .1593017578125);              \n"
++          " pq = (.8359375 + 18.8515625*pq) / (1.0 + 18.6875*pq);       \n"
++          " return pow(pq, 78.84375);                                    \n"
++          "}                                                             \n",
++          metric, SH_MAT3(rgb2bt2020));
++    return metric;
++}
++
++static ident_t emit_maxrgb_metric(pl_shader sh)
++{
++    ident_t metric = sh_fresh(sh, "maxrgb_tone_metric");
++    GLSLH("float "$"(vec3 c) {                                      \n"
++          " float p = max(max(c.r, c.g), c.b) * (203.0/10000.0);    \n"
++          " p = pow(clamp(p, 0.0, 1.0), .1593017578125);            \n"
++          " p = (.8359375 + 18.8515625*p) / (1.0 + 18.6875*p);     \n"
++          " return pow(p, 78.84375);                                \n"
++          "}                                                        \n",
++          metric);
++    return metric;
++}
++
+ static float measure_peak(const unsigned max_pq[SLICES],
+                           const unsigned hist[SLICES][HIST_BINS],
+                           float percentile)
+@@ -1508,12 +1569,13 @@ static void update_peak_buf(pl_gpu gpu, struct sh_color_map_obj *obj, bool force
+         return;
+     }
+ 
+-    uint64_t frame_sum_pq = 0u, frame_sum_rgb = 0u;
++    uint64_t frame_sum_pq = 0u, frame_sum_rgb = 0u, frame_sum_metric = 0u;
+     uint64_t frame_wg_count = 0u, frame_wg_active = 0u;
+     unsigned frame_max_rgb = 0u;
+     for (int k = 0; k < SLICES; k++) {
+         frame_sum_pq    += data.frame_sum_pq[k];
+         frame_sum_rgb   += data.frame_sum_rgb[k];
++        frame_sum_metric  += data.frame_sum_metric[k];
+         frame_wg_count  += data.frame_wg_count[k];
+         frame_wg_active += data.frame_wg_active[k];
+         frame_max_rgb    = PL_MAX(frame_max_rgb, data.frame_max_rgb[k]);
+@@ -1542,6 +1604,55 @@ static void update_peak_buf(pl_gpu gpu, struct sh_color_map_obj *obj, bool force
+         obj->peak.raw_max_rgb = (float) frame_max_rgb / RGB_MAX * 10000.0f;
+     }
+ 
++    if (params->metric != PL_TONE_MAP_METRIC_STANDARD) {
++        float raw_avg_metric = frame_wg_active
++            ? (float) frame_sum_metric / (frame_wg_active * PQ_MAX)
++            : PL_COLOR_HDR_BLACK;
++        float raw_max_metric = frame_wg_active
++            ? measure_peak(data.frame_max_metric, data.frame_hist_metric,
++                           params->percentile)
++            : PL_COLOR_HDR_BLACK;
++        obj->peak.raw_avg_metric = raw_avg_metric;
++        obj->peak.raw_max_metric = raw_max_metric;
++        if (!obj->peak.avg_metric) {
++            obj->peak.avg_metric = raw_avg_metric;
++            obj->peak.max_metric = raw_max_metric;
++        } else {
++            // Match the standard detector's rounding-noise suppression before
++            // applying its temporal behavior in this metric's own PQ domain.
++            static const float epsilon = 1.0f / PQ_MAX;
++            if (fabsf(raw_avg_metric - obj->peak.avg_metric) < epsilon)
++                raw_avg_metric = obj->peak.avg_metric;
++            if (fabsf(raw_max_metric - obj->peak.max_metric) < epsilon)
++                raw_max_metric = obj->peak.max_metric;
++        }
++
++        const float coeff = iir_coeff(params->smoothing_period);
++        obj->peak.avg_metric += coeff *
++            (raw_avg_metric - obj->peak.avg_metric);
++        obj->peak.max_metric += coeff *
++            (raw_max_metric - obj->peak.max_metric);
++
++        // Accelerate both smoothed values on scene changes, exactly as the
++        // standard detector does, but detect the change from this metric's
++        // frame average rather than CIE Y.
++        if (params->scene_threshold_low > 0 &&
++            params->scene_threshold_high > 0) {
++            const float log10_pq = 1e-2f;
++            const float thresh_low = params->scene_threshold_low * log10_pq;
++            const float thresh_high = params->scene_threshold_high * log10_pq;
++            const float bias = (float) frame_wg_active / frame_wg_count;
++            const float delta = bias *
++                fabsf(raw_avg_metric - obj->peak.avg_metric);
++            const float mix_coeff =
++                pl_smoothstep(thresh_low, thresh_high, delta);
++            obj->peak.avg_metric = PL_MIX(obj->peak.avg_metric,
++                                          raw_avg_metric, mix_coeff);
++            obj->peak.max_metric = PL_MIX(obj->peak.max_metric,
++                                          raw_max_metric, mix_coeff);
++        }
++    }
++
+     if (!obj->peak.avg_pq) {
+         // Set the initial value accordingly if it contains no data
+         obj->peak.avg_pq = avg_pq;
+@@ -1590,9 +1701,13 @@ bool pl_shader_detect_peak(pl_shader sh, struct pl_color_space csp,
+     }
+ 
+     const bool use_histogram = params->percentile > 0 && params->percentile < 100;
+-    size_t shmem_req = 6 * sizeof(uint32_t);
++    const bool use_metric = params->metric != PL_TONE_MAP_METRIC_STANDARD;
++    const bool use_maxrgb = params->metric == PL_TONE_MAP_METRIC_MAXRGB_ITP ||
++                            params->metric == PL_TONE_MAP_METRIC_MAXRGB_ADAPTIVE ||
++                            params->metric == PL_TONE_MAP_METRIC_MAXRGB_RGB;
++    size_t shmem_req = (use_metric ? 8 : 6) * sizeof(uint32_t);
+     if (use_histogram)
+-        shmem_req += 2 * sizeof(uint32_t[HIST_BINS]);
++        shmem_req += (use_metric ? 3 : 2) * sizeof(uint32_t[HIST_BINS]);
+ 
+     if (!sh_try_compute(sh, 16, 16, true, shmem_req)) {
+         PL_ERR(sh, "HDR peak detection requires compute shaders with support "
+@@ -1650,6 +1765,7 @@ retry_ssbo:
+     }
+ 
+     obj->peak.params = *params;
++    pl_color_space_infer(&csp);
+ 
+     sh_desc(sh, (struct pl_shader_desc) {
+         .desc = {
+@@ -1671,7 +1787,10 @@ retry_ssbo:
+             wg_rgb_pq_max = sh_fresh(sh, "wg_rgb_pq_max"),
+             wg_black   = sh_fresh(sh, "wg_black"),
+             wg_hist    = NULL_IDENT,
+-            wg_hist_rgb = NULL_IDENT;
++            wg_hist_rgb = NULL_IDENT,
++            wg_metric_sum = NULL_IDENT,
++            wg_metric_max = NULL_IDENT,
++            wg_hist_metric = NULL_IDENT;
+     GLSLH("shared uint "$", "$", "$", "$", "$", "$"; \n",
+           wg_sum, wg_max, wg_rgb_sum, wg_rgb_max, wg_rgb_pq_max, wg_black);
+     if (use_histogram) {
+@@ -1681,6 +1800,16 @@ retry_ssbo:
+         GLSLH("shared uint "$"[%u]; \n", wg_hist_rgb, HIST_BINS);
+     }
+ 
++    if (use_metric) {
++        wg_metric_sum = sh_fresh(sh, "wg_metric_sum");
++        wg_metric_max = sh_fresh(sh, "wg_metric_max");
++        GLSLH("shared uint "$", "$"; \n", wg_metric_sum, wg_metric_max);
++        if (use_histogram) {
++            wg_hist_metric = sh_fresh(sh, "wg_hist_metric");
++            GLSLH("shared uint "$"[%u]; \n", wg_hist_metric, HIST_BINS);
++        }
++    }
++
+     sh_describe(sh, "peak detection");
+ #pragma GLSL /* pl_shader_detect_peak */                                        \
+     {                                                                           \
+@@ -1693,16 +1822,24 @@ retry_ssbo:
+     if (local_idx == 0u) {                                                      \
+         $wg_sum = $wg_max = $wg_rgb_sum = $wg_rgb_max = $wg_rgb_pq_max = 0u;  \
+         $wg_black = 0u;                                                         \
++        @if (use_metric) {                                                        \
++            $wg_metric_sum = $wg_metric_max = 0u;                                  \
++        @}                                                                      \
+     }                                                                           \
+     @if (use_histogram) {                                                       \
+-        for (uint i = local_idx; i < ${const uint: HIST_BINS}; i += wg_size)    \
++        for (uint i = local_idx; i < ${const uint: HIST_BINS}; i += wg_size) {  \
+             $wg_hist[i] = $wg_hist_rgb[i] = 0u;                                \
++            @if (use_metric) {                                                    \
++                $wg_hist_metric[i] = 0u;                                         \
++            @}                                                                  \
++        }                                                                       \
+     @}                                                                          \
+     barrier();
+ 
+     // Decode color into linear light representation
+-    pl_color_space_infer(&csp);
+     pl_shader_linearize(sh, &csp);
++    ident_t metric_fn = use_metric && !use_maxrgb
++        ? emit_bt2020_metric(sh, csp.primaries) : NULL_IDENT;
+ 
+     bool has_subgroups = sh_glsl(sh).subgroup_size > 0;
+     const float cutoff = fmaxf(params->black_cutoff, 0.0f) * 1e-2f;
+@@ -1724,6 +1861,14 @@ retry_ssbo:
+     @if (cutoff)                                                                \
+         luma *= smoothstep(0.0, ${float: cutoff}, luma);                        \
+     uint y_pq = uint(${const float: PQ_MAX} * luma);                            \
++    uint metric_pq = 0u;                                                          \
++    @if (use_metric) {                                                            \
++        @if (use_maxrgb) {                                                        \
++            metric_pq = rgb_pq;                                                   \
++        @} else {                                                                 \
++            metric_pq = uint(${const float: PQ_MAX} * $metric_fn(color.rgb));    \
++        @}                                                                         \
++    @}                                                                          \
+                                                                                 \
+     /* Update the work group's shared atomics */                                \
+     @if (use_histogram) {                                                       \
+@@ -1733,6 +1878,12 @@ retry_ssbo:
+         int bin_rgb = int(rgb_pq) >> ${const int: PQ_BITS - HIST_BITS};         \
+         bin_rgb -= ${const int: HIST_BIAS};                                     \
+         bin_rgb = clamp(bin_rgb, 0, ${const int: HIST_BINS - 1});               \
++        @if (use_metric) {                                                        \
++            int bin_metric = int(metric_pq) >> ${const int: PQ_BITS - HIST_BITS};  \
++            bin_metric -= ${const int: HIST_BIAS};                                \
++            bin_metric = clamp(bin_metric, 0, ${const int: HIST_BINS - 1});         \
++            atomicAdd($wg_hist_metric[bin_metric], 1u);                             \
++        @}                                                                      \
+         @if (has_subgroups) {                                                   \
+             /* Optimize for the very common case of identical histogram bins */ \
+             if (subgroupAllEqual(bin)) {                                        \
+@@ -1781,6 +1932,11 @@ retry_ssbo:
+                 atomicAdd($wg_black, 1u);                                       \
+         @}                                                                      \
+     @}                                                                          \
++    barrier();                                                                  \
++    @if (use_metric) {                                                            \
++        atomicAdd($wg_metric_sum, metric_pq);                                      \
++        atomicMax($wg_metric_max, metric_pq);                                      \
++    @}                                                                           \
+     barrier();                                                                  \
+                                                                                 \
+     @if (use_histogram) {                                                       \
+@@ -1793,6 +1949,10 @@ retry_ssbo:
+             atomicAdd(frame_hist[hist_base + i], $wg_hist[i]);                  \
+         for (uint i = local_idx; i < ${const uint: HIST_BINS}; i += wg_size)    \
+             atomicAdd(frame_hist_rgb[hist_base + i], $wg_hist_rgb[i]);          \
++        @if (use_metric) {                                                        \
++            for (uint i = local_idx; i < ${const uint: HIST_BINS}; i += wg_size)\
++                atomicAdd(frame_hist_metric[hist_base + i], $wg_hist_metric[i]);    \
++        @}                                                                       \
+     @}                                                                          \
+                                                                                 \
+     /* Have one thread per work group update the global atomics */              \
+@@ -1803,6 +1963,10 @@ retry_ssbo:
+         atomicAdd(frame_sum_rgb[slice], $wg_rgb_sum / wg_size);                 \
+         atomicMax(frame_max_rgb[slice], $wg_rgb_max);                           \
+         atomicMax(frame_max_rgb_pq[slice], $wg_rgb_pq_max);                     \
++        @if (use_metric) {                                                        \
++            atomicAdd(frame_sum_metric[slice], $wg_metric_sum / wg_size);           \
++            atomicMax(frame_max_metric[slice], $wg_metric_max);                     \
++        @}                                                                       \
+         if (num > 0u) {                                                         \
+             atomicAdd(frame_sum_pq[slice], $wg_sum / num);                      \
+             atomicMax(frame_max_pq[slice], $wg_max);                            \
+@@ -1842,16 +2006,43 @@ bool pl_get_peak_detect_metrics(const pl_shader_obj state,
+         return false;
+ 
+     *out = (struct pl_peak_detect_metrics) {
++        .metric            = obj->peak.params.metric,
+         .raw_max_pq_y      = obj->peak.raw_max_pq,
+         .raw_avg_pq_y      = obj->peak.raw_avg_pq,
+         .smoothed_max_pq_y = obj->peak.max_pq,
+         .smoothed_avg_pq_y = obj->peak.avg_pq,
+         .raw_max_rgb       = obj->peak.raw_max_rgb,
+         .raw_avg_rgb       = obj->peak.raw_avg_rgb,
++        .raw_max_metric      = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, obj->peak.raw_max_metric),
++        .raw_avg_metric      = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, obj->peak.raw_avg_metric),
++        .smoothed_max_metric = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, obj->peak.max_metric),
++        .smoothed_avg_metric = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, obj->peak.avg_metric),
+     };
+     return true;
+ }
+ 
++bool pl_get_detected_tone_map_range(const pl_shader_obj state,
++                                    enum pl_tone_map_metric metric,
++                                    float *max_pq, float *avg_pq)
++{
++    if (!state || state->type != PL_SHADER_OBJ_COLOR_MAP)
++        return false;
++    struct sh_color_map_obj *obj = state->priv;
++    update_peak_buf(state->gpu, obj, false);
++    if (metric != PL_TONE_MAP_METRIC_STANDARD) {
++        if (obj->peak.params.metric != metric || !obj->peak.avg_metric)
++            return false;
++        *max_pq = obj->peak.max_metric;
++        *avg_pq = obj->peak.avg_metric;
++        return true;
++    }
++    if (!obj->peak.avg_pq)
++        return false;
++    *max_pq = obj->peak.max_pq;
++    *avg_pq = obj->peak.avg_pq;
++    return true;
++}
++
+ void pl_reset_detected_peak(pl_shader_obj state)
+ {
+     if (!state || state->type != PL_SHADER_OBJ_COLOR_MAP)
+@@ -2120,6 +2311,14 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+     }
+ 
+     params = PL_DEF(params, &pl_color_map_default_params);
++    bool metric_active = false;
++    float metric_max = 0.0f, metric_avg = 0.0f;
++    if (args->state && obj &&
++        params->tone_mapping_metric != PL_TONE_MAP_METRIC_STANDARD &&
++        obj->peak.params.metric == params->tone_mapping_metric) {
++        metric_active = pl_get_detected_tone_map_range(*args->state,
++            params->tone_mapping_metric, &metric_max, &metric_avg);
++    }
+     GLSL("// pl_shader_color_map \n"
+          "{                      \n");
+ 
+@@ -2151,6 +2350,13 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+                                         PL_COLOR_HDR_BLACK);
+     }
+ 
++    if (metric_active) {
++        // These are private detector values in PQ, not source metadata.
++        tone.input_min = PL_COLOR_HDR_BLACK;
++        tone.input_max = metric_max;
++        tone.input_avg = metric_avg;
++    }
++
+     pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
+         .color      = &dst,
+         .metadata   = PL_HDR_METADATA_HDR10,
+@@ -2388,7 +2594,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+         }
+ 
+         bool need_recovery = tone.input_max >= tone.output_max;
+-        if (need_recovery && params->contrast_recovery && args->feature_map) {
++        if (!metric_active && need_recovery && params->contrast_recovery && args->feature_map) {
+             ident_t pos, pt;
+             ident_t lowres = sh_bind(sh, args->feature_map, PL_TEX_ADDRESS_CLAMP,
+                                      PL_TEX_SAMPLE_LINEAR, "feature_map",
+@@ -2430,17 +2636,103 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+                  SH_FLOAT(params->contrast_recovery),
+                  SH_FLOAT(tone.output_min), SH_FLOAT_DYN(tone.output_max));
+ 
+-        } else {
++        } else if (!metric_active) {
+ 
+             GLSL("ipt.x = tone_map(ipt.x); \n");
+         }
+ 
++        if (metric_active) {
++            bool maxrgb_metric =
++                params->tone_mapping_metric == PL_TONE_MAP_METRIC_MAXRGB_ITP ||
++                params->tone_mapping_metric == PL_TONE_MAP_METRIC_MAXRGB_ADAPTIVE ||
++                params->tone_mapping_metric == PL_TONE_MAP_METRIC_MAXRGB_RGB;
++            ident_t pixel_metric = maxrgb_metric
++                ? emit_maxrgb_metric(sh)
++                : emit_bt2020_metric(sh, src.primaries);
++            GLSL("float metric_in = "$"(color.rgb);                       \n"
++                 "float metric_out = tone_map(metric_in);                 \n"
++                 "float metric_in_v = pow(clamp(metric_in, 0.0, 1.0),    \n"
++                 "                          1.0/78.84375);                 \n"
++                 "float metric_out_v = pow(clamp(metric_out, 0.0, 1.0),  \n"
++                 "                           1.0/78.84375);                \n"
++                 "float metric_in_lin = pow(max(metric_in_v-.8359375,0.0)\n"
++                 "    / max(18.8515625-18.6875*metric_in_v,1e-6),        \n"
++                 "      1.0/.1593017578125);                             \n"
++                 "float metric_out_lin = pow(max(metric_out_v-.8359375,0.0)\n"
++                 "    / max(18.8515625-18.6875*metric_out_v,1e-6),       \n"
++                 "      1.0/.1593017578125);                             \n"
++                 "float metric_scale = metric_in_lin > 1e-12            \n"
++                 "    ? metric_out_lin / metric_in_lin : 1.0;           \n",
++                 pixel_metric);
++
++            if (params->tone_mapping_metric == PL_TONE_MAP_METRIC_BT2020_RGB ||
++                params->tone_mapping_metric == PL_TONE_MAP_METRIC_MAXRGB_RGB) {
++                // Homogeneity makes this the exact fixed-hue inverse:
++                // P(scale * RGB) == scale * P(RGB).
++                GLSL("color.rgb *= metric_scale;                           \n"
++                 "lms = "$" * color.rgb;                                \n"
++                 "lmspq = %f * lms;                                      \n"
++                 "lmspq = pow(max(lmspq, 0.0), vec3(%f));                 \n"
++                 "lmspq = (vec3(%f) + %f * lmspq) /                      \n"
++                 "        (vec3(1.0) + %f * lmspq);                      \n"
++                 "lmspq = pow(lmspq, vec3(%f));                          \n"
++                 "ipt = "$" * lmspq;                                    \n",
++                 SH_MAT3(rgb2lms),
++                 PL_COLOR_SDR_WHITE / 10000, PQ_M1, PQ_C1, PQ_C2, PQ_C3,
++                 PQ_M2, lms2ipt);
++            } else {
++                // Apply the metric-derived linear compression to I, retaining
++                // libplacebo's existing ITP chroma and gamut processing.
++                GLSL("float i_v = pow(clamp(i_orig, 0.0, 1.0),           \n"
++                     "                    1.0/78.84375);                  \n"
++                     "float i_lin = pow(max(i_v-.8359375,0.0)            \n"
++                     "    / max(18.8515625-18.6875*i_v,1e-6),            \n"
++                     "      1.0/.1593017578125) * metric_scale;          \n"
++                     "float i_m = pow(clamp(i_lin, 0.0, 1.0),            \n"
++                     "                    .1593017578125);                \n"
++                     "i_m = (.8359375 + 18.8515625*i_m)                  \n"
++                     "    / (1.0 + 18.6875*i_m);                         \n"
++                     "ipt.x = pow(i_m, 78.84375);                        \n");
++            }
++        }
++
+         // Avoid raising saturation excessively when raising brightness, and
+         // also desaturate when reducing brightness greatly to account for the
+         // reduction in gamut volume.
+-        GLSL("vec2 hull = vec2(i_orig, ipt.x);                  \n"
+-             "hull = ((hull - 6.0) * hull + 9.0) * hull;        \n"
+-             "ipt.yz *= min(i_orig / ipt.x, hull.y / hull.x);   \n");
++        if (!metric_active ||
++            params->tone_mapping_metric == PL_TONE_MAP_METRIC_BT2020_ITP ||
++            params->tone_mapping_metric == PL_TONE_MAP_METRIC_BT2020_ADAPTIVE ||
++            params->tone_mapping_metric == PL_TONE_MAP_METRIC_MAXRGB_ITP ||
++            params->tone_mapping_metric == PL_TONE_MAP_METRIC_MAXRGB_ADAPTIVE) {
++            GLSL("vec2 hull = vec2(i_orig, ipt.x);                       \n"
++                 "hull = ((hull - 6.0) * hull + 9.0) * hull;             \n"
++                 "float chroma_scale = min(i_orig / max(ipt.x, 1e-6),   \n"
++                 "                         hull.y / max(hull.x, 1e-6));  \n");
++            if (params->tone_mapping_metric == PL_TONE_MAP_METRIC_BT2020_ADAPTIVE ||
++                params->tone_mapping_metric == PL_TONE_MAP_METRIC_MAXRGB_ADAPTIVE) {
++                // MPC-SK-inspired adaptive chroma retention. Keep the
++                // metric-derived I coordinate, but pull the conservative
++                // libplacebo hull result toward source IPT chroma according
++                // to saturation intent and compression strength. The normal
++                // gamut mapper remains the final output-gamut constraint.
++                GLSL("float rgb_max = max(max(color.r, color.g), color.b); \n"
++                     "float rgb_min = min(min(color.r, color.g), color.b); \n"
++                     "float rgb_sat = rgb_max > 1e-7                       \n"
++                     "    ? clamp((rgb_max-rgb_min)/rgb_max, 0.0, 1.0)    \n"
++                     "    : 0.0;                                           \n"
++                     "float rel_chroma = clamp(length(ipt.yz) /            \n"
++                     "    max(i_orig, 1e-6), 0.0, 1.0);                    \n"
++                     "float sat_intent = clamp(max(rgb_sat,                 \n"
++                     "    0.35*rel_chroma), 0.0, 1.0);                      \n"
++                     "float compression = clamp(1.0-metric_scale,          \n"
++                     "    0.0, 1.0);                                       \n"
++                     "float chroma_keep = clamp(0.50+0.38*sat_intent       \n"
++                     "    - 0.18*compression, 0.0, 1.0);                   \n"
++                     "chroma_keep = max(chroma_keep, 0.68*rgb_sat);        \n"
++                     "chroma_scale = mix(chroma_scale, 1.0, chroma_keep);  \n");
++            }
++            GLSL("ipt.yz *= chroma_scale;                              \n");
++        }
+     }
+ 
+     if (need_gamut_map) {

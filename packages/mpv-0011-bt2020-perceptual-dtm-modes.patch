@@ -1,0 +1,230 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MPV-SK <local@mpv-sk>
+Date: Mon, 3 Aug 2026 20:45:00 -0400
+Subject: [PATCH] vo_gpu_next: add private DTM metric modes
+
+---
+ DOCS/man/input.rst      | 16 ++++++++++++++++
+ DOCS/man/options.rst    | 27 +++++++++++++++++++++++++++
+ player/command.c        |  8 ++++++++
+ video/mp_image.h        |  5 +++++
+ video/out/gpu/video.c   |  8 ++++++++
+ video/out/gpu/video.h   | 11 +++++++++++
+ video/out/vo_gpu_next.c | 38 +++++++++++++++++++++++++++++++++-----
+ 7 files changed, 108 insertions(+), 5 deletions(-)
+
+diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
+index ed5ada576..8ab44ebaf 100644
+--- a/DOCS/man/input.rst
++++ b/DOCS/man/input.rst
+@@ -2932,6 +2932,18 @@ Property list
+         black pixels. It is independent of ``--hdr-peak-percentile`` and is
+         not static MaxFALL metadata.
+ 
++    ``video-params/raw-max-tone-metric-nits``,
++    ``video-params/raw-avg-tone-metric-nits``
++        Unsmoothed percentile peak and PQ-domain frame average for the selected
++        non-standard ``--tone-mapping-metric``, expressed in cd/mÂ². Unavailable
++        in ``standard`` mode.
++
++    ``video-params/smoothed-max-tone-metric-nits``,
++    ``video-params/smoothed-avg-tone-metric-nits``
++        Temporally smoothed peak and average for the selected non-standard
++        metric, after scene-change acceleration. These values define the
++        detected source range used to generate the active tone-mapping curve.
++
+     ``video-params/dolby-vision-el-type``
+         Dolby Vision enhancement layer type of the current frame, as signalled
+         by the RPU. Either ``fel`` (full enhancement layer: carries residual
+@@ -2994,6 +3006,10 @@ Property list
+             "raw-avg-pq-y"      MPV_FORMAT_DOUBLE
+             "raw-max-rgb-nits"  MPV_FORMAT_DOUBLE
+             "raw-avg-rgb-nits"  MPV_FORMAT_DOUBLE
++            "raw-max-tone-metric-nits" MPV_FORMAT_DOUBLE
++            "raw-avg-tone-metric-nits" MPV_FORMAT_DOUBLE
++            "smoothed-max-tone-metric-nits" MPV_FORMAT_DOUBLE
++            "smoothed-avg-tone-metric-nits" MPV_FORMAT_DOUBLE
+             "dolby-vision-el-type" MPV_FORMAT_STRING
+             "prim-red-x"        MPV_FORMAT_DOUBLE
+             "prim-red-y"        MPV_FORMAT_DOUBLE
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index 3fed8f062..54bff121d 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -7730,6 +7730,33 @@ them.
+     st2094-10
+         Specifies the contrast (slope) at the knee point. Defaults to 1.0.
+ 
++``--tone-mapping-metric=<standard|bt2020-itp|bt2020-adaptive|bt2020-rgb|maxrgb-itp|maxrgb-adaptive|maxrgb-rgb>``
++    Selects the brightness metric for renderer-generated dynamic tone mapping.
++    ``standard`` uses libplacebo's normal brightness metric.
++    The three ``bt2020`` modes use MPV-SK's smooth, homogeneous approximation of
++    the selected literal p=1 BT.2020 perceptual coordinate. ``bt2020-itp``
++    applies the metric-derived compression to I while retaining libplacebo's
++    normal conservative ITP chroma processing. ``bt2020-adaptive`` retains
++    progressively more source IPT chroma for saturated pixels while keeping
++    the same metric-derived I coordinate. ``bt2020-rgb`` applies the exact
++    fixed-hue inverse along the linear RGB ray.
++
++    The three ``maxrgb`` modes use per-pixel ``max(R,G,B)`` for both the
++    percentile/average frame statistics that generate the curve and the
++    per-pixel curve lookup. ``maxrgb-itp`` applies the resulting compression
++    to I with conservative chroma processing, ``maxrgb-adaptive`` uses the
++    same adaptive chroma retention, and ``maxrgb-rgb`` applies it exactly
++    along the linear RGB ray.
++
++    These modes are used only for generic, pixel-measured DTM. If tone mapping is
++    inactive, peak measurement is disabled or unavailable, HDR10+ authored
++    mapping is active, or Dolby Vision L1 metadata is selected as the mapping
++    range, the renderer automatically uses ``standard`` for that frame. The
++    requested option and all physical HDR metadata (including MaxCLL, MaxFALL,
++    mastering display data, and Dolby Vision/HDR10+ metadata) are preserved.
++    Dolby Vision reshape/RPU processing alone does not disable these modes.
++    (``--vo=gpu-next`` only)
++
+ ``--inverse-tone-mapping``
+     If set, allows inverse tone mapping (expanding dynamic range). Can be used
+     for upscaling SDR content to HDR, or for making HDR content brighter.
+diff --git a/player/command.c b/player/command.c
+index 4184189d6..ded9f6730 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -2579,6 +2579,14 @@ static int property_imgparams(const struct mp_image_params *p, int action, void
+                             .unavailable = !peak->valid},
+         {"raw-avg-rgb-nits", SUB_PROP_FLOAT(peak->raw_avg_rgb),
+                             .unavailable = !peak->valid},
++        {"raw-max-tone-metric-nits", SUB_PROP_FLOAT(peak->raw_max_tone_metric),
++                            .unavailable = !peak->tone_metric_valid},
++        {"raw-avg-tone-metric-nits", SUB_PROP_FLOAT(peak->raw_avg_tone_metric),
++                            .unavailable = !peak->tone_metric_valid},
++        {"smoothed-max-tone-metric-nits", SUB_PROP_FLOAT(peak->smoothed_max_tone_metric),
++                            .unavailable = !peak->tone_metric_valid},
++        {"smoothed-avg-tone-metric-nits", SUB_PROP_FLOAT(peak->smoothed_avg_tone_metric),
++                            .unavailable = !peak->tone_metric_valid},
+         {"dolby-vision-el-type",
+             SUB_PROP_STR(p->dovi_el_type == MP_DOVI_EL_FEL ? "fel" : "mel"),
+             .unavailable = p->dovi_el_type == MP_DOVI_EL_NONE},
+diff --git a/video/mp_image.h b/video/mp_image.h
+index 550cc19b7..e499bee66 100644
+--- a/video/mp_image.h
++++ b/video/mp_image.h
+@@ -55,10 +55,15 @@ enum mp_dovi_el_type {
+ // not participate in image-parameter equality or trigger a VO reconfigure.
+ struct mp_peak_detect_metrics {
+     bool valid;
++    bool tone_metric_valid;
+     float raw_max_pq_y;         // percentile CIE Y peak, PQ 0-1
+     float raw_avg_pq_y;         // average CIE Y, PQ 0-1
+     float raw_max_rgb;          // percentile maxRGB peak, cd/m^2
+     float raw_avg_rgb;          // average maxRGB, cd/m^2
++    float raw_max_tone_metric;       // percentile private-metric peak
++    float raw_avg_tone_metric;       // average private-metric value
++    float smoothed_max_tone_metric;  // curve input peak after smoothing
++    float smoothed_avg_tone_metric;  // curve input average after smoothing
+ };
+ 
+ // Describes image parameters that usually stay constant.
+diff --git a/video/out/gpu/video.c b/video/out/gpu/video.c
+index 656c11c29..2d7e873cd 100644
+--- a/video/out/gpu/video.c
++++ b/video/out/gpu/video.c
+@@ -468,6 +468,14 @@ const struct m_sub_options gl_video_conf = {
+             {"st2094-40", TONE_MAPPING_ST2094_40},
+             {"st2094-10", TONE_MAPPING_ST2094_10})},
+         {"tone-mapping-param", OPT_FLOATDEF(tone_map.curve_param)},
++        {"tone-mapping-metric", OPT_CHOICE(tone_map.metric,
++            {"standard",   TONE_MAPPING_METRIC_STANDARD},
++            {"bt2020-itp", TONE_MAPPING_METRIC_BT2020_ITP},
++            {"bt2020-adaptive", TONE_MAPPING_METRIC_BT2020_ADAPTIVE},
++            {"bt2020-rgb", TONE_MAPPING_METRIC_BT2020_RGB},
++            {"maxrgb-itp", TONE_MAPPING_METRIC_MAXRGB_ITP},
++            {"maxrgb-adaptive", TONE_MAPPING_METRIC_MAXRGB_ADAPTIVE},
++            {"maxrgb-rgb", TONE_MAPPING_METRIC_MAXRGB_RGB})},
+         {"inverse-tone-mapping", OPT_BOOL(tone_map.inverse)},
+         {"tone-mapping-max-boost", OPT_FLOAT(tone_map.max_boost),
+             M_RANGE(1.0, 10.0)},
+diff --git a/video/out/gpu/video.h b/video/out/gpu/video.h
+index a5b03adfb..ca3f7004d 100644
+--- a/video/out/gpu/video.h
++++ b/video/out/gpu/video.h
+@@ -101,6 +101,16 @@ enum tone_mapping {
+     TONE_MAPPING_ST2094_10,
+ };
+ 
++enum tone_mapping_metric {
++    TONE_MAPPING_METRIC_STANDARD,
++    TONE_MAPPING_METRIC_BT2020_ITP,
++    TONE_MAPPING_METRIC_BT2020_ADAPTIVE,
++    TONE_MAPPING_METRIC_BT2020_RGB,
++    TONE_MAPPING_METRIC_MAXRGB_ITP,
++    TONE_MAPPING_METRIC_MAXRGB_ADAPTIVE,
++    TONE_MAPPING_METRIC_MAXRGB_RGB,
++};
++
+ enum gamut_mode {
+     GAMUT_AUTO,
+     GAMUT_CLIP,
+@@ -116,6 +126,7 @@ enum gamut_mode {
+ 
+ struct gl_tone_map_opts {
+     int curve;
++    int metric;
+     float curve_param;
+     float max_boost;
+     bool inverse;
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 5b4813829..700280ac2 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -1699,11 +1699,16 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+         struct pl_peak_detect_metrics metrics;
+         if (pl_renderer_get_peak_detect_metrics(p->rr, &metrics)) {
+             vo->params->peak_detect = (struct mp_peak_detect_metrics) {
+-                .valid        = true,
+-                .raw_max_pq_y = metrics.raw_max_pq_y,
+-                .raw_avg_pq_y = metrics.raw_avg_pq_y,
+-                .raw_max_rgb  = metrics.raw_max_rgb,
+-                .raw_avg_rgb  = metrics.raw_avg_rgb,
++                .valid               = true,
++                .tone_metric_valid   = metrics.metric != PL_TONE_MAP_METRIC_STANDARD,
++                .raw_max_pq_y        = metrics.raw_max_pq_y,
++                .raw_avg_pq_y        = metrics.raw_avg_pq_y,
++                .raw_max_rgb         = metrics.raw_max_rgb,
++                .raw_avg_rgb         = metrics.raw_avg_rgb,
++                .raw_max_tone_metric      = metrics.raw_max_metric,
++                .raw_avg_tone_metric      = metrics.raw_avg_metric,
++                .smoothed_max_tone_metric = metrics.smoothed_max_metric,
++                .smoothed_avg_tone_metric = metrics.smoothed_avg_metric,
+             };
+         } else {
+             vo->params->peak_detect = (struct mp_peak_detect_metrics) {0};
+@@ -2946,6 +2951,29 @@ AV_NOWARN_DEPRECATED(
+     if (isnan(pars->color_map_params.tone_mapping_param)) // vo_gpu compatibility
+         pars->color_map_params.tone_mapping_param = 0.0;
+ )
++    switch (opts->tone_map.metric) {
++    case TONE_MAPPING_METRIC_BT2020_ITP:
++        pars->color_map_params.tone_mapping_metric = PL_TONE_MAP_METRIC_BT2020_ITP;
++        break;
++    case TONE_MAPPING_METRIC_BT2020_ADAPTIVE:
++        pars->color_map_params.tone_mapping_metric = PL_TONE_MAP_METRIC_BT2020_ADAPTIVE;
++        break;
++    case TONE_MAPPING_METRIC_BT2020_RGB:
++        pars->color_map_params.tone_mapping_metric = PL_TONE_MAP_METRIC_BT2020_RGB;
++        break;
++    case TONE_MAPPING_METRIC_MAXRGB_ITP:
++        pars->color_map_params.tone_mapping_metric = PL_TONE_MAP_METRIC_MAXRGB_ITP;
++        break;
++    case TONE_MAPPING_METRIC_MAXRGB_ADAPTIVE:
++        pars->color_map_params.tone_mapping_metric = PL_TONE_MAP_METRIC_MAXRGB_ADAPTIVE;
++        break;
++    case TONE_MAPPING_METRIC_MAXRGB_RGB:
++        pars->color_map_params.tone_mapping_metric = PL_TONE_MAP_METRIC_MAXRGB_RGB;
++        break;
++    default:
++        pars->color_map_params.tone_mapping_metric = PL_TONE_MAP_METRIC_STANDARD;
++        break;
++    }
+     pars->color_map_params.inverse_tone_mapping = opts->tone_map.inverse;
+     pars->color_map_params.contrast_recovery = opts->tone_map.contrast_recovery;
+     pars->color_map_params.visualize_lut = opts->tone_map.visualize;
