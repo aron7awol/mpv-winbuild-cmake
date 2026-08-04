@@ -1,17 +1,17 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 271f9ddd3af6dd8de1b890259644974034c8d11c Mon Sep 17 00:00:00 2001
 From: MPV-SK <local@mpv-sk>
 Date: Mon, 3 Aug 2026 20:45:00 -0400
 Subject: [PATCH] vo_gpu_next: add private DTM metric modes
 
 ---
  DOCS/man/input.rst      | 16 ++++++++++++++++
- DOCS/man/options.rst    | 27 +++++++++++++++++++++++++++
+ DOCS/man/options.rst    | 35 +++++++++++++++++++++++++++++++++++
  player/command.c        |  8 ++++++++
  video/mp_image.h        |  5 +++++
- video/out/gpu/video.c   |  8 ++++++++
- video/out/gpu/video.h   | 11 +++++++++++
- video/out/vo_gpu_next.c | 38 +++++++++++++++++++++++++++++++++-----
- 7 files changed, 108 insertions(+), 5 deletions(-)
+ video/out/gpu/video.c   | 11 +++++++++++
+ video/out/gpu/video.h   | 12 ++++++++++++
+ video/out/vo_gpu_next.c | 40 +++++++++++++++++++++++++++++++++++-----
+ 7 files changed, 122 insertions(+), 5 deletions(-)
 
 diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
 index ed5ada576..8ab44ebaf 100644
@@ -48,10 +48,10 @@ index ed5ada576..8ab44ebaf 100644
              "prim-red-x"        MPV_FORMAT_DOUBLE
              "prim-red-y"        MPV_FORMAT_DOUBLE
 diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
-index 3fed8f062..54bff121d 100644
+index 3fed8f062..edd9e734d 100644
 --- a/DOCS/man/options.rst
 +++ b/DOCS/man/options.rst
-@@ -7730,6 +7730,33 @@ them.
+@@ -7730,6 +7730,41 @@ them.
      st2094-10
          Specifies the contrast (slope) at the knee point. Defaults to 1.0.
  
@@ -81,6 +81,14 @@ index 3fed8f062..54bff121d 100644
 +    mastering display data, and Dolby Vision/HDR10+ metadata) are preserved.
 +    Dolby Vision reshape/RPU processing alone does not disable these modes.
 +    (``--vo=gpu-next`` only)
++
++``--tone-mapping-adaptive-chroma-strength=<0..100>``
++    Controls how strongly the ``bt2020-adaptive`` and ``maxrgb-adaptive``
++    modes restore chroma removed by libplacebo's normal ITP hull processing.
++    ``0`` is identical to the corresponding ``itp`` mode, while ``100``
++    reproduces the full adaptive formula. The default is ``50``. This option
++    does not alter the selected brightness metric, peak measurements, temporal
++    smoothing, tone curve, or final gamut mapping. (``--vo=gpu-next`` only)
 +
  ``--inverse-tone-mapping``
      If set, allows inverse tone mapping (expanding dynamic range). Can be used
@@ -125,10 +133,18 @@ index 550cc19b7..e499bee66 100644
  
  // Describes image parameters that usually stay constant.
 diff --git a/video/out/gpu/video.c b/video/out/gpu/video.c
-index 656c11c29..2d7e873cd 100644
+index 656c11c29..642639cfb 100644
 --- a/video/out/gpu/video.c
 +++ b/video/out/gpu/video.c
-@@ -468,6 +468,14 @@ const struct m_sub_options gl_video_conf = {
+@@ -399,6 +399,7 @@ static const struct gl_video_opts gl_video_opts_def = {
+     .gamma = 1.0f,
+     .tone_map = {
+         .curve = TONE_MAPPING_AUTO,
++        .adaptive_chroma_strength = 50.0,
+         .curve_param = NAN,
+         .max_boost = 1.0,
+         .decay_rate = 20.0,
+@@ -468,6 +469,16 @@ const struct m_sub_options gl_video_conf = {
              {"st2094-40", TONE_MAPPING_ST2094_40},
              {"st2094-10", TONE_MAPPING_ST2094_10})},
          {"tone-mapping-param", OPT_FLOATDEF(tone_map.curve_param)},
@@ -140,11 +156,13 @@ index 656c11c29..2d7e873cd 100644
 +            {"maxrgb-itp", TONE_MAPPING_METRIC_MAXRGB_ITP},
 +            {"maxrgb-adaptive", TONE_MAPPING_METRIC_MAXRGB_ADAPTIVE},
 +            {"maxrgb-rgb", TONE_MAPPING_METRIC_MAXRGB_RGB})},
++        {"tone-mapping-adaptive-chroma-strength",
++            OPT_FLOAT(tone_map.adaptive_chroma_strength), M_RANGE(0.0, 100.0)},
          {"inverse-tone-mapping", OPT_BOOL(tone_map.inverse)},
          {"tone-mapping-max-boost", OPT_FLOAT(tone_map.max_boost),
              M_RANGE(1.0, 10.0)},
 diff --git a/video/out/gpu/video.h b/video/out/gpu/video.h
-index a5b03adfb..ca3f7004d 100644
+index a5b03adfb..8ba031b35 100644
 --- a/video/out/gpu/video.h
 +++ b/video/out/gpu/video.h
 @@ -101,6 +101,16 @@ enum tone_mapping {
@@ -164,16 +182,17 @@ index a5b03adfb..ca3f7004d 100644
  enum gamut_mode {
      GAMUT_AUTO,
      GAMUT_CLIP,
-@@ -116,6 +126,7 @@ enum gamut_mode {
+@@ -116,6 +126,8 @@ enum gamut_mode {
  
  struct gl_tone_map_opts {
      int curve;
 +    int metric;
++    float adaptive_chroma_strength;
      float curve_param;
      float max_boost;
      bool inverse;
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index 5b4813829..700280ac2 100644
+index 5b4813829..a6d349c12 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
 @@ -1699,11 +1699,16 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
@@ -198,7 +217,7 @@ index 5b4813829..700280ac2 100644
              };
          } else {
              vo->params->peak_detect = (struct mp_peak_detect_metrics) {0};
-@@ -2946,6 +2951,29 @@ AV_NOWARN_DEPRECATED(
+@@ -2946,6 +2951,31 @@ AV_NOWARN_DEPRECATED(
      if (isnan(pars->color_map_params.tone_mapping_param)) // vo_gpu compatibility
          pars->color_map_params.tone_mapping_param = 0.0;
  )
@@ -225,6 +244,10 @@ index 5b4813829..700280ac2 100644
 +        pars->color_map_params.tone_mapping_metric = PL_TONE_MAP_METRIC_STANDARD;
 +        break;
 +    }
++    pars->color_map_params.adaptive_chroma_strength =
++        opts->tone_map.adaptive_chroma_strength / 100.0f;
      pars->color_map_params.inverse_tone_mapping = opts->tone_map.inverse;
      pars->color_map_params.contrast_recovery = opts->tone_map.contrast_recovery;
      pars->color_map_params.visualize_lut = opts->tone_map.visualize;
+-- 
+2.54.0.windows.1

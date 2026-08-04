@@ -1,0 +1,302 @@
+From 361ef2f6efd5085cb44591cba686791dee8ae688 Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Tue, 4 Aug 2026 17:20:26 -0400
+Subject: [PATCH] vo_gpu_next: reset peak smoothing at authored scene cuts
+
+---
+ DOCS/man/options.rst         |  8 +++++
+ filters/f_enhancement_pair.c |  2 ++
+ player/command.c             | 11 ++++++
+ video/filter/vf_format.c     |  2 ++
+ video/mp_image.c             | 18 ++++++++++
+ video/mp_image.h             | 14 ++++++++
+ video/out/vo_gpu_next.c      | 68 ++++++++++++++++++++++++++++++++++++
+ 7 files changed, 123 insertions(+)
+
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index 54bff121d..87fba24f2 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -7840,6 +7840,14 @@ them.
+     advanced scaling is enabled. Defaults to no. (Only affects
+     ``--vo=gpu-next``, note that ``--vo=gpu`` always delays the peak.)
+ 
++``--hdr-authored-scene-reset=<yes|no>``
++    When measured HDR peak detection is active, reset its temporal smoothing at
++    authored scene boundaries. Dolby Vision uses the RPU scene refresh flag.
++    HDR10+ boundaries are inferred when a new dynamic-metadata signature remains
++    stable for two decoded frames. The reset is associated with the matching GPU
++    measurement even when delayed peak detection is enabled. Defaults to yes.
++    (Only for ``--vo=gpu-next``)
++
+ ``--hdr-peak-percentile=<0.0..100.0>``
+     Which percentile of the input image brightness histogram to consider as the
+     true peak of the scene. If this is set to 100 (default), the
+diff --git a/filters/f_enhancement_pair.c b/filters/f_enhancement_pair.c
+index 16a4966e6..0aa338022 100644
+--- a/filters/f_enhancement_pair.c
++++ b/filters/f_enhancement_pair.c
+@@ -103,6 +103,8 @@ static void inherit_dovi_from_el(struct mp_image *bl, struct mp_image *el)
+         return;
+     if (el->params.dovi_el_type != MP_DOVI_EL_NONE)
+         bl->params.dovi_el_type = el->params.dovi_el_type;
++    bl->params.authored_scene_cut |=
++        el->params.authored_scene_cut & MP_SCENE_CUT_DOVI;
+     if (!el->dovi)
+         return;
+     if (bl->dovi)
+diff --git a/player/command.c b/player/command.c
+index ded9f6730..56bd0bf88 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -2579,6 +2579,17 @@ static int property_imgparams(const struct mp_image_params *p, int action, void
+                             .unavailable = !peak->valid},
+         {"raw-avg-rgb-nits", SUB_PROP_FLOAT(peak->raw_avg_rgb),
+                             .unavailable = !peak->valid},
++        {"peak-scene-reset", SUB_PROP_BOOL(peak->scene_reset),
++                            .unavailable = !peak->valid},
++        {"peak-scene-reset-count", SUB_PROP_INT64(peak->scene_reset_count),
++                            .unavailable = !peak->valid},
++        {"peak-scene-reset-source",
++            SUB_PROP_STR(peak->scene_reset_source == MP_SCENE_CUT_DOVI
++                         ? "dv" : peak->scene_reset_source == MP_SCENE_CUT_HDR10PLUS
++                         ? "hdr10plus" : peak->scene_reset_source ==
++                           (MP_SCENE_CUT_DOVI | MP_SCENE_CUT_HDR10PLUS)
++                         ? "dv+hdr10plus" : "none"),
++            .unavailable = !peak->valid},
+         {"raw-max-tone-metric-nits", SUB_PROP_FLOAT(peak->raw_max_tone_metric),
+                             .unavailable = !peak->tone_metric_valid},
+         {"raw-avg-tone-metric-nits", SUB_PROP_FLOAT(peak->raw_avg_tone_metric),
+diff --git a/video/filter/vf_format.c b/video/filter/vf_format.c
+index e5a049c42..664fae41e 100644
+--- a/video/filter/vf_format.c
++++ b/video/filter/vf_format.c
+@@ -203,6 +203,8 @@ static void vf_format_process(struct mp_filter *f)
+                    sizeof(img->params.color.hdr.scene_max));
+             img->params.color.hdr.scene_avg = 0;
+             img->params.color.hdr.ootf = (struct pl_hdr_bezier){0};
++            img->params.hdr10plus_signature = 0;
++            img->params.authored_scene_cut &= ~MP_SCENE_CUT_HDR10PLUS;
+         }
+ 
+         if (priv->opts->min_luma)
+diff --git a/video/mp_image.c b/video/mp_image.c
+index b2c03f4e8..4519d6c3c 100644
+--- a/video/mp_image.c
++++ b/video/mp_image.c
+@@ -561,6 +561,8 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
+     dst->params.primaries_orig = src->params.primaries_orig;
+     dst->params.transfer_orig = src->params.transfer_orig;
+     dst->params.sys_orig = src->params.sys_orig;
++    dst->params.authored_scene_cut = src->params.authored_scene_cut;
++    dst->params.hdr10plus_signature = src->params.hdr10plus_signature;
+     dst->params.no_dovi = src->params.no_dovi;
+     dst->params.no_enhancement_layer = src->params.no_enhancement_layer;
+ 
+@@ -904,6 +906,8 @@ void mp_image_params_update_dynamic(struct mp_image_params *dst,
+     // update rather than the static params; without this the property would
+     // keep reporting the value from the first frame of the stream.
+     dst->dovi_el_type = src->dovi_el_type;
++    dst->authored_scene_cut = src->authored_scene_cut;
++    dst->hdr10plus_signature = src->hdr10plus_signature;
+     // Don't overwrite peak-detected HDR metadata if available.
+     float max_pq_y = dst->color.hdr.max_pq_y;
+     float avg_pq_y = dst->color.hdr.avg_pq_y;
+@@ -1171,6 +1175,17 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
+     AVFrameSideData *mdm = av_frame_get_side_data(src, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+     AVFrameSideData *clm = av_frame_get_side_data(src, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+     AVFrameSideData *dhp = av_frame_get_side_data(src, AV_FRAME_DATA_DYNAMIC_HDR_PLUS);
++    if (dhp) {
++        // FFmpeg's parsed structure contains no explicit scene boundary flag.
++        // Preserve an exact per-frame fingerprint so gpu-next can infer stable
++        // ST 2094-40 metadata transitions without relying on lossy float fields.
++        uint64_t hash = 1469598103934665603ULL;
++        for (size_t i = 0; i < dhp->size; i++) {
++            hash ^= dhp->data[i];
++            hash *= 1099511628211ULL;
++        }
++        dst->params.hdr10plus_signature = hash ? hash : 1;
++    }
+     pl_map_hdr_metadata(&dst->params.color.hdr, &(struct pl_av_hdr_metadata) {
+         .mdm = (void *)(mdm ? mdm->data : NULL),
+         .clm = (void *)(clm ? clm->data : NULL),
+@@ -1204,6 +1219,9 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
+             dst->params.dovi_el_type =
+                 mapping->nlq_method_idc == AV_DOVI_NLQ_NONE ? MP_DOVI_EL_MEL
+                                                             : MP_DOVI_EL_FEL;
++            const AVDOVIColorMetadata *color = av_dovi_get_color(metadata);
++            if (color->scene_refresh_flag)
++                dst->params.authored_scene_cut |= MP_SCENE_CUT_DOVI;
+         }
+ #if PL_API_VER < 364
+         const AVDOVIRpuDataHeader *header = av_dovi_get_header(metadata);
+diff --git a/video/mp_image.h b/video/mp_image.h
+index e499bee66..defe0e61a 100644
+--- a/video/mp_image.h
++++ b/video/mp_image.h
+@@ -50,12 +50,21 @@ enum mp_dovi_el_type {
+     MP_DOVI_EL_FEL,             // EL present, carries residual picture data
+ };
+ 
++enum mp_authored_scene_cut {
++    MP_SCENE_CUT_NONE      = 0,
++    MP_SCENE_CUT_DOVI      = 1 << 0,
++    MP_SCENE_CUT_HDR10PLUS = 1 << 1,
++};
++
+ // Per-frame peak-detection measurements produced by the video output. These
+ // are dynamic renderer results rather than source metadata, and therefore must
+ // not participate in image-parameter equality or trigger a VO reconfigure.
+ struct mp_peak_detect_metrics {
+     bool valid;
+     bool tone_metric_valid;
++    bool scene_reset;
++    unsigned scene_reset_source;
++    uint64_t scene_reset_count;
+     float raw_max_pq_y;         // percentile CIE Y peak, PQ 0-1
+     float raw_avg_pq_y;         // average CIE Y, PQ 0-1
+     float raw_max_rgb;          // percentile maxRGB peak, cd/m^2
+@@ -95,6 +104,11 @@ struct mp_image_params {
+     // like color.hdr, so it is deliberately NOT part of
+     // mp_image_params_equal() -- it must not trigger a VO reconfigure.
+     enum mp_dovi_el_type dovi_el_type;
++    // Per-frame authored boundary hints. These are dynamic metadata and must
++    // not participate in parameter equality or trigger VO reconfiguration.
++    unsigned authored_scene_cut;
++    // Exact fingerprint of parsed AV_FRAME_DATA_DYNAMIC_HDR_PLUS side data.
++    uint64_t hdr10plus_signature;
+     struct mp_peak_detect_metrics peak_detect;
+     // Flags for f_enhancement_pair.c to not inherit flags from EL.
+     bool no_dovi;
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 700280ac2..bdcb454bd 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -146,6 +146,10 @@ struct priv {
+     bool frame_pending;
+     bool paused;
+ 
++    uint64_t hdr10plus_stable_signature;
++    uint64_t hdr10plus_candidate_signature;
++    int hdr10plus_candidate_frames;
++
+     pl_options pars;
+     struct m_config_cache *opts_cache;
+     struct m_config_cache *next_opts_cache;
+@@ -180,6 +184,7 @@ static void update_lut(struct priv *p, struct user_lut *lut);
+ 
+ struct gl_next_opts {
+     bool delayed_peak;
++    bool authored_scene_reset;
+     int sub_hdr_peak;
+     int image_subs_hdr_peak;
+     int border_background;
+@@ -212,6 +217,7 @@ const struct m_sub_options gl_next_conf = {
+         {"image-subs-hdr-peak", OPT_CHOICE(image_subs_hdr_peak, {"sdr", PL_COLOR_SDR_WHITE},
+             {"video", -1}, {"video-static", -2}, {"video-dynamic", -3}),  M_RANGE(10, 10000)},
+         {"allow-delayed-peak-detect", OPT_BOOL(delayed_peak)},
++        {"hdr-authored-scene-reset", OPT_BOOL(authored_scene_reset)},
+         {"border-background", OPT_CHOICE(border_background,
+             {"none",  BACKGROUND_NONE},
+             {"color", BACKGROUND_COLOR},
+@@ -241,6 +247,7 @@ const struct m_sub_options gl_next_conf = {
+         .image_subs_hdr_peak = 1000,
+         .target_hint = -1,
+         .target_hint_strict = true,
++        .authored_scene_reset = true,
+     },
+     .size = sizeof(struct gl_next_opts),
+     .change_flags = UPDATE_VIDEO,
+@@ -484,8 +491,54 @@ struct frame_priv {
+     struct ra_hwdec *el_hwdec;
+     pl_tex el_tex[4];
+     struct pl_frame el_frame;
++    unsigned authored_scene_cut;
+ };
+ 
++static void reset_authored_scene_state(struct priv *p)
++{
++    p->hdr10plus_stable_signature = 0;
++    p->hdr10plus_candidate_signature = 0;
++    p->hdr10plus_candidate_frames = 0;
++}
++
++static unsigned detect_authored_scene_cut(struct priv *p,
++                                          const struct mp_image_params *par)
++{
++    unsigned cut = par->authored_scene_cut;
++    uint64_t sig = par->hdr10plus_signature;
++
++    if (!sig) {
++        reset_authored_scene_state(p);
++        return cut;
++    }
++
++    if (!p->hdr10plus_stable_signature) {
++        p->hdr10plus_stable_signature = sig;
++        return cut;
++    }
++
++    if (sig == p->hdr10plus_stable_signature) {
++        p->hdr10plus_candidate_signature = 0;
++        p->hdr10plus_candidate_frames = 0;
++        return cut;
++    }
++
++    if (sig != p->hdr10plus_candidate_signature) {
++        p->hdr10plus_candidate_signature = sig;
++        p->hdr10plus_candidate_frames = 1;
++        return cut;
++    }
++
++    if (++p->hdr10plus_candidate_frames >= 2) {
++        cut |= MP_SCENE_CUT_HDR10PLUS;
++        p->hdr10plus_stable_signature = sig;
++        p->hdr10plus_candidate_signature = 0;
++        p->hdr10plus_candidate_frames = 0;
++    }
++
++    return cut;
++}
++
+ static int plane_data_from_imgfmt(struct pl_plane_data out_data[4],
+                                   struct pl_bit_encoding *out_bits,
+                                   enum mp_imgfmt imgfmt, bool use_uint)
+@@ -895,6 +948,17 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
+         .rotation = par.rotate / 90,
+         .user_data = mpi,
+     };
++    fp->authored_scene_cut = detect_authored_scene_cut(p, &mpi->params);
++    frame->scene_cut = p->next_opts->authored_scene_reset &&
++                       fp->authored_scene_cut != MP_SCENE_CUT_NONE;
++    frame->scene_cut_tag = fp->authored_scene_cut;
++    if (frame->scene_cut) {
++        const char *source = fp->authored_scene_cut == MP_SCENE_CUT_DOVI
++            ? "Dolby Vision" : fp->authored_scene_cut == MP_SCENE_CUT_HDR10PLUS
++            ? "HDR10+" : "Dolby Vision + HDR10+";
++        MP_VERBOSE(vo, "Resetting measured HDR smoothing at %s boundary "
++                   "(PTS %.3f)\n", source, mpi->pts);
++    }
+ 
+     const struct gl_video_opts *opts = p->opts_cache->opts;
+     float ref_luma;
+@@ -1287,6 +1351,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+             pl_queue_reset(p->queue);
+             p->last_pts = 0.0;
+             p->last_id = 0;
++            reset_authored_scene_state(p);
+             p->want_reset = false;
+             p->flush_cache = true;
+         }
+@@ -1701,6 +1766,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+             vo->params->peak_detect = (struct mp_peak_detect_metrics) {
+                 .valid               = true,
+                 .tone_metric_valid   = metrics.metric != PL_TONE_MAP_METRIC_STANDARD,
++                .scene_reset         = metrics.scene_reset,
++                .scene_reset_source  = metrics.scene_reset_tag,
++                .scene_reset_count   = metrics.scene_reset_count,
+                 .raw_max_pq_y        = metrics.raw_max_pq_y,
+                 .raw_avg_pq_y        = metrics.raw_avg_pq_y,
+                 .raw_max_rgb         = metrics.raw_max_rgb,
+-- 
+2.54.0.windows.1

@@ -1,14 +1,14 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From f624cf2282dbeed8c322ec7dd45730ca4e58b92d Mon Sep 17 00:00:00 2001
 From: Aaron <aaronmedeiros@gmail.com>
 Date: Mon, 3 Aug 2026 22:44:30 -0400
 Subject: [PATCH] shaders: add smoothed private DTM metrics
 
 ---
  meson.build                                 |   1 +
- src/include/libplacebo/shaders/colorspace.h |  30 ++
+ src/include/libplacebo/shaders/colorspace.h |  35 +++
  src/renderer.c                              |   5 +-
- src/shaders/colorspace.c                    | 316 +++++++++++++++++++-
- 4 files changed, 339 insertions(+), 13 deletions(-)
+ src/shaders/colorspace.c                    | 320 +++++++++++++++++++-
+ 4 files changed, 348 insertions(+), 13 deletions(-)
 
 diff --git a/meson.build b/meson.build
 index 3832230b..d73bbfbc 100644
@@ -23,7 +23,7 @@ index 3832230b..d73bbfbc 100644
        '371': 'input frame.hdr.max_luma is now respecte when frame has ICC profile',
        '370': 'deprecate pl_avdovi_metadata_supported and pl_avframe_params.map_dovi_force',
 diff --git a/src/include/libplacebo/shaders/colorspace.h b/src/include/libplacebo/shaders/colorspace.h
-index 373e3f6b..2bfa2cb5 100644
+index 373e3f6b..4cfe4313 100644
 --- a/src/include/libplacebo/shaders/colorspace.h
 +++ b/src/include/libplacebo/shaders/colorspace.h
 @@ -123,6 +123,18 @@ PL_API void pl_shader_sigmoidize(pl_shader sh, const struct pl_sigmoid_params *p
@@ -86,7 +86,7 @@ index 373e3f6b..2bfa2cb5 100644
  // After dispatching the above shader, this function can be used to retrieve
  // the detected dynamic HDR10+ metadata parameters. The other fields of
  // `metadata` are not written to. Returns whether or not any values were
-@@ -317,6 +343,10 @@ struct pl_color_map_params {
+@@ -317,6 +343,14 @@ struct pl_color_map_params {
      // value allows overriding the default metadata preference logic.
      enum pl_hdr_metadata_type metadata;
  
@@ -94,9 +94,21 @@ index 373e3f6b..2bfa2cb5 100644
 +    // result is present. They are intentionally ignored for authored metadata.
 +    enum pl_tone_map_metric tone_mapping_metric;
 +
++    // Global strength of the private adaptive-chroma correction, from 0.0
++    // (normal ITP hull processing) to 1.0 (full adaptive formula).
++    float adaptive_chroma_strength;
++
      // Tone mapping LUT size. Defaults to 256.
      int lut_size;
  
+@@ -368,6 +402,7 @@ struct pl_color_map_params {
+     .gamut_constants        = { PL_GAMUT_MAP_CONSTANTS },       \
+     .tone_constants         = { PL_TONE_MAP_CONSTANTS },        \
+     .metadata               = PL_HDR_METADATA_ANY,              \
++    .adaptive_chroma_strength = 0.5f,                           \
+     .lut3d_size             = {48, 32, 256},                    \
+     .lut_size               = 256,                              \
+     .visualize_rect         = {0, 0, 1, 1},                     \
 diff --git a/src/renderer.c b/src/renderer.c
 index 5d70743d..fb5065d3 100644
 --- a/src/renderer.c
@@ -115,7 +127,7 @@ index 5d70743d..fb5065d3 100644
          PL_WARN(rr, "Failed creating HDR peak detection shader.. disabling");
          rr->errors |= PL_RENDER_ERR_PEAK_DETECT;
 diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
-index 8fc3363b..bcca0575 100644
+index 8fc3363b..9502bd08 100644
 --- a/src/shaders/colorspace.c
 +++ b/src/shaders/colorspace.c
 @@ -979,7 +979,8 @@ static bool peak_detect_params_eq(const struct pl_peak_detect_params *a,
@@ -511,7 +523,7 @@ index 8fc3363b..bcca0575 100644
              ident_t pos, pt;
              ident_t lowres = sh_bind(sh, args->feature_map, PL_TEX_ADDRESS_CLAMP,
                                       PL_TEX_SAMPLE_LINEAR, "feature_map",
-@@ -2430,17 +2636,103 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+@@ -2430,17 +2636,107 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
                   SH_FLOAT(params->contrast_recovery),
                   SH_FLOAT(tone.output_min), SH_FLOAT_DYN(tone.output_max));
  
@@ -593,6 +605,8 @@ index 8fc3363b..bcca0575 100644
 +                 "                         hull.y / max(hull.x, 1e-6));  \n");
 +            if (params->tone_mapping_metric == PL_TONE_MAP_METRIC_BT2020_ADAPTIVE ||
 +                params->tone_mapping_metric == PL_TONE_MAP_METRIC_MAXRGB_ADAPTIVE) {
++                const float adaptive_strength =
++                    PL_CLAMP(params->adaptive_chroma_strength, 0.0f, 1.0f);
 +                // MPC-SK-inspired adaptive chroma retention. Keep the
 +                // metric-derived I coordinate, but pull the conservative
 +                // libplacebo hull result toward source IPT chroma according
@@ -612,10 +626,14 @@ index 8fc3363b..bcca0575 100644
 +                     "float chroma_keep = clamp(0.50+0.38*sat_intent       \n"
 +                     "    - 0.18*compression, 0.0, 1.0);                   \n"
 +                     "chroma_keep = max(chroma_keep, 0.68*rgb_sat);        \n"
-+                     "chroma_scale = mix(chroma_scale, 1.0, chroma_keep);  \n");
++                     "chroma_keep *= "$";                                  \n"
++                     "chroma_scale = mix(chroma_scale, 1.0, chroma_keep);  \n",
++                     SH_FLOAT(adaptive_strength));
 +            }
 +            GLSL("ipt.yz *= chroma_scale;                              \n");
 +        }
      }
  
      if (need_gamut_map) {
+-- 
+2.54.0.windows.1

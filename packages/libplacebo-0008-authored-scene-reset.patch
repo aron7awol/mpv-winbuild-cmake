@@ -1,0 +1,144 @@
+From cfc84520d581e81ceffc56316211bffcaf9db017 Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Tue, 4 Aug 2026 17:20:26 -0400
+Subject: [PATCH] peak detection: reset smoothing at authored scene cuts
+
+---
+ src/include/libplacebo/renderer.h           |  7 ++++++
+ src/include/libplacebo/shaders/colorspace.h |  9 +++++++
+ src/renderer.c                              |  2 ++
+ src/shaders/colorspace.c                    | 26 +++++++++++++++++++--
+ 4 files changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/src/include/libplacebo/renderer.h b/src/include/libplacebo/renderer.h
+index 2ffc32ea..44514bbf 100644
+--- a/src/include/libplacebo/renderer.h
++++ b/src/include/libplacebo/renderer.h
+@@ -584,6 +584,13 @@ struct pl_frame {
+     struct pl_color_repr repr;
+     struct pl_color_space color;
+ 
++    // Marks an authored scene boundary for temporal algorithms. Peak
++    // detection associates this flag with this frame's GPU measurement and
++    // reseeds its smoothing state when that measurement is consumed.
++    bool scene_cut;
++    // Opaque application tag returned with peak-detection reset diagnostics.
++    uint64_t scene_cut_tag;
++
+     // Optional ICC profile associated with this frame.
+     pl_icc_object icc;
+ 
+diff --git a/src/include/libplacebo/shaders/colorspace.h b/src/include/libplacebo/shaders/colorspace.h
+index 2bfa2cb5..e5351a41 100644
+--- a/src/include/libplacebo/shaders/colorspace.h
++++ b/src/include/libplacebo/shaders/colorspace.h
+@@ -188,6 +188,12 @@ struct pl_peak_detect_params {
+     // Set internally by the renderer only for generic pixel DTM.
+     enum pl_tone_map_metric metric;
+ 
++    // One-shot tag for the measurement submitted with these parameters. When
++    // its GPU result is consumed, temporal peak/average smoothing is reseeded
++    // from that frame. Deliberately excluded from parameter equality.
++    bool scene_reset;
++    uint64_t scene_reset_tag;
++
+     // --- Deprecated / removed fields
+     PL_DEPRECATED_IN(v6.313) float minimum_peak;
+ };
+@@ -248,6 +254,9 @@ struct pl_peak_detect_metrics {
+     float raw_avg_rgb;
+     float raw_max_metric, raw_avg_metric;
+     float smoothed_max_metric, smoothed_avg_metric;
++    bool scene_reset;
++    uint64_t scene_reset_tag;
++    uint64_t scene_reset_count;
+ };
+ 
+ // Returns false until a peak-detection dispatch has completed. With
+diff --git a/src/renderer.c b/src/renderer.c
+index fb5065d3..bf839c54 100644
+--- a/src/renderer.c
++++ b/src/renderer.c
+@@ -1244,6 +1244,8 @@ static void hdr_update_peak(struct pass_state *pass)
+     struct pl_peak_detect_params peak_params = *params->peak_detect_params;
+     peak_params.metric = cpars ? cpars->tone_mapping_metric
+                                : PL_TONE_MAP_METRIC_STANDARD;
++    peak_params.scene_reset = pass->image.scene_cut;
++    peak_params.scene_reset_tag = pass->image.scene_cut_tag;
+     bool ok = pl_shader_detect_peak(img_sh(pass, &pass->img), pass->img.color,
+                                     &rr->tone_map_state, &peak_params);
+     if (!ok) {
+diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
+index bcca0575..c6672462 100644
+--- a/src/shaders/colorspace.c
++++ b/src/shaders/colorspace.c
+@@ -981,7 +981,9 @@ static bool peak_detect_params_eq(const struct pl_peak_detect_params *a,
+            a->scene_threshold_high == b->scene_threshold_high &&
+            a->percentile           == b->percentile &&
+            a->metric               == b->metric;
+-    // don't compare `allow_delayed` because it doesn't change measurement
++    // Don't compare `allow_delayed` because it doesn't change measurement,
++    // or `scene_reset` / `scene_reset_tag` because they are one-shot tags for
++    // the pending buffer.
+ }
+ 
+ enum {
+@@ -1094,6 +1096,9 @@ struct sh_color_map_obj {
+         float raw_max_rgb;
+         float raw_avg_metric, raw_max_metric;
+         float avg_metric, max_metric;
++        bool last_scene_reset;
++        uint64_t last_scene_reset_tag;
++        uint64_t scene_reset_count;
+     } peak;
+ };
+ 
+@@ -1603,6 +1608,11 @@ static void update_peak_buf(pl_gpu gpu, struct sh_color_map_obj *obj, bool force
+     } else {
+         obj->peak.raw_max_rgb = (float) frame_max_rgb / RGB_MAX * 10000.0f;
+     }
++    obj->peak.last_scene_reset = params->scene_reset;
++    if (params->scene_reset) {
++        obj->peak.last_scene_reset_tag = params->scene_reset_tag;
++        obj->peak.scene_reset_count++;
++    }
+ 
+     if (params->metric != PL_TONE_MAP_METRIC_STANDARD) {
+         float raw_avg_metric = frame_wg_active
+@@ -1614,7 +1624,10 @@ static void update_peak_buf(pl_gpu gpu, struct sh_color_map_obj *obj, bool force
+             : PL_COLOR_HDR_BLACK;
+         obj->peak.raw_avg_metric = raw_avg_metric;
+         obj->peak.raw_max_metric = raw_max_metric;
+-        if (!obj->peak.avg_metric) {
++        if (params->scene_reset) {
++            obj->peak.avg_metric = raw_avg_metric;
++            obj->peak.max_metric = raw_max_metric;
++        } else if (!obj->peak.avg_metric) {
+             obj->peak.avg_metric = raw_avg_metric;
+             obj->peak.max_metric = raw_max_metric;
+         } else {
+@@ -1653,6 +1666,12 @@ static void update_peak_buf(pl_gpu gpu, struct sh_color_map_obj *obj, bool force
+         }
+     }
+ 
++    if (params->scene_reset) {
++        obj->peak.avg_pq = avg_pq;
++        obj->peak.max_pq = max_pq;
++        return;
++    }
++
+     if (!obj->peak.avg_pq) {
+         // Set the initial value accordingly if it contains no data
+         obj->peak.avg_pq = avg_pq;
+@@ -2017,6 +2036,9 @@ bool pl_get_peak_detect_metrics(const pl_shader_obj state,
+         .raw_avg_metric      = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, obj->peak.raw_avg_metric),
+         .smoothed_max_metric = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, obj->peak.max_metric),
+         .smoothed_avg_metric = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, obj->peak.avg_metric),
++        .scene_reset          = obj->peak.last_scene_reset,
++        .scene_reset_tag      = obj->peak.last_scene_reset_tag,
++        .scene_reset_count    = obj->peak.scene_reset_count,
+     };
+     return true;
+ }
+-- 
+2.54.0.windows.1
