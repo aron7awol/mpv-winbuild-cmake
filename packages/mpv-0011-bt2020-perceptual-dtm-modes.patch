@@ -4,31 +4,29 @@ Date: Mon, 3 Aug 2026 20:45:00 -0400
 Subject: [PATCH] vo_gpu_next: add private DTM metric modes
 
 ---
- DOCS/man/input.rst      | 16 ++++++++++++++++
+ DOCS/man/input.rst      | 14 ++++++++++++++
  DOCS/man/options.rst    | 35 +++++++++++++++++++++++++++++++++++
  player/command.c        |  8 ++++++++
  video/mp_image.h        |  5 +++++
  video/out/gpu/video.c   | 11 +++++++++++
  video/out/gpu/video.h   | 12 ++++++++++++
  video/out/vo_gpu_next.c | 40 +++++++++++++++++++++++++++++++++++-----
- 7 files changed, 122 insertions(+), 5 deletions(-)
+ 7 files changed, 120 insertions(+), 5 deletions(-)
 
 diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
 index ed5ada576..8ab44ebaf 100644
 --- a/DOCS/man/input.rst
 +++ b/DOCS/man/input.rst
-@@ -2932,6 +2932,18 @@ Property list
+@@ -2932,6 +2932,16 @@ Property list
          black pixels. It is independent of ``--hdr-peak-percentile`` and is
          not static MaxFALL metadata.
  
-+    ``video-params/raw-max-tone-metric-nits``,
-+    ``video-params/raw-avg-tone-metric-nits``
++    ``video-params/raw-max-tone-metric-nits``, ``video-params/raw-avg-tone-metric-nits``
 +        Unsmoothed percentile peak and PQ-domain frame average for the selected
 +        non-standard ``--tone-mapping-metric``, expressed in cd/mÂ². Unavailable
 +        in ``standard`` mode.
 +
-+    ``video-params/smoothed-max-tone-metric-nits``,
-+    ``video-params/smoothed-avg-tone-metric-nits``
++    ``video-params/smoothed-max-tone-metric-nits``, ``video-params/smoothed-avg-tone-metric-nits``
 +        Temporally smoothed peak and average for the selected non-standard
 +        metric, after scene-change acceleration. These values define the
 +        detected source range used to generate the active tone-mapping curve.
@@ -36,7 +34,7 @@ index ed5ada576..8ab44ebaf 100644
      ``video-params/dolby-vision-el-type``
          Dolby Vision enhancement layer type of the current frame, as signalled
          by the RPU. Either ``fel`` (full enhancement layer: carries residual
-@@ -2994,6 +3006,10 @@ Property list
+@@ -2994,6 +3004,10 @@ Property list
              "raw-avg-pq-y"      MPV_FORMAT_DOUBLE
              "raw-max-rgb-nits"  MPV_FORMAT_DOUBLE
              "raw-avg-rgb-nits"  MPV_FORMAT_DOUBLE
