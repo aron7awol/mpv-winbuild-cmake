@@ -1,0 +1,107 @@
+From cd621f19419f763d989d21b18f627c8c2da110a6 Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Mon, 10 Aug 2026 14:31:30 -0400
+Subject: [PATCH] win32: focus window after accepted file drop
+
+---
+ video/out/w32_common.c       |  3 ++-
+ video/out/win32/droptarget.c | 13 ++++++++++++-
+ video/out/win32/droptarget.h |  3 ++-
+ 3 files changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/video/out/w32_common.c b/video/out/w32_common.c
+index 2245f230a..bd1f09438 100644
+--- a/video/out/w32_common.c
++++ b/video/out/w32_common.c
+@@ -2116,7 +2116,8 @@ static MP_THREAD_VOID gui_thread(void *ptr)
+     if (SUCCEEDED(OleInitialize(NULL))) {
+         ole_ok = true;
+ 
+-        IDropTarget *dt = mp_w32_droptarget_create(w32->log, w32->opts, w32->input_ctx);
++        IDropTarget *dt = mp_w32_droptarget_create(w32->log, w32->opts,
++                                                    w32->input_ctx, w32->window);
+         RegisterDragDrop(w32->window, dt);
+ 
+         // ITaskbarList2 has the MarkFullscreenWindow method, which is used to
+diff --git a/video/out/win32/droptarget.c b/video/out/win32/droptarget.c
+index 4582e441c..14a075616 100644
+--- a/video/out/win32/droptarget.c
++++ b/video/out/win32/droptarget.c
+@@ -37,6 +37,7 @@ struct droptarget {
+     struct mp_log *log;
+     struct input_ctx *input_ctx;
+     struct mp_vo_opts *opts;
++    HWND window;
+     DWORD last_effect;
+     IDataObject *data_obj;
+ };
+@@ -135,6 +136,7 @@ static STDMETHODIMP DropTarget_Drop(IDropTarget *self, IDataObject *pDataObj,
+     enum mp_dnd_action action;
+     action = (grfKeyState & MK_SHIFT) ? DND_APPEND : DND_REPLACE;
+ 
++    bool accepted = false;
+     SAFE_RELEASE(t->data_obj);
+ 
+     STGMEDIUM medium;
+@@ -167,6 +169,7 @@ static STDMETHODIMP DropTarget_Drop(IDropTarget *self, IDataObject *pDataObj,
+             GlobalUnlock(medium.hGlobal);
+             mp_input_drop_files(t->input_ctx, recvd_files, files, action);
+             talloc_free(files);
++            accepted = recvd_files > 0;
+         }
+ 
+         ReleaseStgMedium(&medium);
+@@ -178,6 +181,7 @@ static STDMETHODIMP DropTarget_Drop(IDropTarget *self, IDataObject *pDataObj,
+                                         bstr0(url), action) > 0)
+             {
+                 MP_VERBOSE(t, "received dropped URL: %s\n", url);
++                accepted = true;
+             } else {
+                 MP_ERR(t, "error getting dropped URL\n");
+             }
+@@ -191,6 +195,11 @@ static STDMETHODIMP DropTarget_Drop(IDropTarget *self, IDataObject *pDataObj,
+         t->last_effect = DROPEFFECT_NONE;
+     }
+ 
++    // The drop is an explicit user gesture. Activate its target before any
++    // resulting fullscreen transition, which intentionally preserves focus.
++    if (accepted && !SetForegroundWindow(t->window))
++        MP_VERBOSE(t, "could not focus window after file drop\n");
++
+     *pdwEffect = t->last_effect;
+     return S_OK;
+ }
+@@ -207,7 +216,8 @@ static IDropTargetVtbl idroptarget_vtbl = {
+ 
+ IDropTarget *mp_w32_droptarget_create(struct mp_log *log,
+                                       struct mp_vo_opts *opts,
+-                                      struct input_ctx *input_ctx)
++                                      struct input_ctx *input_ctx,
++                                      HWND window)
+ {
+     fmtetc_url.cfFormat = RegisterClipboardFormatW(L"UniformResourceLocatorW");
+ 
+@@ -219,6 +229,7 @@ IDropTarget *mp_w32_droptarget_create(struct mp_log *log,
+     dt->log = mp_log_new(dt, log, "droptarget");
+     dt->opts = opts;
+     dt->input_ctx = input_ctx;
++    dt->window = window;
+ 
+     return &dt->iface;
+ }
+diff --git a/video/out/win32/droptarget.h b/video/out/win32/droptarget.h
+index 1c18c06d9..24e8a53ef 100644
+--- a/video/out/win32/droptarget.h
++++ b/video/out/win32/droptarget.h
+@@ -30,6 +30,7 @@
+ // Create a IDropTarget implementation that sends dropped files to input_ctx
+ IDropTarget *mp_w32_droptarget_create(struct mp_log *log,
+                                       struct mp_vo_opts *opts,
+-                                      struct input_ctx *input_ctx);
++                                      struct input_ctx *input_ctx,
++                                      HWND window);
+ 
+ #endif
+-- 
+2.54.0.windows.1
+
