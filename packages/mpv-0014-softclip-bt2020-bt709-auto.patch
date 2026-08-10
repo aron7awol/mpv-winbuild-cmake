@@ -1,0 +1,130 @@
+From f781f812536677fbf9102281d81b9b2f3270c823 Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Mon, 10 Aug 2026 14:18:09 -0400
+Subject: [PATCH] gpu-next: use Softclip for automatic BT.2020 to BT.709
+
+---
+ DOCS/man/options.rst    |  7 ++++++-
+ video/out/gpu/video.c   |  1 +
+ video/out/gpu/video.h   |  1 +
+ video/out/vo_gpu_next.c | 35 +++++++++++++++++++++++++++++++++++
+ 4 files changed, 43 insertions(+), 1 deletion(-)
+
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index c83c979f7..204a9bcaa 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -7795,13 +7795,18 @@ them.
+     target display, after any tone mapping is done.
+ 
+     auto
+-        Choose the best mode automatically. (Default)
++        Choose the best mode automatically. Uses ``softclip`` when mapping a
++        BT.2020 source signal to BT.709, and the normal default otherwise.
++        (Default)
+     clip
+         Hard-clip to the gamut (per-channel). Very low quality, but free.
+     perceptual
+         Performs a perceptually balanced gamut mapping using a soft knee
+         function to roll-off clipped regions, and a hue shifting function to
+         preserve saturation. (``--vo=gpu-next`` only)
++    softclip
++        Performs RGB-domain soft clipping against the destination gamut.
++        (``--vo=gpu-next`` only)
+     relative
+         Performs relative colorimetric clipping, while maintaining an
+         exponential relationship between brightness and chromaticity.
+diff --git a/video/out/gpu/video.c b/video/out/gpu/video.c
+index 642639cfb..8ed9a6bda 100644
+--- a/video/out/gpu/video.c
++++ b/video/out/gpu/video.c
+@@ -487,6 +487,7 @@ const struct m_sub_options gl_video_conf = {
+             {"auto",        GAMUT_AUTO},
+             {"clip",        GAMUT_CLIP},
+             {"perceptual",  GAMUT_PERCEPTUAL},
++            {"softclip",    GAMUT_SOFTCLIP},
+             {"relative",    GAMUT_RELATIVE},
+             {"saturation",  GAMUT_SATURATION},
+             {"absolute",    GAMUT_ABSOLUTE},
+diff --git a/video/out/gpu/video.h b/video/out/gpu/video.h
+index 8ba031b35..2f2fc805c 100644
+--- a/video/out/gpu/video.h
++++ b/video/out/gpu/video.h
+@@ -115,6 +115,7 @@ enum gamut_mode {
+     GAMUT_AUTO,
+     GAMUT_CLIP,
+     GAMUT_PERCEPTUAL,
++    GAMUT_SOFTCLIP,
+     GAMUT_RELATIVE,
+     GAMUT_SATURATION,
+     GAMUT_ABSOLUTE,
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index c2f4540fc..47aac911f 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -1293,6 +1293,23 @@ static void update_tm_viz(struct pl_color_map_params *params,
+ static void update_hook_opts_dynamic(struct priv *p, const struct pl_hook *hook,
+                                      const struct mp_image *mpi);
+ 
++static bool use_auto_softclip(const struct gl_video_opts *opts,
++                              struct pl_color_space source_color,
++                              struct pl_color_space target_color)
++{
++    if (opts->tone_map.gamut_mode != GAMUT_AUTO)
++        return false;
++    pl_color_space_infer(&source_color);
++    pl_color_space_infer(&target_color);
++    const struct pl_raw_primaries bt709 =
++        *pl_raw_primaries_get(PL_COLOR_PRIM_BT_709);
++    const bool target_bt709 =
++        opts->target_prim == PL_COLOR_PRIM_BT_709 ||
++        target_color.primaries == PL_COLOR_PRIM_BT_709 ||
++        pl_raw_primaries_equal(&target_color.hdr.prim, &bt709);
++    return source_color.primaries == PL_COLOR_PRIM_BT_2020 && target_bt709;
++}
++
+ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+ {
+     struct priv *p = vo->priv;
+@@ -1638,6 +1655,16 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+     apply_crop(&target, p->dst, swframe.fbo->params.w, swframe.fbo->params.h);
+     update_tm_viz(&pars->color_map_params, &target);
+ 
++    // Prefer libplacebo Softclip for real BT.2020-to-BT.709 conversion while
++    // leaving explicit choices and every other automatic pairing unchanged.
++    struct pl_color_map_params automatic_color_map;
++    if (frame->current && use_auto_softclip(opts,
++            frame->current->params.color, target.color)) {
++        automatic_color_map = *params.color_map_params;
++        automatic_color_map.gamut_mapping = &pl_gamut_map_softclip;
++        params.color_map_params = &automatic_color_map;
++    }
++
+     struct pl_frame_mix mix = {0};
+     if (frame->current) {
+         // Update queue state
+@@ -2085,6 +2112,13 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
+     apply_crop(&target, dst, fbo->params.w, fbo->params.h);
+     update_tm_viz(&pars->color_map_params, &target);
+ 
++    struct pl_color_map_params automatic_color_map;
++    if (use_auto_softclip(opts, image.color, target.color)) {
++        automatic_color_map = *params.color_map_params;
++        automatic_color_map.gamut_mapping = &pl_gamut_map_softclip;
++        params.color_map_params = &automatic_color_map;
++    }
++
+     int osd_flags = 0;
+     if (!args->subs)
+         osd_flags |= OSD_DRAW_OSD_ONLY;
+@@ -3004,6 +3038,7 @@ static void update_render_options(struct vo *vo)
+         [GAMUT_AUTO]            = pl_color_map_default_params.gamut_mapping,
+         [GAMUT_CLIP]            = &pl_gamut_map_clip,
+         [GAMUT_PERCEPTUAL]      = &pl_gamut_map_perceptual,
++        [GAMUT_SOFTCLIP]        = &pl_gamut_map_softclip,
+         [GAMUT_RELATIVE]        = &pl_gamut_map_relative,
+         [GAMUT_SATURATION]      = &pl_gamut_map_saturation,
+         [GAMUT_ABSOLUTE]        = &pl_gamut_map_absolute,
+-- 
+2.54.0.windows.1
+
