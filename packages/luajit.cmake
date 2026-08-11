@@ -47,6 +47,10 @@ ExternalProject_Add(luajit
         "HOST_CC='${LUAJIT_HOST_GCC} ${LUAJIT_GCC_ARGS}'"
         ${EXPORT}
         install
+    COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/src/lua51.dll
+        ${MINGW_INSTALL_PREFIX}/bin/lua51.dll
+    COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/src/libluajit-5.1.dll.a
+        ${MINGW_INSTALL_PREFIX}/lib/libluajit-5.1.dll.a
     COMMAND ${CMAKE_COMMAND} -E rm -f ${MINGW_INSTALL_PREFIX}/lib/libluajit-5.1.a
     BUILD_IN_SOURCE 1
     LOG_DOWNLOAD 1 LOG_UPDATE 1 LOG_CONFIGURE 1 LOG_BUILD 1 LOG_INSTALL 1
