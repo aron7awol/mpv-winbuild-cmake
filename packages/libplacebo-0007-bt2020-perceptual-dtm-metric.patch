@@ -523,7 +523,7 @@ index 8fc3363b..9502bd08 100644
              ident_t pos, pt;
              ident_t lowres = sh_bind(sh, args->feature_map, PL_TEX_ADDRESS_CLAMP,
                                       PL_TEX_SAMPLE_LINEAR, "feature_map",
-@@ -2430,17 +2636,107 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+@@ -2430,17 +2636,108 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
                   SH_FLOAT(params->contrast_recovery),
                   SH_FLOAT(tone.output_min), SH_FLOAT_DYN(tone.output_max));
  
@@ -603,8 +603,9 @@ index 8fc3363b..9502bd08 100644
 +                 "hull = ((hull - 6.0) * hull + 9.0) * hull;             \n"
 +                 "float chroma_scale = min(i_orig / max(ipt.x, 1e-6),   \n"
 +                 "                         hull.y / max(hull.x, 1e-6));  \n");
-+            if (params->tone_mapping_metric == PL_TONE_MAP_METRIC_BT2020_ADAPTIVE ||
-+                params->tone_mapping_metric == PL_TONE_MAP_METRIC_MAXRGB_ADAPTIVE) {
++            if (metric_active &&
++                (params->tone_mapping_metric == PL_TONE_MAP_METRIC_BT2020_ADAPTIVE ||
++                 params->tone_mapping_metric == PL_TONE_MAP_METRIC_MAXRGB_ADAPTIVE)) {
 +                const float adaptive_strength =
 +                    PL_CLAMP(params->adaptive_chroma_strength, 0.0f, 1.0f);
 +                // MPC-SK-inspired adaptive chroma retention. Keep the
