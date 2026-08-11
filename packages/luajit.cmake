@@ -16,7 +16,7 @@ endif()
 set(EXPORT
     "CROSS=${TARGET_ARCH}-
     TARGET_SYS=Windows
-    BUILDMODE=static
+    BUILDMODE=dynamic
     FILE_T=luajit.exe
     CFLAGS='-DUNICODE'
     XCFLAGS='-DLUAJIT_ENABLE_LUA52COMPAT ${DISABLE_JIT}'
@@ -37,14 +37,17 @@ ExternalProject_Add(luajit
     PATCH_COMMAND ${EXEC} git am --3way ${CMAKE_CURRENT_SOURCE_DIR}/luajit-*.patch
     UPDATE_COMMAND ""
     CONFIGURE_COMMAND ""
-    BUILD_COMMAND ${MAKE} -C <SOURCE_DIR>/src
+    BUILD_COMMAND ${MAKE} -C <SOURCE_DIR>/src clean
+    COMMAND ${MAKE} -C <SOURCE_DIR>/src
         "HOST_CC='${LUAJIT_HOST_GCC} ${LUAJIT_GCC_ARGS}'"
         ${EXPORT}
         amalg
-    INSTALL_COMMAND ${MAKE}
+    INSTALL_COMMAND ${CMAKE_COMMAND} -E rm -f ${MINGW_INSTALL_PREFIX}/lib/libluajit-5.1.a
+    COMMAND ${MAKE}
         "HOST_CC='${LUAJIT_HOST_GCC} ${LUAJIT_GCC_ARGS}'"
         ${EXPORT}
         install
+    COMMAND ${CMAKE_COMMAND} -E rm -f ${MINGW_INSTALL_PREFIX}/lib/libluajit-5.1.a
     BUILD_IN_SOURCE 1
     LOG_DOWNLOAD 1 LOG_UPDATE 1 LOG_CONFIGURE 1 LOG_BUILD 1 LOG_INSTALL 1
 )
