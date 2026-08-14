@@ -3,6 +3,12 @@ get_property(src_fast_float TARGET fast_float PROPERTY _EP_SOURCE_DIR)
 file(GLOB libplacebo_patches CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_LIST_DIR}/libplacebo-*.patch")
 list(SORT libplacebo_patches)
+set(libplacebo_patch_fingerprint "")
+foreach(libplacebo_patch IN LISTS libplacebo_patches)
+    file(SHA256 "${libplacebo_patch}" libplacebo_patch_sha256)
+    string(APPEND libplacebo_patch_fingerprint "${libplacebo_patch_sha256}")
+endforeach()
+string(SHA256 libplacebo_patch_fingerprint "${libplacebo_patch_fingerprint}")
 
 ExternalProject_Add(libplacebo
     DEPENDS
@@ -22,6 +28,10 @@ ExternalProject_Add(libplacebo
     PATCH_COMMAND bash -c "git am --abort 2>/dev/null || true"
     COMMAND ${EXEC} git reset --hard 4c426e466814536def653cb23f1d1c287ea7a7f5
     COMMAND ${EXEC} git am --3way ${libplacebo_patches}
+    # Include the patch contents in the generated step command so restored
+    # ExternalProject stamps cannot preserve a stale source checkout.
+    COMMAND ${CMAKE_COMMAND} -E echo
+        "libplacebo patch stack ${libplacebo_patch_fingerprint}"
     CONFIGURE_COMMAND ""
     COMMAND bash -c "rm -rf <SOURCE_DIR>/3rdparty/glad"
     COMMAND bash -c "rm -rf <SOURCE_DIR>/3rdparty/fast_float"

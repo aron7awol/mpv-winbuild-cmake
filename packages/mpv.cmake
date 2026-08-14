@@ -1,3 +1,13 @@
+file(GLOB mpv_patch_files CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/mpv-*.patch")
+list(SORT mpv_patch_files)
+set(mpv_patch_fingerprint "")
+foreach(mpv_patch IN LISTS mpv_patch_files)
+    file(SHA256 "${mpv_patch}" mpv_patch_sha256)
+    string(APPEND mpv_patch_fingerprint "${mpv_patch_sha256}")
+endforeach()
+string(SHA256 mpv_patch_fingerprint "${mpv_patch_fingerprint}")
+
 ExternalProject_Add(mpv
     DEPENDS
         angle-headers
@@ -31,6 +41,9 @@ ExternalProject_Add(mpv
     PATCH_COMMAND bash -c "git am --abort 2>/dev/null || true"
     COMMAND ${EXEC} git reset --hard 74356c0fc669d21af9daac5a11f296123efd0684
     COMMAND ${EXEC} git am --3way ${CMAKE_CURRENT_SOURCE_DIR}/mpv-*.patch
+    # Make ExternalProject invalidate a restored patch-step stamp whenever the
+    # ordered patch stack changes, instead of building a stale cached source.
+    COMMAND ${CMAKE_COMMAND} -E echo "mpv patch stack ${mpv_patch_fingerprint}"
     UPDATE_COMMAND ""
     CONFIGURE_COMMAND ${EXEC} CONF=1 meson setup <BINARY_DIR> <SOURCE_DIR>
         --prefix=${MINGW_INSTALL_PREFIX}
