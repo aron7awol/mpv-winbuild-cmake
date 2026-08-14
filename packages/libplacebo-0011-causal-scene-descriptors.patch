@@ -1,0 +1,1829 @@
+From f972950c31fed62eaa932fad70eaa6638dec959e Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Thu, 13 Aug 2026 15:21:41 -0400
+Subject: [PATCH] causal scene detection: add native descriptors and
+ acceleration
+
+---
+ src/include/libplacebo/renderer.h           |  34 ++
+ src/include/libplacebo/shaders/colorspace.h |  18 +
+ src/renderer.c                              | 468 +++++++++++++++++++-
+ src/shaders/colorspace.c                    | 409 ++++++++++++++++-
+ src/tests/causal_test.h                     |  31 ++
+ src/tests/gpu_tests.c                       | 414 +++++++++++++++++
+ 6 files changed, 1345 insertions(+), 29 deletions(-)
+ create mode 100644 src/tests/causal_test.h
+
+diff --git a/src/include/libplacebo/renderer.h b/src/include/libplacebo/renderer.h
+index 44514bbf..6a13bf5b 100644
+--- a/src/include/libplacebo/renderer.h
++++ b/src/include/libplacebo/renderer.h
+@@ -192,6 +192,13 @@ struct pl_render_params {
+     // is disabled.
+     const struct pl_peak_detect_params *peak_detect_params;
+ 
++    // Opt-in native-cie-y-v1 causal-scene diagnostics. This is strictly
++    // observational; disabled by default and never changes rendering.
++    bool causal_scene_detection;
++    // Experimental: let eligible visual triggers fully accelerate temporal
++    // peak/average smoothing. Requires causal scene detection and is off by
++    // default. Authored scene resets retain priority.
++    bool causal_scene_acceleration;
+     // Configures the settings used to tone map from HDR to SDR, or from higher
+     // gamut to standard gamut content. If NULL, defaults to
+     // `&pl_color_map_default_params`.
+@@ -590,7 +597,11 @@ struct pl_frame {
+     bool scene_cut;
+     // Opaque application tag returned with peak-detection reset diagnostics.
+     uint64_t scene_cut_tag;
++    uint64_t scene_cut_source;
+ 
++    // Exact source presentation identity for causal diagnostics; zero means
++    // unavailable and suppresses comparisons.
++    uint64_t causal_scene_tag;
+     // Optional ICC profile associated with this frame.
+     pl_icc_object icc;
+ 
+@@ -771,6 +782,29 @@ PL_API bool pl_renderer_get_hdr_metadata(pl_renderer rr,
+ PL_API bool pl_renderer_get_peak_detect_metrics(
+     pl_renderer rr, struct pl_peak_detect_metrics *metrics);
+ 
++enum pl_causal_scene_withheld_reason {
++    PL_CAUSAL_SCENE_WITHHELD_NONE,
++    PL_CAUSAL_SCENE_WITHHELD_DISABLED,
++    PL_CAUSAL_SCENE_WITHHELD_NO_TAG,
++    PL_CAUSAL_SCENE_WITHHELD_PENDING,
++    PL_CAUSAL_SCENE_WITHHELD_DISCONTINUITY,
++    PL_CAUSAL_SCENE_WITHHELD_UNSUPPORTED,
++};
++
++struct pl_causal_scene_diagnostics {
++    bool effective_allow_delayed, descriptor_valid, visual_trigger;
++    bool acceleration_applied;
++    uint64_t submitted_tag, consumed_tag, last_trigger_tag, visual_trigger_count;
++    uint64_t authored_boundary_tag, authored_boundary_source;
++    enum pl_causal_scene_withheld_reason withheld_reason;
++    enum pl_tone_map_metric active_metric_branch;
++    int readback_latency_frames;
++    float histogram_tv, tile_mad, shifted_tile_mad;
++    float translated_motion_fraction, global_motion_residual, cut_score;
++};
++
++PL_API bool pl_renderer_get_causal_scene_diagnostics(
++    pl_renderer rr, struct pl_causal_scene_diagnostics *diagnostics);
+ // Represents a mixture of input frames, distributed temporally.
+ //
+ // NOTE: Frames must be sorted by timestamp, i.e. `timestamps` must be
+diff --git a/src/include/libplacebo/shaders/colorspace.h b/src/include/libplacebo/shaders/colorspace.h
+index 837f0d16..7731b582 100644
+--- a/src/include/libplacebo/shaders/colorspace.h
++++ b/src/include/libplacebo/shaders/colorspace.h
+@@ -22,6 +22,8 @@
+ // value (PL_SHADER_SIG_COLOR).
+ 
+ #include <libplacebo/colorspace.h>
++#include <libplacebo/dispatch.h>
++struct pl_causal_scene_diagnostics;
+ #include <libplacebo/gamut_mapping.h>
+ #include <libplacebo/tone_mapping.h>
+ #include <libplacebo/shaders.h>
+@@ -193,6 +195,13 @@ struct pl_peak_detect_params {
+     // from that frame. Deliberately excluded from parameter equality.
+     bool scene_reset;
+     uint64_t scene_reset_tag;
++    uint64_t scene_reset_source;
++    bool causal_scene_enabled;
++    bool causal_scene_acceleration;
++    uint64_t causal_scene_tag;
++    // Renderer-owned signature of the decoded source representation/crop.
++    // A change clears causal adjacency without resetting peak smoothing.
++    uint64_t causal_scene_signature;
+ 
+     // --- Deprecated / removed fields
+     PL_DEPRECATED_IN(v6.313) float minimum_peak;
+@@ -264,6 +273,15 @@ struct pl_peak_detect_metrics {
+ PL_API bool pl_get_peak_detect_metrics(const pl_shader_obj state,
+                                        struct pl_peak_detect_metrics *metrics);
+ 
++PL_API bool pl_shader_detect_causal_scene(pl_dispatch dp, pl_gpu gpu,
++                                          pl_tex proxy,
++                                          pl_shader_obj *state,
++                                          pl_shader_obj borrowed_state,
++                                          const struct pl_peak_detect_params *params);
++PL_API bool pl_get_causal_scene_diagnostics(const pl_shader_obj state,
++                                            struct pl_causal_scene_diagnostics *out);
++PL_API void pl_reset_causal_scene(pl_shader_obj state);
++
+ // The private dynamic range for the selected detector metric. Unlike
+ // pl_get_detected_hdr_metadata it never re-labels physical CIE Y metadata.
+ PL_API bool pl_get_detected_tone_map_range(const pl_shader_obj state,
+diff --git a/src/renderer.c b/src/renderer.c
+index bf839c54..ace040c1 100644
+--- a/src/renderer.c
++++ b/src/renderer.c
+@@ -22,6 +22,7 @@
+ #include "hash.h"
+ #include "shaders.h"
+ #include "dispatch.h"
++#include "tests/causal_test.h"
+ 
+ #include <libplacebo/renderer.h>
+ 
+@@ -56,6 +57,7 @@ struct icc_state {
+ struct pl_renderer_t {
+     pl_gpu gpu;
+     pl_dispatch dp;
++    pl_dispatch causal_dp;
+     pl_log log;
+ 
+     // Cached feature checks (inverted)
+@@ -88,6 +90,15 @@ struct pl_renderer_t {
+     // Frame cache (for frame mixing / interpolation)
+     PL_ARRAY(struct cached_frame) frames;
+     PL_ARRAY(pl_tex) frame_fbos;
++    // Causal diagnostics own all GPU/readback state. They must never share
++    // the live tone-map state, even when peak detection is enabled.
++    pl_shader_obj causal_state;
++    pl_tex causal_linear_tex; // private full-resolution linear CIE Y
++    pl_tex causal_proxy_tex; // dedicated; never competes with live FBO pool
++    struct pl_causal_scene_diagnostics causal_unavailable;
++    bool causal_unavailable_valid;
++    uint64_t causal_last_dispatched_tag;
++    bool causal_last_dispatched_valid;
+ 
+     // For debugging / logging purposes
+     int prev_dither;
+@@ -116,6 +127,7 @@ pl_renderer pl_renderer_create(pl_log log, pl_gpu gpu)
+         .gpu  = gpu,
+         .log = log,
+         .dp  = pl_dispatch_create(log, gpu),
++        .causal_dp = pl_dispatch_create(log, gpu),
+         .osd_attribs = {
+             {
+                 .name = "pos",
+@@ -133,7 +145,7 @@ pl_renderer pl_renderer_create(pl_log log, pl_gpu gpu)
+         },
+     };
+ 
+-    assert(rr->dp);
++    assert(rr->dp && rr->causal_dp);
+     return rr;
+ }
+ 
+@@ -158,9 +170,14 @@ void pl_renderer_destroy(pl_renderer *p_rr)
+         pl_tex_destroy(rr->gpu, &rr->frames.elem[i].tex);
+     for (int i = 0; i < rr->frame_fbos.num; i++)
+         pl_tex_destroy(rr->gpu, &rr->frame_fbos.elem[i]);
++    pl_tex_destroy(rr->gpu, &rr->causal_linear_tex);
++    pl_tex_destroy(rr->gpu, &rr->causal_proxy_tex);
+ 
+     // Free all shader resource objects
++    // The live peak transaction may hold a weak causal sink until its single
++    // readback is consumed, so destroy the owner before the sink.
+     pl_shader_obj_destroy(&rr->tone_map_state);
++    pl_shader_obj_destroy(&rr->causal_state);
+     pl_shader_obj_destroy(&rr->dither_state);
+     for (int i = 0; i < PL_ARRAY_SIZE(rr->lut_state); i++)
+         pl_shader_obj_destroy(&rr->lut_state[i]);
+@@ -184,6 +201,7 @@ void pl_renderer_destroy(pl_renderer *p_rr)
+         pl_icc_close(&rr->icc_fallback[i].icc);
+ 
+     pl_dispatch_destroy(&rr->dp);
++    pl_dispatch_destroy(&rr->causal_dp);
+     pl_free_ptr(p_rr);
+ }
+ 
+@@ -203,7 +221,10 @@ void pl_renderer_flush_cache(pl_renderer rr)
+         pl_tex_destroy(rr->gpu, &rr->frames.elem[i].tex);
+     rr->frames.num = 0;
+ 
++    // Reset the live owner first; it drops any weak causal sink before the
++    // isolated state is cleared.
+     pl_reset_detected_peak(rr->tone_map_state);
++    pl_reset_causal_scene(rr->causal_state);
+ }
+ 
+ const struct pl_render_params pl_render_fast_params = { PL_RENDER_DEFAULTS };
+@@ -382,6 +403,7 @@ struct pass_state {
+     pl_fmt fbofmt[5];
+     bool *fbos_used;
+     bool need_peak_fbo; // need indirection for peak detection
++    pl_tex causal_proxy; // fixed 320x180 pre-hook native-cie-y-v1 proxy
+ 
+     // Map of acquired frames
+     struct {
+@@ -1189,6 +1211,94 @@ hook_error:
+     return ret;
+ }
+ 
++// Freeze the native-cie-y-v1 representation before PL_HOOK_RGB. Rendering to
++// this fixed target makes the sampler evaluate at 320x180 pixel centres; the
++// explicit bilinear sampler clamps edge fetches through the texture binding.
++static bool causal_make_proxy(struct pass_state *pass, pl_dispatch dp)
++{
++    enum { W = 320, H = 180 };
++    pl_renderer rr = pass->rr;
++    if (pass->img.color.primaries == PL_COLOR_PRIM_UNKNOWN)
++        return false;
++    pl_fmt fmt = pl_find_fmt(rr->gpu, PL_FMT_FLOAT, 1, 32, 0,
++                             PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE |
++                             PL_FMT_CAP_LINEAR);
++    // The frozen reference is linear RGB -> CIE Y -> bilinear scale -> PQ.
++    // Materialize Y first; interpolation in encoded RGB is not equivalent.
++    struct pl_tex_params yparams = {
++        .w = pass->img.w, .h = pass->img.h, .format = fmt, .sampleable = true,
++        .renderable = true, .debug_tag = "causal native-cie-y-v1 linear Y",
++    };
++    struct pl_tex_params tparams = {
++        .w = W, .h = H, .format = fmt, .sampleable = true,
++        .renderable = true, .blit_src = true,
++        .debug_tag = "causal native-cie-y-v1 proxy",
++    };
++    if (!fmt || !pl_tex_recreate(rr->gpu, &rr->causal_linear_tex, &yparams) ||
++        !pl_tex_recreate(rr->gpu, &rr->causal_proxy_tex, &tparams))
++        return false;
++    pl_tex linear_y = rr->causal_linear_tex, dst = rr->causal_proxy_tex;
++    if (!linear_y || !dst)
++        return false;
++
++    pl_shader sh = pass->img.sh;
++
++    struct pl_color_space csp = pass->img.color;
++    const pl_matrix3x3 rgb2xyz =
++        pl_get_rgb2xyz_matrix(pl_raw_primaries_get(csp.primaries));
++    float cy[3] = { rgb2xyz.m[1][0], rgb2xyz.m[1][1], rgb2xyz.m[1][2] };
++    // native-cie-y-v1 freezes these normative rows (rather than inheriting
++    // tiny chromaticity-matrix rounding differences) for the common HDR and
++    // SDR source primaries covered by the CPU reference.
++    switch (csp.primaries) {
++    case PL_COLOR_PRIM_BT_2020: cy[0]=0.2627f; cy[1]=0.6780f; cy[2]=0.0593f; break;
++    case PL_COLOR_PRIM_BT_709: cy[0]=0.2126f; cy[1]=0.7152f; cy[2]=0.0722f; break;
++    case PL_COLOR_PRIM_DCI_P3:
++    case PL_COLOR_PRIM_DISPLAY_P3: cy[0]=0.2289746f; cy[1]=0.6917385f; cy[2]=0.0792869f; break;
++    default: break;
++    }
++    pl_shader_linearize(sh, &csp);
++    // The raw primary matrix may be rounded very slightly away from a white
++    // row sum of one. Normalise that row so neutral RGB follows the frozen
++    // physical CIE-Y definition exactly at uniform PQ bin boundaries.
++    const float ysum = cy[0] + cy[1] + cy[2];
++    GLSL("// native-cie-y-v1 full-resolution linear CIE Y\n"
++         "float y = dot(vec3("$", "$", "$"), color.rgb) / "$";\n"
++         "color = vec4(max(y, 0.0), 0.0, 0.0, 1.0);\n",
++         SH_FLOAT(cy[0]), SH_FLOAT(cy[1]), SH_FLOAT(cy[2]), SH_FLOAT(ysum));
++    if (!pl_dispatch_finish(dp, pl_dispatch_params(.shader = &sh, .target = linear_y)))
++        return false;
++    sh = pl_dispatch_begin(dp);
++    // Preserve an already-native 320x180 source exactly. The CPU fixture
++    // defines this first proxy stage as identity before the independent
++    // 48x27 bilinear grid is formed.
++    const struct pl_sample_src proxy_src = *pl_sample_src(
++        .tex = linear_y, .new_w = W, .new_h = H);
++    bool sampled = pass->img.w == W && pass->img.h == H
++        ? pl_shader_sample_direct(sh, &proxy_src)
++        : pl_shader_sample_bilinear(sh, &proxy_src);
++    if (!sampled)
++        goto error;
++    GLSL("// native-cie-y-v1 scaled Y -> normalized ST 2084 PQ\n"
++         "float y = clamp(color.r * "$", 0.0, 1.0);\n"
++         "y = pow(y, "$");\n"
++         "y = ("$" + "$" * y) / (1.0 + "$" * y);\n"
++         "y = pow(y, "$");\n"
++         "color = vec4(y, 0.0, 0.0, 1.0);\n",
++         SH_FLOAT(PL_COLOR_SDR_WHITE / 10000.0),
++         SH_FLOAT(0.1593017578125), SH_FLOAT(0.8359375),
++         SH_FLOAT(18.8515625), SH_FLOAT(18.6875), SH_FLOAT(78.84375));
++    if (!pl_dispatch_finish(dp, pl_dispatch_params(.shader = &sh, .target = dst)))
++        return false;
++    pass->causal_proxy = dst;
++    return true;
++error:
++    pl_dispatch_abort(dp, &sh);
++    return false;
++}
++
++static void causal_update(struct pass_state *pass);
++
+ static void hdr_update_peak(struct pass_state *pass)
+ {
+     const struct pl_render_params *params = pass->params;
+@@ -1246,6 +1356,14 @@ static void hdr_update_peak(struct pass_state *pass)
+                                : PL_TONE_MAP_METRIC_STANDARD;
+     peak_params.scene_reset = pass->image.scene_cut;
+     peak_params.scene_reset_tag = pass->image.scene_cut_tag;
++    peak_params.scene_reset_source = pass->image.scene_cut_source;
++    // This tag identifies a transaction for an optional descriptor append;
++    // it is intentionally excluded from peak parameter equality and cannot
++    // change peak math or tone-map state.
++    peak_params.causal_scene_enabled = params->causal_scene_detection ||
++                                        params->causal_scene_acceleration;
++    peak_params.causal_scene_acceleration = params->causal_scene_acceleration;
++    peak_params.causal_scene_tag = pass->image.causal_scene_tag;
+     bool ok = pl_shader_detect_peak(img_sh(pass, &pass->img), pass->img.color,
+                                     &rr->tone_map_state, &peak_params);
+     if (!ok) {
+@@ -1253,7 +1371,6 @@ static void hdr_update_peak(struct pass_state *pass)
+         rr->errors |= PL_RENDER_ERR_PEAK_DETECT;
+         goto cleanup;
+     }
+-
+     pass->need_peak_fbo = !params->peak_detect_params->allow_delayed;
+     return;
+ 
+@@ -1275,6 +1392,133 @@ bool pl_renderer_get_peak_detect_metrics(
+     return pl_get_peak_detect_metrics(rr->tone_map_state, metrics);
+ }
+ 
++static void causal_update(struct pass_state *pass)
++{
++    const struct pl_render_params *params = pass->params;
++    pl_renderer rr = pass->rr;
++    if (!params->causal_scene_detection && !params->causal_scene_acceleration)
++        return;
++
++    // Mixing may enter pass_scale_main more than once for the same decoded
++    // source tag. A descriptor transaction is source-frame scoped, never an
++    // interpolation-pass scoped operation.
++    if (rr->causal_last_dispatched_valid &&
++        rr->causal_last_dispatched_tag == pass->image.causal_scene_tag)
++        return;
++    if (!pass->image.causal_scene_tag) {
++        rr->causal_unavailable = (struct pl_causal_scene_diagnostics) {
++            .effective_allow_delayed = params->peak_detect_params
++                ? params->peak_detect_params->allow_delayed : true,
++            .authored_boundary_tag = pass->image.scene_cut_tag,
++            .authored_boundary_source = pass->image.scene_cut_source,
++            .active_metric_branch = params->color_map_params
++                ? params->color_map_params->tone_mapping_metric
++                : PL_TONE_MAP_METRIC_STANDARD,
++            .withheld_reason = PL_CAUSAL_SCENE_WITHHELD_NO_TAG,
++        };
++        rr->causal_unavailable_valid = true;
++        pl_reset_causal_scene(rr->causal_state);
++        rr->causal_last_dispatched_tag = pass->image.causal_scene_tag;
++        rr->causal_last_dispatched_valid = true;
++        return;
++    }
++
++    // The frozen Stage-1 source domain is display-oriented. Plane flips are
++    // handled by source assembly, but source rotation is normally applied
++    // later in the live output pipeline; fail closed until that transpose is
++    // represented in the isolated source target.
++    if (pass->image.field != PL_FIELD_NONE || pass->image.rotation ||
++        !pass->causal_proxy) {
++        rr->causal_unavailable = (struct pl_causal_scene_diagnostics) {
++            .effective_allow_delayed = params->peak_detect_params
++                ? params->peak_detect_params->allow_delayed : true,
++            .submitted_tag = pass->image.causal_scene_tag,
++            .authored_boundary_tag = pass->image.scene_cut_tag,
++            .authored_boundary_source = pass->image.scene_cut_source,
++            .active_metric_branch = params->color_map_params
++                ? params->color_map_params->tone_mapping_metric
++                : PL_TONE_MAP_METRIC_STANDARD,
++            .withheld_reason = PL_CAUSAL_SCENE_WITHHELD_UNSUPPORTED,
++        };
++        rr->causal_unavailable_valid = true;
++        pl_reset_causal_scene(rr->causal_state);
++        rr->causal_last_dispatched_tag = pass->image.causal_scene_tag;
++        rr->causal_last_dispatched_valid = true;
++        return;
++    }
++
++    // This is representation identity, not PTS. It deliberately covers every
++    // source fact that changes the native-cie-y-v1 descriptor domain.
++    uint64_t sig = 1469598103934665603ULL;
++#define CAUSAL_SIG(v) (sig = (sig ^ (uint64_t) (v)) * 1099511628211ULL)
++#define CAUSAL_SIG_FLOAT(v) do { uint32_t bits; float f = (v); \
++    memcpy(&bits, &f, sizeof(bits)); CAUSAL_SIG(bits); } while (0)
++    CAUSAL_SIG_FLOAT(pass->image.crop.x0); CAUSAL_SIG_FLOAT(pass->image.crop.y0);
++    CAUSAL_SIG_FLOAT(pass->image.crop.x1); CAUSAL_SIG_FLOAT(pass->image.crop.y1);
++    CAUSAL_SIG(pass->image.color.primaries);
++    CAUSAL_SIG(pass->image.color.transfer);
++    CAUSAL_SIG(pass->image.repr.sys);
++    CAUSAL_SIG(pass->image.repr.levels);
++    CAUSAL_SIG(pass->rotation);
++    CAUSAL_SIG(pass->image.num_planes);
++    CAUSAL_SIG(pass->image.repr.bits.sample_depth);
++    CAUSAL_SIG(pass->image.repr.bits.color_depth);
++    for (int i = 0; i < pass->image.num_planes; i++) {
++        const struct pl_plane *plane = &pass->image.planes[i];
++        CAUSAL_SIG(plane->texture->params.w); CAUSAL_SIG(plane->texture->params.h);
++        CAUSAL_SIG(plane->texture->params.format->num_components);
++        CAUSAL_SIG(plane->flipped); CAUSAL_SIG(plane->components);
++        CAUSAL_SIG_FLOAT(plane->shift_x); CAUSAL_SIG_FLOAT(plane->shift_y);
++    }
++#undef CAUSAL_SIG_FLOAT
++#undef CAUSAL_SIG
++
++    struct pl_peak_detect_params causal = {
++        .allow_delayed = params->peak_detect_params
++            ? params->peak_detect_params->allow_delayed : true,
++        .metric = params->color_map_params
++            ? params->color_map_params->tone_mapping_metric
++            : PL_TONE_MAP_METRIC_STANDARD,
++        .scene_reset = pass->image.scene_cut,
++        .scene_reset_tag = pass->image.scene_cut_tag,
++        .scene_reset_source = pass->image.scene_cut_source,
++        .causal_scene_enabled = true,
++        .causal_scene_acceleration = params->causal_scene_acceleration,
++        .causal_scene_tag = pass->image.causal_scene_tag,
++        .causal_scene_signature = sig,
++    };
++    if (!pl_shader_detect_causal_scene(rr->dp, rr->gpu, pass->causal_proxy,
++                                        &rr->causal_state, rr->tone_map_state,
++                                        &causal))
++    {
++        PL_WARN(rr, "Causal-scene diagnostics unsupported for this frame");
++        rr->causal_unavailable = (struct pl_causal_scene_diagnostics) {
++            .effective_allow_delayed = causal.allow_delayed,
++            .submitted_tag = causal.causal_scene_tag,
++            .authored_boundary_tag = causal.scene_reset_tag,
++            .authored_boundary_source = causal.scene_reset_source,
++            .active_metric_branch = causal.metric,
++            .withheld_reason = PL_CAUSAL_SCENE_WITHHELD_UNSUPPORTED,
++        };
++        rr->causal_unavailable_valid = true;
++        pl_reset_causal_scene(rr->causal_state);
++    } else {
++        rr->causal_unavailable_valid = false;
++        rr->causal_last_dispatched_tag = pass->image.causal_scene_tag;
++        rr->causal_last_dispatched_valid = true;
++    }
++}
++
++bool pl_renderer_get_causal_scene_diagnostics(
++    pl_renderer rr, struct pl_causal_scene_diagnostics *diagnostics)
++{
++    if (rr->causal_unavailable_valid) {
++        *diagnostics = rr->causal_unavailable;
++        return true;
++    }
++    return pl_get_causal_scene_diagnostics(rr->causal_state, diagnostics);
++}
++
+ struct plane_state {
+     enum plane_type type;
+     struct pl_plane plane;
+@@ -1515,10 +1759,14 @@ static pl_fmt merge_fmt(struct pass_state *pass, const struct img *a,
+ // Applies a series of rough heuristics to figure out whether we expect any
+ // performance gains from plane merging. This is basically a series of checks
+ // for operations that we *know* benefit from merged planes
+-static bool want_merge(struct pass_state *pass,
++static bool want_merge(struct pass_state *pass, bool source_processing,
+                        const struct plane_state *st,
+                        const struct plane_state *ref)
+ {
++    // Keep the diagnostics source graph independent of live processing and
++    // sampler/cache selection. It is a direct decoded-plane reconstruction.
++    if (!source_processing)
++        return false;
+     const struct pl_render_params *params = pass->params;
+     const pl_renderer rr = pass->rr;
+     if (!pass->fbofmt[4])
+@@ -1682,7 +1930,10 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
+ #endif // PL_HAVE_DOVI
+ 
+ // This scales and merges all of the source images, and initializes pass->img.
+-static bool pass_read_image(struct pass_state *pass)
++// Shared decoded-source builder. The main renderer invokes it through
++// pass_read_image below; the causal path will invoke the same construction
++// with immutable plane state before optional source processing is applied.
++static bool pass_build_source(struct pass_state *pass, bool source_processing)
+ {
+     const struct pl_render_params *params = pass->params;
+     struct pl_frame *image = &pass->image;
+@@ -1721,7 +1972,7 @@ static bool pass_read_image(struct pass_state *pass)
+         }
+ 
+         // Deinterlace plane if needed
+-        if (image->field != PL_FIELD_NONE && params->deinterlace_params &&
++        if (source_processing && image->field != PL_FIELD_NONE && params->deinterlace_params &&
+             pass->fbofmt[4] && !(rr->errors & PL_RENDER_ERR_DEINTERLACING))
+         {
+             struct img *img = &planes[i].img;
+@@ -1751,7 +2002,7 @@ static bool pass_read_image(struct pass_state *pass)
+         struct plane_state *sti = &planes[i];
+         if (!sti->type)
+             continue;
+-        if (!want_merge(pass, sti, ref))
++        if (!want_merge(pass, source_processing, sti, ref))
+             continue;
+ 
+         bool did_merge = false;
+@@ -1833,7 +2084,7 @@ static bool pass_read_image(struct pass_state *pass)
+     // If plane was not merged, convert it alone.
+     for (int i = 0; i < image->num_planes; i++) {
+         struct plane_state *st = &planes[i];
+-        if (!want_merge(pass, st, ref))
++        if (!want_merge(pass, source_processing, st, ref))
+             continue;
+ 
+         if (st->img.tex && st->img.tex->params.format->type == PL_FMT_UINT) {
+@@ -1898,17 +2149,17 @@ static bool pass_read_image(struct pass_state *pass)
+         // it's reduced in quality after e.g. plane scalers as well. It's also
+         // made less effective by performing film grain synthesis first.
+ 
+-        if (plane_deband(pass, &st->img, neutral)) {
++        if (source_processing && plane_deband(pass, &st->img, neutral)) {
+             PL_TRACE(rr, "After debanding:");
+             log_plane_info(rr, st);
+         }
+ 
+-        if (plane_film_grain(pass, i, st, ref)) {
++        if (source_processing && plane_film_grain(pass, i, st, ref)) {
+             PL_TRACE(rr, "After film grain:");
+             log_plane_info(rr, st);
+         }
+ 
+-        if (pass_hook(pass, &st->img, plane_hook_stages[st->type])) {
++        if (source_processing && pass_hook(pass, &st->img, plane_hook_stages[st->type])) {
+             st->plane.texture = st->img.tex;
+             st->plane_w = st->img.w;
+             st->plane_h = st->img.h;
+@@ -1993,8 +2244,12 @@ static bool pass_read_image(struct pass_state *pass)
+             src.tex = img_tex(pass, &st->img);
+             st->img.tex = NULL;
+             st->img.sh = pl_dispatch_begin_ex(rr->dp, true);
+-            dispatch_sampler(pass, st->img.sh, &rr->samplers_src[i],
+-                             SAMPLER_PLANE, NULL, &src);
++            if (source_processing) {
++                dispatch_sampler(pass, st->img.sh, &rr->samplers_src[i],
++                                 SAMPLER_PLANE, NULL, &src);
++            } else {
++                pl_shader_sample_direct(st->img.sh, &src);
++            }
+             st->img.err_enum |= PL_RENDER_ERR_SAMPLING;
+             st->img.rect.x0 = st->img.rect.y0 = 0.0f;
+             st->img.w = st->img.rect.x1 = src.new_w;
+@@ -2002,7 +2257,8 @@ static bool pass_read_image(struct pass_state *pass)
+             src.scale = 1.0;
+         }
+ 
+-        pass_hook(pass, &st->img, plane_scaled_hook_stages[st->type]);
++        if (source_processing)
++            pass_hook(pass, &st->img, plane_scaled_hook_stages[st->type]);
+         ident_t sub = sh_subpass(sh, img_sh(pass, &st->img));
+         if (!sub) {
+             if (!img_tex(pass, &st->img)) {
+@@ -2046,14 +2302,15 @@ static bool pass_read_image(struct pass_state *pass)
+     // Update the reference rect to our adjusted image coordinates
+     pass->ref_rect = pass->img.rect;
+ 
+-    pass_hook(pass, &pass->img, PL_HOOK_NATIVE);
++    if (source_processing)
++        pass_hook(pass, &pass->img, PL_HOOK_NATIVE);
+ 
+     // Apply LUT logic and colorspace conversion
+     enum pl_lut_type lut_type = guess_frame_lut_type(image, false);
+     sh = img_sh(pass, &pass->img);
+     bool needs_conversion = true;
+ 
+-    if (lut_type == PL_LUT_NATIVE || lut_type == PL_LUT_CONVERSION) {
++    if (source_processing && (lut_type == PL_LUT_NATIVE || lut_type == PL_LUT_CONVERSION)) {
+         // Fix bit depth normalization before applying LUT
+         float scale = pl_color_repr_normalize(&pass->img.repr);
+         GLSL("color *= vec4("$"); \n", SH_FLOAT(scale));
+@@ -2089,18 +2346,20 @@ static bool pass_read_image(struct pass_state *pass)
+ #endif
+         pl_shader_decode_color_ex(sh, pl_color_decode_args(
+             .repr              = &pass->img.repr,
+-            .color_adjustment  = params->color_adjustment,
++            // The causal source is the decoded authored frame, not a view
++            // modified by user colour controls.
++            .color_adjustment  = source_processing ? params->color_adjustment : NULL,
+             .enhancement_layer = el_sh,
+         ));
+         pl_dispatch_abort(rr->dp, &el_sh);
+     }
+ 
+-    if (lut_type == PL_LUT_NORMALIZED)
++    if (source_processing && lut_type == PL_LUT_NORMALIZED)
+         pl_shader_custom_lut(sh, image->lut, &rr->lut_state[LUT_IMAGE]);
+ 
+     // A main PL_LUT_CONVERSION LUT overrides ICC profiles
+     bool main_lut_override = params->lut && params->lut_type == PL_LUT_CONVERSION;
+-    if (image->icc && !main_lut_override) {
++    if (source_processing && image->icc && !main_lut_override) {
+         pl_shader_set_alpha(sh, &pass->img.repr, PL_ALPHA_INDEPENDENT);
+         pl_icc_decode(sh, image->icc, &rr->icc_state[ICC_IMAGE], &pass->img.color);
+     }
+@@ -2109,11 +2368,175 @@ static bool pass_read_image(struct pass_state *pass)
+     // bleeding colors from transparent regions into non-transparent regions
+     pl_shader_set_alpha(sh, &pass->img.repr, PL_ALPHA_PREMULTIPLIED);
+ 
+-    pass_hook(pass, &pass->img, PL_HOOK_RGB);
++    if (source_processing)
++        pass_hook(pass, &pass->img, PL_HOOK_RGB);
+     sh = NULL;
+     return true;
+ }
+ 
++bool pl_renderer_get_causal_test_data(pl_renderer rr, float *proxy,
++                                      size_t proxy_len,
++                                      struct pl_causal_test_descriptors *out)
++{
++    if (!rr || !proxy || !out || proxy_len != PL_CAUSAL_TEST_PROXY_W * PL_CAUSAL_TEST_PROXY_H ||
++        !rr->causal_proxy_tex)
++        return false;
++    pl_tex staging = pl_tex_create(rr->gpu, pl_tex_params(
++        .w = PL_CAUSAL_TEST_PROXY_W, .h = PL_CAUSAL_TEST_PROXY_H,
++        .format = rr->causal_proxy_tex->params.format, .blit_dst = true,
++        .host_readable = true, .debug_tag = "causal test proxy staging"));
++    if (!staging)
++        return false;
++    pl_tex_blit(rr->gpu, pl_tex_blit_params(.src = rr->causal_proxy_tex,
++                                            .dst = staging));
++    bool ok = pl_tex_download(rr->gpu, pl_tex_transfer_params(
++        .tex = staging, .ptr = proxy));
++    pl_tex_destroy(rr->gpu, &staging);
++    if (!ok)
++        return false;
++    return pl_get_causal_test_descriptors(rr->causal_state, out);
++}
++
++// Build the Stage-1 diagnostic source directly from immutable decoded planes.
++// This deliberately does not reuse pass_build_source: that function owns
++// renderer samplers, FBO bookkeeping, hook/LUT state and failure bits used by
++// the live render.  The diagnostic path must not touch any of those.
++static bool causal_extract_source(struct pass_state *live)
++{
++    struct pl_frame *image = &live->image;
++    pl_renderer rr = live->rr;
++    // Use the renderer dispatch so source uploads and proxy reads share one
++    // ordered GPU queue. State, textures and readback remain causal-private.
++    pl_dispatch dp = rr->dp;
++    // A failed preflight must never leave the preceding frame's proxy live.
++    live->causal_proxy = NULL;
++    if (image->field != PL_FIELD_NONE || image->rotation != PL_ROTATION_0 ||
++        image->color.primaries == PL_COLOR_PRIM_UNKNOWN)
++        return false;
++
++    const int ref_idx = frame_ref(image);
++    if (ref_idx < 0 || ref_idx >= image->num_planes ||
++        !image->planes[ref_idx].texture)
++        return false;
++
++    pl_tex ref_tex = image->planes[ref_idx].texture;
++    const pl_rect2df ref_rc = image->crop;
++    pl_rect2d rounded = {
++        .x0 = truncf(ref_rc.x0), .y0 = truncf(ref_rc.y0),
++    };
++    rounded.x1 = rounded.x0 + roundf(pl_rect_w(ref_rc));
++    rounded.y1 = rounded.y0 + roundf(pl_rect_h(ref_rc));
++    if (pl_rect_w(rounded) <= 0 || pl_rect_h(rounded) <= 0)
++        return false;
++
++    // The only transient state is a fresh shader tree.  Every plane is bound
++    // directly; no renderer sampler/cache/FBO/error state is consulted.
++    pl_shader sh = pl_dispatch_begin_ex(dp, true);
++    if (!sh_require(sh, PL_SHADER_SIG_NONE, 0, 0))
++        goto error;
++
++    int bits = image->repr.bits.sample_depth;
++    float out_scale = bits ? (1llu << bits) / ((1llu << bits) - 1.0f) : 1.0f;
++    float neutral_luma = 0.0, neutral_chroma = 0.5f * out_scale;
++    if (pl_color_levels_guess(&image->repr) == PL_COLOR_LEVELS_LIMITED)
++        neutral_luma = 16 / 256.0f * out_scale;
++    if (!pl_color_system_is_ycbcr_like(image->repr.sys))
++        neutral_chroma = neutral_luma;
++    GLSL("vec4 color = vec4("$", vec2("$"), 1.0);\n",
++         SH_FLOAT(neutral_luma), SH_FLOAT(neutral_chroma));
++
++    // Normalize stored sample depth once and carry the normalized
++    // representation into YUV/DV decoding, matching pass_build_source.
++    struct pl_color_repr normalized_repr = image->repr;
++    const float sample_scale = pl_color_repr_normalize(&normalized_repr);
++
++    for (int i = 0; i < image->num_planes; i++) {
++        const struct pl_plane *plane = &image->planes[i];
++        if (!plane->texture)
++            continue;
++        enum plane_type type = detect_plane_type(plane, &image->repr);
++        if (!type || type == PLANE_ALPHA)
++            continue;
++
++        float rx = (float) plane->texture->params.w / ref_tex->params.w;
++        float ry = (float) plane->texture->params.h / ref_tex->params.h;
++        float rrx = rx >= 1 ? roundf(rx) : 1.0 / roundf(1.0 / rx);
++        float rry = ry >= 1 ? roundf(ry) : 1.0 / roundf(1.0 / ry);
++        struct pl_sample_src src = {
++            .tex = plane->texture,
++            .components = plane->components,
++            .address_mode = plane->address_mode,
++            .scale = sample_scale,
++            .new_w = pl_rect_w(rounded),
++            .new_h = pl_rect_h(rounded),
++            .rect = {
++                (ref_rc.x0 - plane->shift_x) * rrx,
++                (ref_rc.y0 - plane->shift_y) * rry,
++                (ref_rc.x1 - plane->shift_x) * rrx,
++                (ref_rc.y1 - plane->shift_y) * rry,
++            },
++        };
++        if (plane->flipped) {
++            float h = ref_tex->params.h * rry;
++            src.rect.y0 = h - src.rect.y0;
++            src.rect.y1 = h - src.rect.y1;
++        }
++        if (!(plane->texture->params.format->caps & PL_FMT_CAP_LINEAR))
++            goto error;
++
++        pl_shader plane_sh = pl_dispatch_begin_ex(dp, true);
++        if (!pl_shader_sample_bilinear(plane_sh, &src)) {
++            pl_dispatch_abort(dp, &plane_sh);
++            goto error;
++        }
++        ident_t sub = sh_subpass(sh, plane_sh);
++        pl_dispatch_abort(dp, &plane_sh);
++        if (!sub)
++            goto error;
++        GLSL("{\nvec4 causal_plane = "$"();\n", sub);
++        for (int c = 0; c < plane->components; c++) {
++            int channel = plane->component_mapping[c];
++            if (channel >= 0 && channel <= 3)
++                GLSL("color[%d] = causal_plane[%d];\n",
++                     channel, plane->texture->params.format->sample_order[c]);
++        }
++        GLSL("}\n");
++    }
++
++    struct pl_color_repr repr = normalized_repr;
++    if (repr.sys == PL_COLOR_SYSTEM_DOLBYVISION && repr.dovi &&
++        repr.dovi->nlq_active)
++        goto error; // EL/NLQ is deliberately fail-closed until direct EL is added.
++    pl_shader_decode_color_ex(sh, pl_color_decode_args(.repr = &repr));
++
++    struct pass_state causal = {
++        .rr = rr,
++        .img = {
++            .sh = sh,
++            .w = pl_rect_w(rounded),
++            .h = pl_rect_h(rounded),
++            .repr = repr,
++            .color = image->color,
++            .comps = 3,
++            .rect = {0, 0, pl_rect_w(rounded), pl_rect_h(rounded)},
++        },
++    };
++    return causal_make_proxy(&causal, dp) &&
++           (live->causal_proxy = causal.causal_proxy, true);
++error:
++    pl_dispatch_abort(dp, &sh);
++    return false;
++}
++
++static bool pass_read_image(struct pass_state *pass)
++{
++    if (pass->params->causal_scene_detection ||
++        pass->params->causal_scene_acceleration)
++        causal_extract_source(pass);
++    bool ok = pass_build_source(pass, true);
++    return ok;
++}
++
+ static bool pass_scale_main(struct pass_state *pass)
+ {
+     const struct pl_render_params *params = pass->params;
+@@ -2122,6 +2545,8 @@ static bool pass_scale_main(struct pass_state *pass)
+     pl_fmt fbofmt = pass->fbofmt[pass->img.comps];
+     if (!fbofmt) {
+         PL_TRACE(rr, "Skipping main scaler (no FBOs)");
++        hdr_update_peak(pass);
++        causal_update(pass);
+         return true;
+     }
+ 
+@@ -2235,6 +2660,11 @@ static bool pass_scale_main(struct pass_state *pass)
+ done:
+     if (info.dir != SAMPLER_UP)
+         hdr_update_peak(pass);
++    // In delayed mode, a pre-existing peak transaction can occupy the shared
++    // buffer at the first scheduling point. Retry after peak scheduling so
++    // the causal reducer appends to that frame's tagged transaction instead
++    // of starving behind a continuous peak stream.
++    causal_update(pass);
+     pass_hook(pass, img, PL_HOOK_SCALED);
+     return true;
+ }
+diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
+index 86cad57f..3f161f95 100644
+--- a/src/shaders/colorspace.c
++++ b/src/shaders/colorspace.c
+@@ -20,8 +20,10 @@
+ #include "cache.h"
+ #include "colorspace.h"
+ #include "shaders.h"
++#include "tests/causal_test.h"
+ 
+ #include <libplacebo/shaders/colorspace.h>
++#include <libplacebo/renderer.h>
+ 
+ void pl_shader_set_alpha(pl_shader sh, struct pl_color_repr *repr,
+                          enum pl_alpha_mode mode)
+@@ -1011,6 +1013,18 @@ enum {
+     HIST_BIAS   = 1 << (HIST_BITS - 1),
+     HIST_BINS   = (1 << HIST_BITS) - HIST_BIAS,
+ 
++    CAUSAL_HIST_BINS = 64,
++    CAUSAL_TILE_W = 20,
++    CAUSAL_TILE_X = 16,
++    CAUSAL_TILE_Y = 9,
++    CAUSAL_TILES = CAUSAL_TILE_X * CAUSAL_TILE_Y,
++    CAUSAL_GRID_X = 48,
++    CAUSAL_GRID_Y = 27,
++    CAUSAL_GRID = CAUSAL_GRID_X * CAUSAL_GRID_Y,
++    // Inclusive Q20 makes every 1/64 bin edge representable. Its half-step
++    // error remains far below native-v1's 2e-5 GPU parity tolerance.
++    CAUSAL_PQ_SCALE = 1 << 20,
++
+     // Convert from histogram bin to (starting) PQ value
+ #define HIST_PQ(bin) (((bin) + HIST_BIAS) << (PQ_BITS - HIST_BITS))
+ };
+@@ -1031,6 +1045,9 @@ struct peak_buf_data {
+     unsigned frame_sum_metric[SLICES];
+     unsigned frame_max_metric[SLICES];
+     unsigned frame_hist_metric[SLICES][HIST_BINS];
++    unsigned causal_hist[CAUSAL_HIST_BINS];
++    unsigned causal_tiles[CAUSAL_TILES];
++    unsigned causal_grid[CAUSAL_GRID];
+ };
+ 
+ static const struct pl_buffer_var peak_buf_vars[] = {
+@@ -1061,9 +1078,37 @@ static const struct pl_buffer_var peak_buf_vars[] = {
+     VAR(frame_sum_metric),
+     VAR(frame_max_metric),
+     VAR(frame_hist_metric),
++    VAR(causal_hist),
++    VAR(causal_tiles),
++    VAR(causal_grid),
+ #undef VAR
+ };
+ 
++// Private causal transaction context. It is deliberately not part of the
++// public peak-detection parameters/state: causal observation must never alter
++// peak parameter comparison, smoothing, or ownership.
++struct causal_scene_params {
++    bool enabled, acceleration, allow_delayed;
++    uint64_t tag, signature;
++    uint64_t authored_tag, authored_source;
++    enum pl_tone_map_metric metric;
++};
++
++static struct causal_scene_params causal_params_from_peak(
++    const struct pl_peak_detect_params *p)
++{
++    return (struct causal_scene_params) {
++        .enabled = p->causal_scene_enabled,
++        .acceleration = p->causal_scene_acceleration,
++        .allow_delayed = p->allow_delayed,
++        .tag = p->causal_scene_tag,
++        .signature = p->causal_scene_signature,
++        .authored_tag = p->scene_reset_tag,
++        .authored_source = p->scene_reset_source,
++        .metric = p->metric,
++    };
++}
++
+ struct sh_color_map_obj {
+ #ifdef PL_BLACK_LEVEL_DIAGNOSTICS
+     struct {
+@@ -1099,6 +1144,32 @@ struct sh_color_map_obj {
+         bool last_scene_reset;
+         uint64_t last_scene_reset_tag;
+         uint64_t scene_reset_count;
++        struct pl_causal_scene_diagnostics causal;
++        // Immutable context for the pending causal transaction. Peak analysis
++        // may append later and replace `params` with its own controls.
++        struct causal_scene_params causal_params;
++        uint64_t causal_latest_submitted_tag;
++        bool causal_have_previous;
++        uint64_t causal_previous_tag;
++        uint64_t causal_previous_signature;
++        float causal_previous_cut_score;
++        float causal_previous_hist[CAUSAL_HIST_BINS];
++        float causal_previous_tiles[CAUSAL_TILES];
++        float causal_previous_grid[CAUSAL_GRID];
++        bool causal_pending_valid;
++        bool causal_pending_local_max_left;
++        uint64_t causal_pending_tag;
++        float causal_pending_cut_score;
++        float causal_pending_motion_residual;
++        struct pl_causal_test_descriptors causal_test;
++        bool causal_test_valid;
++        // A causal-only transaction owns its own buffer.  When a live peak
++        // transaction for the same tagged frame exists, causal only borrows
++        // that buffer and the live transaction delivers its one readback to
++        // this isolated sink.
++        bool causal_owns;
++        pl_shader_obj causal_sink;
++        struct causal_scene_params causal_sink_params;
+     } peak;
+ };
+ 
+@@ -1536,8 +1607,110 @@ static float measure_peak(const unsigned max_pq[SLICES],
+     pl_unreachable();
+ }
+ 
++static float causal_mad(const float *a, const float *b, int w, int h, int dx, int dy, bool trim)
++{
++    float v[CAUSAL_GRID]; int n=0;
++    for(int y=0;y<h;y++) for(int x=0;x<w;x++) { int px=x+dx,py=y+dy;
++        if(px>=0&&px<w&&py>=0&&py<h) v[n++]=fabsf(a[y*w+x]-b[py*w+px]); }
++    for(int i=1;trim&&i<n;i++){float q=v[i];int j=i;while(j&&v[j-1]>q){v[j]=v[j-1];j--;}v[j]=q;}
++    if(trim)n=PL_MAX(1,n*9/10); float s=0;for(int i=0;i<n;i++)s+=v[i];return n?s/n:0;
++}
++
++static bool causal_consume(struct sh_color_map_obj *obj,
++                           const struct peak_buf_data *d,
++                           const struct causal_scene_params *p)
++{
++    if (!p->enabled)
++        return false;
++    struct pl_causal_scene_diagnostics *o = &obj->peak.causal;
++    uint64_t total = 0;
++    for (int i = 0; i < CAUSAL_HIST_BINS; i++) total += d->causal_hist[i];
++    const uint64_t last_trigger_tag = o->last_trigger_tag;
++    const uint64_t trigger_count = o->visual_trigger_count;
++    memset(o, 0, sizeof(*o));
++    o->last_trigger_tag = last_trigger_tag;
++    o->visual_trigger_count = trigger_count;
++    o->effective_allow_delayed = p->allow_delayed;
++    o->submitted_tag = obj->peak.causal_latest_submitted_tag;
++    o->consumed_tag = p->tag;
++    o->readback_latency_frames = obj->peak.causal_latest_submitted_tag >= p->tag
++        ? (int) (obj->peak.causal_latest_submitted_tag - p->tag) : -1;
++    o->active_metric_branch = p->metric;
++    // Carry authored metadata independently of any future policy deciding
++    // whether it should reset peak smoothing. Stage 1 only observes it.
++    o->authored_boundary_tag = p->authored_tag;
++    o->authored_boundary_source = p->authored_source;
++    if (!p->tag || !total) {
++        o->withheld_reason = PL_CAUSAL_SCENE_WITHHELD_NO_TAG;
++        obj->peak.causal_have_previous = false;
++        obj->peak.causal_pending_valid = false;
++        o->last_trigger_tag = o->visual_trigger_count = 0;
++        return false;
++    }
++    float hist[CAUSAL_HIST_BINS], tiles[CAUSAL_TILES], grid[CAUSAL_GRID];
++    for (int i=0;i<CAUSAL_HIST_BINS;i++) hist[i]=(float)d->causal_hist[i]/total;
++    for (int i=0;i<CAUSAL_TILES;i++) tiles[i]=(float)d->causal_tiles[i]/(400*CAUSAL_PQ_SCALE);
++    for (int i=0;i<CAUSAL_GRID;i++) grid[i]=(float)d->causal_grid[i]/CAUSAL_PQ_SCALE;
++    memcpy(obj->peak.causal_test.histogram, hist, sizeof(hist));
++    memcpy(obj->peak.causal_test.tiles, tiles, sizeof(tiles));
++    memcpy(obj->peak.causal_test.grid, grid, sizeof(grid));
++    obj->peak.causal_test_valid = true;
++    if (obj->peak.causal_have_previous &&
++        p->signature == obj->peak.causal_previous_signature &&
++        p->tag == obj->peak.causal_previous_tag + 1) {
++        for (int i=0;i<CAUSAL_HIST_BINS;i++) o->histogram_tv += fabsf(hist[i]-obj->peak.causal_previous_hist[i]);
++        o->histogram_tv *= .5f;
++        o->tile_mad=causal_mad(tiles,obj->peak.causal_previous_tiles,16,9,0,0,false);
++        o->shifted_tile_mad=INFINITY; for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++)o->shifted_tile_mad=PL_MIN(o->shifted_tile_mad,causal_mad(tiles,obj->peak.causal_previous_tiles,16,9,x,y,false));
++        o->translated_motion_fraction=PL_CLAMP((o->tile_mad-o->shifted_tile_mad)/(o->tile_mad+1e-12f),0,1);
++        o->global_motion_residual=INFINITY; for(int y=-2;y<=2;y++)for(int x=-2;x<=2;x++)o->global_motion_residual=PL_MIN(o->global_motion_residual,causal_mad(grid,obj->peak.causal_previous_grid,48,27,x,y,true));
++        o->cut_score=PL_CLAMP(.5f*(o->histogram_tv+o->tile_mad)*(1-o->translated_motion_fraction),0,1);
++        const bool base = o->cut_score >= .10f && o->global_motion_residual >= .015f;
++        const bool immediate = o->cut_score >= .16f && o->global_motion_residual >= .06f;
++        const bool confirmed = obj->peak.causal_pending_valid &&
++            obj->peak.causal_pending_local_max_left &&
++            obj->peak.causal_pending_cut_score >= 1.5f * o->cut_score &&
++            obj->peak.causal_pending_motion_residual >=
++                1.5f * PL_MAX(o->global_motion_residual, .002f);
++        const uint64_t trigger_tag = confirmed ? obj->peak.causal_pending_tag : p->tag;
++        o->visual_trigger = (confirmed || immediate) &&
++            (!o->last_trigger_tag || trigger_tag > o->last_trigger_tag + 2);
++        if (o->visual_trigger) {
++            o->last_trigger_tag = trigger_tag;
++            o->visual_trigger_count++;
++        }
++        obj->peak.causal_pending_valid = base && !immediate;
++        obj->peak.causal_pending_local_max_left =
++            o->cut_score >= obj->peak.causal_previous_cut_score;
++        obj->peak.causal_pending_tag = p->tag;
++        obj->peak.causal_pending_cut_score = o->cut_score;
++        obj->peak.causal_pending_motion_residual = o->global_motion_residual;
++        obj->peak.causal_previous_cut_score = o->cut_score;
++        o->descriptor_valid=true;
++    } else {
++        o->withheld_reason = obj->peak.causal_have_previous
++            ? PL_CAUSAL_SCENE_WITHHELD_DISCONTINUITY
++            : PL_CAUSAL_SCENE_WITHHELD_PENDING;
++        if (obj->peak.causal_have_previous) {
++            o->last_trigger_tag = 0;
++            o->visual_trigger_count = 0;
++        }
++        obj->peak.causal_pending_valid = false;
++        obj->peak.causal_previous_cut_score = 0.0f;
++    }
++    memcpy(obj->peak.causal_previous_hist,hist,sizeof(hist));
++    memcpy(obj->peak.causal_previous_tiles,tiles,sizeof(tiles));
++    memcpy(obj->peak.causal_previous_grid,grid,sizeof(grid));
++    obj->peak.causal_previous_tag=p->tag;
++    obj->peak.causal_previous_signature=p->signature;
++    obj->peak.causal_have_previous=true;
++    return p->acceleration && o->visual_trigger;
++}
++
+ // if `force` is true, ensures the buffer is read, even if `allow_delayed`
+-static void update_peak_buf(pl_gpu gpu, struct sh_color_map_obj *obj, bool force)
++// Single consumer for both stock peak and causal descriptors. `force` keeps
++// the existing allow_delayed semantics; causal diagnostics only observe them.
++static void analysis_consume(pl_gpu gpu, struct sh_color_map_obj *obj, bool force)
+ {
+     const struct pl_peak_detect_params *params = &obj->peak.params;
+     if (!obj->peak.buf)
+@@ -1554,7 +1727,10 @@ static void update_peak_buf(pl_gpu gpu, struct sh_color_map_obj *obj, bool force
+     } else {
+         ok = pl_buf_read(gpu, obj->peak.buf, 0, &data, sizeof(data));
+     }
+-    if (ok && data.frame_wg_count[0] > 0) {
++    bool causal_data = false;
++    for (int i = 0; i < CAUSAL_HIST_BINS; i++)
++        causal_data |= data.causal_hist[i] != 0;
++    if (ok && (data.frame_wg_count[0] > 0 || causal_data)) {
+         // Peak detection completed successfully
+         pl_buf_destroy(gpu, &obj->peak.buf);
+     } else {
+@@ -1574,6 +1750,27 @@ static void update_peak_buf(pl_gpu gpu, struct sh_color_map_obj *obj, bool force
+         return;
+     }
+ 
++    bool causal_acceleration = false;
++    if (obj->peak.causal_sink) {
++        struct sh_color_map_obj *sink = obj->peak.causal_sink->priv;
++        causal_acceleration = causal_consume(sink, &data,
++                                              &obj->peak.causal_sink_params);
++        sink->peak.causal.acceleration_applied = causal_acceleration;
++        sink->peak.causal_test.readback_count++;
++        sink->peak.causal_test.borrowed_peak_transaction = true;
++        sink->peak.causal_test.transaction_bytes = sizeof(data);
++        obj->peak.causal_sink = NULL;
++    } else if (obj->peak.causal_owns) {
++        causal_consume(obj, &data, &obj->peak.causal_params);
++        obj->peak.causal_test.readback_count++;
++        obj->peak.causal_test.borrowed_peak_transaction = false;
++        obj->peak.causal_test.transaction_bytes = sizeof(data);
++    }
++
++    if (!data.frame_wg_count[0]) {
++        return;
++    }
++
+     uint64_t frame_sum_pq = 0u, frame_sum_rgb = 0u, frame_sum_metric = 0u;
+     uint64_t frame_wg_count = 0u, frame_wg_active = 0u;
+     unsigned frame_max_rgb = 0u;
+@@ -1646,6 +1843,11 @@ static void update_peak_buf(pl_gpu gpu, struct sh_color_map_obj *obj, bool force
+         obj->peak.max_metric += coeff *
+             (raw_max_metric - obj->peak.max_metric);
+ 
++        if (causal_acceleration) {
++            obj->peak.avg_metric = raw_avg_metric;
++            obj->peak.max_metric = raw_max_metric;
++        }
++
+         // Accelerate both smoothed values on scene changes, exactly as the
+         // standard detector does, but detect the change from this metric's
+         // frame average rather than CIE Y.
+@@ -1690,6 +1892,11 @@ static void update_peak_buf(pl_gpu gpu, struct sh_color_map_obj *obj, bool force
+     obj->peak.avg_pq += coeff * (avg_pq - obj->peak.avg_pq);
+     obj->peak.max_pq += coeff * (max_pq - obj->peak.max_pq);
+ 
++    if (causal_acceleration) {
++        obj->peak.avg_pq = avg_pq;
++        obj->peak.max_pq = max_pq;
++    }
++
+     // Scene change hysteresis
+     if (params->scene_threshold_low > 0 && params->scene_threshold_high > 0) {
+         const float log10_pq = 1e-2f; // experimentally determined approximate
+@@ -1741,17 +1948,26 @@ bool pl_shader_detect_peak(pl_shader sh, struct pl_color_space csp,
+     if (!obj)
+         return false;
+ 
+-    if (peak_detect_params_eq(&obj->peak.params, params)) {
+-        update_peak_buf(gpu, obj, true); // prevent over-writing previous frame
++    obj->peak.causal_latest_submitted_tag = params->causal_scene_tag;
++    const bool append_causal = obj->peak.buf && obj->peak.params.causal_scene_enabled &&
++        obj->peak.params.causal_scene_tag == params->causal_scene_tag;
++    if (append_causal) {
++        // The causal pre-hook dispatch began this frame's shared analysis
++        // transaction. Append stock peak work to its SSBO; do not read it.
++    } else if (peak_detect_params_eq(&obj->peak.params, params)) {
++        analysis_consume(gpu, obj, true); // prevent over-writing previous frame
+     } else {
+         pl_reset_detected_peak(*state);
+     }
+ 
+-    pl_assert(!obj->peak.buf);
++    if (!append_causal)
++        pl_assert(!obj->peak.buf);
+     static const struct peak_buf_data zero = {0};
+ 
+ retry_ssbo:
+-    if (obj->peak.readback) {
++    if (append_causal) {
++        // The causal dispatch already allocated the exact same transaction.
++    } else if (obj->peak.readback) {
+         obj->peak.buf = pl_buf_create(gpu, pl_buf_params(
+             .size           = sizeof(struct peak_buf_data),
+             .storable       = true,
+@@ -1783,7 +1999,17 @@ retry_ssbo:
+         return false;
+     }
+ 
+-    obj->peak.params = *params;
++    if (append_causal) {
++        // Preserve causal identity/context from the transaction owner while
++        // restoring the actual peak detector controls for consumption.
++        bool causal_enabled = obj->peak.params.causal_scene_enabled;
++        uint64_t causal_tag = obj->peak.params.causal_scene_tag;
++        obj->peak.params = *params;
++        obj->peak.params.causal_scene_enabled = causal_enabled;
++        obj->peak.params.causal_scene_tag = causal_tag;
++    } else {
++        obj->peak.params = *params;
++    }
+     pl_color_space_infer(&csp);
+ 
+     sh_desc(sh, (struct pl_shader_desc) {
+@@ -1997,6 +2223,130 @@ retry_ssbo:
+     return true;
+ }
+ 
++// Appends native-cie-y-v1 descriptors to the exact same pending peak SSBO.
++// The proxy was rendered at fixed pixel centres before RGB hooks; this pass
++// reads each of those 320x180 texels once, then samples the proxy again at the
++// 48x27 grid's own pixel centres.
++bool pl_shader_detect_causal_scene(pl_dispatch dp, pl_gpu gpu, pl_tex proxy,
++                                   pl_shader_obj *state,
++                                   pl_shader_obj borrowed_state,
++                                   const struct pl_peak_detect_params *params)
++{
++    struct sh_color_map_obj *borrow = NULL;
++    bool append_peak = false;
++    if (!params || !params->causal_scene_enabled || !proxy || !state || !gpu)
++        return false;
++    if (proxy->params.w != 320 || proxy->params.h != 180)
++        return false;
++
++    pl_shader dsh = pl_dispatch_begin(dp);
++    pl_shader sh = dsh;
++    struct sh_color_map_obj *obj = SH_OBJ(dsh, state, PL_SHADER_OBJ_COLOR_MAP,
++                                          struct sh_color_map_obj,
++                                          sh_color_map_uninit);
++    if (!obj)
++        goto error;
++
++    // Do not share the causal state object with tone mapping. The optional
++    // borrowed transaction is live peak's *buffer only*, and only if it was
++    // submitted for this exact source tag. Its normal single consume delivers
++    // the descriptor payload into our isolated causal history below.
++    borrow = borrowed_state ? borrowed_state->priv : NULL;
++    append_peak = borrow && borrow->peak.buf &&
++        borrow->peak.params.causal_scene_enabled &&
++        borrow->peak.params.causal_scene_tag == params->causal_scene_tag;
++    if (!append_peak)
++        analysis_consume(gpu, obj, !params->allow_delayed);
++    if (!append_peak && obj->peak.buf) {
++        obj->peak.causal_params = causal_params_from_peak(params);
++        obj->peak.causal = (struct pl_causal_scene_diagnostics) {
++            .effective_allow_delayed = true,
++            .submitted_tag = obj->peak.causal_latest_submitted_tag,
++            .authored_boundary_tag = params->scene_reset_tag,
++            .authored_boundary_source = params->scene_reset_source,
++            .active_metric_branch = params->metric,
++            .withheld_reason = PL_CAUSAL_SCENE_WITHHELD_PENDING,
++        };
++        return true; // queue pressure; keep pending buffer intact
++    }
++    if (!append_peak && !obj->peak.buf) {
++        static const struct peak_buf_data zero = {0};
++        obj->peak.buf = pl_buf_create(gpu, pl_buf_params(
++            .size = sizeof(zero), .memory_type = PL_BUF_MEM_DEVICE,
++            .host_readable = true, .storable = true, .initial_data = &zero,
++        ));
++        if (!obj->peak.buf) {
++            obj->peak.readback = pl_buf_create(gpu, pl_buf_params(
++                .size = sizeof(zero), .host_readable = true,
++            ));
++            if (obj->peak.readback)
++                obj->peak.buf = pl_buf_create(gpu, pl_buf_params(
++                    .size = sizeof(zero), .storable = true,
++                    .initial_data = &zero,
++                ));
++        }
++    }
++    if (!append_peak && !obj->peak.buf)
++        goto error;
++    obj->peak.params = *params;
++    obj->peak.causal_params = causal_params_from_peak(params);
++    obj->peak.causal_latest_submitted_tag = params->causal_scene_tag;
++    obj->peak.causal_owns = !append_peak;
++    if (append_peak) {
++        // Weak sink: the live owner remains responsible for destroying its
++        // buffer/readback. Do not overwrite a prior sink for a different tag.
++        if (borrow->peak.causal_sink)
++            goto error;
++        borrow->peak.causal_sink = *state;
++        borrow->peak.causal_sink_params = causal_params_from_peak(params);
++    }
++    if (!sh_try_compute(dsh, 16, 16, false, 0))
++        goto error;
++    ident_t tex = sh_bind(dsh, proxy, PL_TEX_ADDRESS_CLAMP,
++                          PL_TEX_SAMPLE_LINEAR, "causal_proxy", NULL,
++                          NULL, NULL);
++    if (!tex)
++        goto error;
++    sh_desc(dsh, (struct pl_shader_desc) {
++        .desc = { .name = "PeakBuf", .type = PL_DESC_BUF_STORAGE,
++                  .access = PL_DESC_ACCESS_READWRITE },
++        .binding.object = append_peak ? borrow->peak.buf : obj->peak.buf,
++        .buffer_vars = (struct pl_buffer_var *) peak_buf_vars,
++        .num_buffer_vars = PL_ARRAY_SIZE(peak_buf_vars),
++    });
++    GLSL("// native-cie-y-v1 causal descriptor reduction\n"
++         "uvec2 p = gl_GlobalInvocationID.xy;\n"
++         "if (p.x < 320u && p.y < 180u) {\n"
++         "  float v = texelFetch("$", ivec2(p), 0).r;\n"
++         "  uint q = uint(clamp(v, 0.0, 1.0) * "$" + 0.5);\n"
++         // Canonicalize only the frozen GPU parity neighbourhood of a bin
++         // edge. This handles reciprocal PQ float round-trips without moving
++         // ordinary samples or changing the descriptor's interval contract.
++         "  float edge = round(v * 64.0) / 64.0;\n"
++         "  uint bin = abs(v - edge) <= 2e-5 ? uint(edge * 64.0) : (q >> 14u);\n"
++         "  atomicAdd(causal_hist[min(bin, 63u)], 1u);\n"
++         "  atomicAdd(causal_tiles[(p.y / 20u) * 16u + p.x / 20u], q);\n"
++         "}\n"
++         "if (p.x < 48u && p.y < 27u) {\n"
++         "  vec2 qpos = clamp((vec2(p) + vec2(0.5)) * vec2(320.0 / 48.0, 180.0 / 27.0) - vec2(0.5), vec2(0.0), vec2(319.0, 179.0));\n"
++         "  ivec2 q0 = ivec2(floor(qpos));\n"
++         "  ivec2 q1 = min(q0 + ivec2(1), ivec2(319, 179));\n"
++         "  vec2 qf = fract(qpos);\n"
++         "  float qtop = mix(texelFetch("$", q0, 0).r, texelFetch("$", ivec2(q1.x, q0.y), 0).r, qf.x);\n"
++         "  float qbot = mix(texelFetch("$", ivec2(q0.x, q1.y), 0).r, texelFetch("$", q1, 0).r, qf.x);\n"
++         "  float v = mix(qtop, qbot, qf.y);\n"
++         "  causal_grid[p.y * 48u + p.x] = uint(clamp(v,0.0,1.0)*"$"+0.5);\n"
++         "}\n", tex, SH_FLOAT(CAUSAL_PQ_SCALE), tex, tex, tex, tex,
++         SH_FLOAT(CAUSAL_PQ_SCALE));
++    return pl_dispatch_compute(dp, pl_dispatch_compute_params(
++        .shader = &dsh, .dispatch_size = {20, 12, 1}));
++error:
++    if (append_peak && borrow && borrow->peak.causal_sink == *state)
++        borrow->peak.causal_sink = NULL;
++    pl_dispatch_abort(dp, &dsh);
++    return false;
++}
++
+ bool pl_get_detected_hdr_metadata(const pl_shader_obj state,
+                                   struct pl_hdr_metadata *out)
+ {
+@@ -2004,7 +2354,7 @@ bool pl_get_detected_hdr_metadata(const pl_shader_obj state,
+         return false;
+ 
+     struct sh_color_map_obj *obj = state->priv;
+-    update_peak_buf(state->gpu, obj, false);
++    analysis_consume(state->gpu, obj, false);
+     if (!obj->peak.avg_pq)
+         return false;
+ 
+@@ -2020,7 +2370,7 @@ bool pl_get_peak_detect_metrics(const pl_shader_obj state,
+         return false;
+ 
+     struct sh_color_map_obj *obj = state->priv;
+-    update_peak_buf(state->gpu, obj, false);
++    analysis_consume(state->gpu, obj, false);
+     if (!obj->peak.avg_pq)
+         return false;
+ 
+@@ -2043,6 +2393,45 @@ bool pl_get_peak_detect_metrics(const pl_shader_obj state,
+     return true;
+ }
+ 
++bool pl_get_causal_scene_diagnostics(const pl_shader_obj state,
++                                     struct pl_causal_scene_diagnostics *out)
++{
++    if (!state || state->type != PL_SHADER_OBJ_COLOR_MAP || !out)
++        return false;
++    struct sh_color_map_obj *obj = state->priv;
++    analysis_consume(state->gpu, obj, false);
++    *out = obj->peak.causal;
++    return obj->peak.causal_params.enabled;
++}
++
++bool pl_get_causal_test_descriptors(const pl_shader_obj state,
++                                    struct pl_causal_test_descriptors *out)
++{
++    if (!state || state->type != PL_SHADER_OBJ_COLOR_MAP || !out)
++        return false;
++    struct sh_color_map_obj *obj = state->priv;
++    analysis_consume(state->gpu, obj, true);
++    if (!obj->peak.causal_test_valid)
++        return false;
++    *out = obj->peak.causal_test;
++    return true;
++}
++
++void pl_reset_causal_scene(pl_shader_obj state)
++{
++    if (!state || state->type != PL_SHADER_OBJ_COLOR_MAP)
++        return;
++    struct sh_color_map_obj *obj = state->priv;
++    memset(&obj->peak.causal, 0, sizeof(obj->peak.causal));
++    memset(&obj->peak.causal_params, 0, sizeof(obj->peak.causal_params));
++    obj->peak.causal_have_previous = false;
++    obj->peak.causal_previous_tag = 0;
++    obj->peak.causal_previous_signature = 0;
++    obj->peak.causal_previous_cut_score = 0.0f;
++    obj->peak.causal_pending_valid = false;
++    obj->peak.causal_test_valid = false;
++}
++
+ bool pl_get_detected_tone_map_range(const pl_shader_obj state,
+                                     enum pl_tone_map_metric metric,
+                                     float *max_pq, float *avg_pq)
+@@ -2050,7 +2439,7 @@ bool pl_get_detected_tone_map_range(const pl_shader_obj state,
+     if (!state || state->type != PL_SHADER_OBJ_COLOR_MAP)
+         return false;
+     struct sh_color_map_obj *obj = state->priv;
+-    update_peak_buf(state->gpu, obj, false);
++    analysis_consume(state->gpu, obj, false);
+     if (metric != PL_TONE_MAP_METRIC_STANDARD) {
+         if (obj->peak.params.metric != metric || !obj->peak.avg_metric)
+             return false;
+diff --git a/src/tests/causal_test.h b/src/tests/causal_test.h
+new file mode 100644
+index 00000000..5d21d29e
+--- /dev/null
++++ b/src/tests/causal_test.h
+@@ -0,0 +1,31 @@
++/* Private causal diagnostic test seam.  Never installed or exported. */
++#pragma once
++
++#include <stddef.h>
++#include <libplacebo/renderer.h>
++
++enum {
++    PL_CAUSAL_TEST_PROXY_W = 320,
++    PL_CAUSAL_TEST_PROXY_H = 180,
++    PL_CAUSAL_TEST_HIST_BINS = 64,
++    PL_CAUSAL_TEST_TILES = 144,
++    PL_CAUSAL_TEST_GRID = 1296,
++};
++
++struct pl_causal_test_descriptors {
++    float histogram[PL_CAUSAL_TEST_HIST_BINS];
++    float tiles[PL_CAUSAL_TEST_TILES];
++    float grid[PL_CAUSAL_TEST_GRID];
++    unsigned readback_count;
++    bool borrowed_peak_transaction;
++    size_t transaction_bytes;
++};
++
++// Requires a completed causal frame. `proxy` has exactly 320 * 180 floats.
++// This is deliberately a test-only synchronized copy, not a production API.
++bool pl_renderer_get_causal_test_data(pl_renderer rr, float *proxy,
++                                      size_t proxy_len,
++                                      struct pl_causal_test_descriptors *out);
++
++bool pl_get_causal_test_descriptors(pl_shader_obj state,
++                                    struct pl_causal_test_descriptors *out);
+diff --git a/src/tests/gpu_tests.c b/src/tests/gpu_tests.c
+index 965221f5..92ce14fa 100644
+--- a/src/tests/gpu_tests.c
++++ b/src/tests/gpu_tests.c
+@@ -1,5 +1,6 @@
+ #include "gpu_tests.h"
+ #include "shaders.h"
++#include "tests/causal_test.h"
+ 
+ #include <libplacebo/renderer.h>
+ #include <libplacebo/utils/frame_queue.h>
+@@ -1969,6 +1970,414 @@ static void pl_test_host_ptr(pl_gpu gpu)
+ #endif // unix
+ }
+ 
++// Stage-1 contract: the opt-in causal graph is observational. Exercise both
++// the normal GPU path and a deliberate Unsupported (unknown primaries) path
++// against byte-identical output from the same source/target render.
++static void pl_causal_output_invariance_test(pl_gpu gpu)
++{
++    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 32, 0,
++                             PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_RENDERABLE);
++    if (!fmt || !gpu->limits.compute_queues || !gpu->limits.max_ssbo_size)
++        return;
++    enum { W = 8, H = 8 };
++    float src[W * H * 4], ref[W * H * 4], out[W * H * 4];
++    for (int i = 0; i < W * H; i++) {
++        src[4*i+0] = (float) i / (W * H - 1) * (10000.0f / PL_COLOR_SDR_WHITE);
++        src[4*i+1] = 0.2f * src[4*i+0]; src[4*i+2] = 0.1f * src[4*i+0];
++        src[4*i+3] = 1.0f;
++    }
++    pl_tex st = pl_tex_create(gpu, pl_tex_params(.w=W, .h=H, .format=fmt,
++        .sampleable=true, .initial_data=src));
++    pl_tex dt = pl_tex_create(gpu, pl_tex_params(.w=W, .h=H, .format=fmt,
++        .renderable=true, .host_readable=true));
++    pl_tex dt_causal = pl_tex_create(gpu, pl_tex_params(.w=W, .h=H, .format=fmt,
++        .renderable=true, .host_readable=true));
++    pl_tex dt_peak = pl_tex_create(gpu, pl_tex_params(.w=W*2, .h=H*2, .format=fmt,
++        .renderable=true, .host_readable=true));
++    if (!st || !dt || !dt_causal || !dt_peak) goto done;
++    // Separate renderers avoid normal peak-detection history from one render
++    // becoming a false difference in the opt-in causal comparison.
++    pl_renderer rr_ref = pl_renderer_create(gpu->log, gpu);
++    pl_renderer rr = pl_renderer_create(gpu->log, gpu);
++    REQUIRE(rr_ref && rr);
++    struct pl_frame image = { .num_planes=1, .planes={{.texture=st,
++        .components=3, .component_mapping={0,1,2}}},
++        .repr={.sys=PL_COLOR_SYSTEM_RGB,.levels=PL_COLOR_LEVELS_FULL},
++        .color={.primaries=PL_COLOR_PRIM_BT_2020,.transfer=PL_COLOR_TRC_LINEAR},
++        .causal_scene_tag=1 };
++    struct pl_frame target = { .num_planes=1, .planes={{.texture=dt,
++        .components=4, .component_mapping={0,1,2,3}}},
++        .repr={.sys=PL_COLOR_SYSTEM_RGB,.levels=PL_COLOR_LEVELS_FULL},
++        .color=image.color };
++    REQUIRE(pl_render_image(rr_ref, &image, &target, NULL));
++    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex=dt,.ptr=ref)));
++    struct pl_render_params p = pl_render_default_params;
++    // Guard the harness: NULL and a value copy of the default parameters must
++    // match before any opt-in diagnostic work is enabled.
++    REQUIRE(pl_render_image(rr, &image, &target, &p));
++    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex=dt,.ptr=out)));
++    REQUIRE_MEMEQ(ref, out, sizeof(ref));
++    p.causal_scene_detection = true;
++    // A zero tag must exercise source proxy creation but withhold the reducer.
++    // This narrows output-invariance regressions to extraction vs. analysis.
++    image.causal_scene_tag = 0;
++    target.planes[0].texture = dt_causal;
++    REQUIRE(pl_render_image(rr, &image, &target, &p));
++    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex=dt_causal,.ptr=out)));
++    REQUIRE_MEMEQ(ref, out, sizeof(ref));
++    // A normal tagged transaction, including reducer/readback setup, remains
++    // strictly observational.
++    image.causal_scene_tag = 1;
++    REQUIRE(pl_render_image(rr, &image, &target, &p));
++    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex=dt_causal,.ptr=out)));
++    REQUIRE_MEMEQ(ref, out, sizeof(ref));
++
++    // The private test seam downloads the exact fixed proxy and the completed
++    // reducer descriptors. This is intentionally not part of libplacebo's API.
++    float *proxy = malloc(PL_CAUSAL_TEST_PROXY_W * PL_CAUSAL_TEST_PROXY_H * sizeof(*proxy));
++    struct pl_causal_test_descriptors causal_desc = {0};
++    REQUIRE(proxy);
++    REQUIRE(pl_renderer_get_causal_test_data(rr, proxy,
++            PL_CAUSAL_TEST_PROXY_W * PL_CAUSAL_TEST_PROXY_H, &causal_desc));
++    float hist_sum = 0.0f;
++    for (int i = 0; i < PL_CAUSAL_TEST_PROXY_W * PL_CAUSAL_TEST_PROXY_H; i++)
++        REQUIRE(isfinite(proxy[i]) && proxy[i] >= 0.0f && proxy[i] <= 1.0f);
++    for (int i = 0; i < PL_CAUSAL_TEST_HIST_BINS; i++)
++        hist_sum += causal_desc.histogram[i];
++    REQUIRE(fabsf(hist_sum - 1.0f) < 2e-5f);
++    free(proxy);
++
++    // A real HDR peak transaction shares its SSBO/readback with causal
++    // descriptors. Compare independent clean renderers first: enabling the
++    // diagnostic must not alter pixels even while peak detection is active.
++    pl_renderer rr_peak_ref = pl_renderer_create(gpu->log, gpu);
++    pl_renderer rr_peak = pl_renderer_create(gpu->log, gpu);
++    REQUIRE(rr_peak_ref && rr_peak);
++    struct pl_peak_detect_params peak = pl_peak_detect_default_params;
++    peak.force = true;
++    peak.allow_delayed = false;
++    struct pl_render_params hp = pl_render_default_params;
++    hp.peak_detect_params = &peak;
++    struct pl_frame hdr_image = image;
++    hdr_image.color.transfer = PL_COLOR_TRC_PQ;
++    hdr_image.color.hdr.max_luma = 10000.0f;
++    hdr_image.causal_scene_tag = 10;
++    struct pl_frame sdr_target = target;
++    sdr_target.color.transfer = PL_COLOR_TRC_SRGB;
++    sdr_target.color.hdr.max_luma = 80.0f;
++    sdr_target.planes[0].texture = dt_peak;
++    REQUIRE(pl_render_image(rr_peak_ref, &hdr_image, &sdr_target, &hp));
++    float peak_ref[W * H * 4 * 4], peak_out[W * H * 4 * 4];
++    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex=dt_peak,.ptr=peak_ref)));
++    hp.causal_scene_detection = true;
++    sdr_target.planes[0].texture = dt_peak;
++    REQUIRE(pl_render_image(rr_peak, &hdr_image, &sdr_target, &hp));
++    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex=dt_peak,.ptr=peak_out)));
++    REQUIRE_MEMEQ(peak_ref, peak_out, sizeof(peak_ref));
++    struct pl_peak_detect_metrics peak_metrics;
++    REQUIRE(pl_renderer_get_peak_detect_metrics(rr_peak, &peak_metrics));
++    proxy = malloc(PL_CAUSAL_TEST_PROXY_W * PL_CAUSAL_TEST_PROXY_H * sizeof(*proxy));
++    REQUIRE(proxy && pl_renderer_get_causal_test_data(rr_peak, proxy,
++            PL_CAUSAL_TEST_PROXY_W * PL_CAUSAL_TEST_PROXY_H, &causal_desc));
++    REQUIRE(causal_desc.borrowed_peak_transaction && causal_desc.readback_count == 1);
++    // Cost is one shared descriptor-extended transaction: no second buffer
++    // or synchronization is allocated in the peak-active path.
++    REQUIRE(causal_desc.transaction_bytes >= sizeof(struct pl_causal_test_descriptors));
++    free(proxy);
++    struct pl_causal_scene_diagnostics shared_diag;
++    REQUIRE(pl_renderer_get_causal_scene_diagnostics(rr_peak, &shared_diag));
++    REQUIRE(shared_diag.consumed_tag == 10 && shared_diag.readback_latency_frames >= 0);
++    pl_renderer_destroy(&rr_peak_ref);
++    pl_renderer_destroy(&rr_peak);
++
++    // Delayed mode has backend-dependent completion latency. Poll the live
++    // owner first (never the sink) across a bounded tagged sequence, then
++    // verify that its single consume reached the borrowed causal sink.
++    pl_renderer rr_delayed = pl_renderer_create(gpu->log, gpu);
++    REQUIRE(rr_delayed);
++    peak.allow_delayed = true;
++    bool delivered = false;
++    for (uint64_t tag = 20; tag < 40 && !delivered; tag++) {
++        hdr_image.causal_scene_tag = tag;
++        REQUIRE(pl_render_image(rr_delayed, &hdr_image, &sdr_target, &hp));
++        struct pl_peak_detect_metrics delayed_peak;
++        pl_renderer_get_peak_detect_metrics(rr_delayed, &delayed_peak);
++        proxy = malloc(PL_CAUSAL_TEST_PROXY_W * PL_CAUSAL_TEST_PROXY_H * sizeof(*proxy));
++        REQUIRE(proxy);
++        delivered = pl_renderer_get_causal_test_data(rr_delayed, proxy,
++            PL_CAUSAL_TEST_PROXY_W * PL_CAUSAL_TEST_PROXY_H, &causal_desc);
++        free(proxy);
++    }
++    REQUIRE(delivered && causal_desc.borrowed_peak_transaction &&
++            causal_desc.readback_count == 1);
++    REQUIRE(pl_renderer_get_causal_scene_diagnostics(rr_delayed, &shared_diag));
++    REQUIRE(shared_diag.submitted_tag >= shared_diag.consumed_tag &&
++            shared_diag.readback_latency_frames >= 0 && !shared_diag.acceleration_applied);
++    pl_renderer_destroy(&rr_delayed);
++
++
++
++    // Interlaced input is explicitly unsupported by Stage 1. Validate the
++    // fail-closed diagnostic state rather than byte equality.
++    image.field = PL_FIELD_TOP;
++    image.first_field = PL_FIELD_TOP;
++    image.causal_scene_tag++;
++    REQUIRE(pl_render_image(rr, &image, &target, &p));
++    struct pl_causal_scene_diagnostics d;
++    REQUIRE(pl_renderer_get_causal_scene_diagnostics(rr, &d));
++    REQUIRE(d.withheld_reason == PL_CAUSAL_SCENE_WITHHELD_UNSUPPORTED);
++    pl_renderer_destroy(&rr_ref);
++    pl_renderer_destroy(&rr);
++done:
++    pl_tex_destroy(gpu, &st); pl_tex_destroy(gpu, &dt); pl_tex_destroy(gpu, &dt_causal); pl_tex_destroy(gpu, &dt_peak);
++}
++
++// Frozen native_cie_y_v1 GPU fixture subset. Inputs are libplacebo internal
++// linear units (1.0 == PL_COLOR_SDR_WHITE nits), not physical 0..10000 nits.
++static void pl_causal_native_cie_y_fixture_test(pl_gpu gpu)
++{
++    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 32, 0,
++                             PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_RENDERABLE);
++    if (!fmt || !gpu->limits.compute_queues || !gpu->limits.max_ssbo_size)
++        return;
++    const float scale = 10000.0f / PL_COLOR_SDR_WHITE;
++    float src[2 * 2 * 4] = {
++        0, 0, 0, 1,       scale, 0, 0, 1,
++        0, scale, 0, 1,   0, 0, scale, 1,
++    };
++    float out[2 * 2 * 4], proxy[PL_CAUSAL_TEST_PROXY_W * PL_CAUSAL_TEST_PROXY_H];
++    pl_tex st = pl_tex_create(gpu, pl_tex_params(.w=2, .h=2, .format=fmt,
++        .sampleable=true, .initial_data=src));
++    pl_tex dt = pl_tex_create(gpu, pl_tex_params(.w=2, .h=2, .format=fmt,
++        .renderable=true, .host_readable=true));
++    if (!st || !dt) goto done;
++    pl_renderer rr = pl_renderer_create(gpu->log, gpu);
++    REQUIRE(rr);
++    struct pl_frame image = { .num_planes=1, .planes={{.texture=st,
++        .components=3, .component_mapping={0,1,2}}},
++        .repr={.sys=PL_COLOR_SYSTEM_RGB,.levels=PL_COLOR_LEVELS_FULL},
++        .color={.primaries=PL_COLOR_PRIM_BT_2020,.transfer=PL_COLOR_TRC_LINEAR},
++        .causal_scene_tag=1 };
++    struct pl_frame target = { .num_planes=1, .planes={{.texture=dt,
++        .components=4,.component_mapping={0,1,2,3}}}, .repr=image.repr,
++        .color=image.color };
++    struct pl_render_params p = pl_render_default_params;
++    p.causal_scene_detection = true;
++    REQUIRE(pl_render_image(rr, &image, &target, &p));
++    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex=dt,.ptr=out)));
++    struct pl_causal_test_descriptors d;
++    REQUIRE(pl_renderer_get_causal_test_data(rr, proxy, PL_ARRAY_SIZE(proxy), &d));
++    // Frozen fixture: BT.2020 R/G/B normalized ST2084 values.
++    REQUIRE(fabsf(proxy[0] - 7.309559e-7f) < 2e-5f);
++    REQUIRE(fabsf(proxy[PL_CAUSAL_TEST_PROXY_W - 1] - 0.85708486f) < 2e-5f);
++    REQUIRE(fabsf(proxy[(PL_CAUSAL_TEST_PROXY_H - 1) * PL_CAUSAL_TEST_PROXY_W] - 0.95902807f) < 2e-5f);
++    REQUIRE(fabsf(proxy[PL_CAUSAL_TEST_PROXY_H * PL_CAUSAL_TEST_PROXY_W - 1] - 0.69502327f) < 2e-5f);
++    // The fixed reducer must expose exactly one normalized histogram.
++    float sum = 0.0f;
++    for (int i = 0; i < PL_CAUSAL_TEST_HIST_BINS; i++) sum += d.histogram[i];
++    REQUIRE(fabsf(sum - 1.0f) < 2e-5f);
++    pl_renderer_destroy(&rr);
++done:
++    pl_tex_destroy(gpu, &st); pl_tex_destroy(gpu, &dt);
++}
++
++static float causal_pq_to_internal(float pq)
++{
++    const float x = powf(PL_CLAMP(pq, 0.0f, 1.0f), 1.0f / 78.84375f);
++    const float n = powf(PL_MAX(x - 0.8359375f, 0.0f) /
++                         (18.8515625f - 18.6875f * x), 1.0f / 0.1593017578125f);
++    return n * 10000.0f / PL_COLOR_SDR_WHITE;
++}
++
++// Render a full native-v1 proxy directly.  Each fixture is intentionally a
++// fresh renderer: tags begin at one and there is no hidden prior history.
++static bool causal_fixture_render(pl_gpu gpu, const float *gray,
++                                  uint64_t tag, pl_renderer *out_rr,
++                                  struct pl_causal_test_descriptors *out)
++{
++    enum { W = PL_CAUSAL_TEST_PROXY_W, H = PL_CAUSAL_TEST_PROXY_H };
++    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 32, 0,
++                             PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_RENDERABLE);
++    if (!fmt) return false;
++    float *src = malloc(W * H * 4 * sizeof(*src));
++    float *proxy = malloc(W * H * sizeof(*proxy));
++    if (!src || !proxy) { free(src); free(proxy); return false; }
++    for (int i = 0; i < W * H; i++)
++        src[4*i+0] = src[4*i+1] = src[4*i+2] = gray[i], src[4*i+3] = 1.0f;
++    pl_tex st = pl_tex_create(gpu, pl_tex_params(.w=W,.h=H,.format=fmt,
++        .sampleable=true,.initial_data=src));
++    pl_tex dt = pl_tex_create(gpu, pl_tex_params(.w=W,.h=H,.format=fmt,
++        .renderable=true));
++    pl_renderer rr = pl_renderer_create(gpu->log, gpu);
++    struct pl_frame image = { .num_planes=1, .planes={{.texture=st,
++        .components=3,.component_mapping={0,1,2}}},
++        .repr={.sys=PL_COLOR_SYSTEM_RGB,.levels=PL_COLOR_LEVELS_FULL},
++        .color={.primaries=PL_COLOR_PRIM_BT_2020,.transfer=PL_COLOR_TRC_LINEAR},
++        .causal_scene_tag=tag };
++    struct pl_frame target = { .num_planes=1, .planes={{.texture=dt,
++        .components=4,.component_mapping={0,1,2,3}}}, .repr=image.repr,.color=image.color };
++    struct pl_render_params p = pl_render_default_params;
++    p.causal_scene_detection = true;
++    bool ok = st && dt && rr && pl_render_image(rr, &image, &target, &p) &&
++        pl_renderer_get_causal_test_data(rr, proxy, W * H, out);
++    free(src); free(proxy);
++    if (ok && out_rr) {
++        *out_rr = rr;
++    } else {
++        pl_renderer_destroy(&rr);
++    }
++    pl_tex_destroy(gpu,&st); pl_tex_destroy(gpu,&dt);
++    return ok;
++}
++
++// Sequential native-v1 state gate: black -> white triggers once and, when the
++// experimental acceleration is enabled, snaps both the standard and private
++// Perceptual detector histories to the current frame. The next black boundary
++// is observed but suppressed by the documented two-tag cooldown.
++static void pl_causal_temporal_fixture_test(pl_gpu gpu)
++{
++    enum { W = PL_CAUSAL_TEST_PROXY_W, H = PL_CAUSAL_TEST_PROXY_H };
++    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 32, 0,
++                             PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_RENDERABLE);
++    if (!fmt || !gpu->limits.compute_queues || !gpu->limits.max_ssbo_size)
++        return;
++    float *src = calloc((size_t) W * H * 4, sizeof(*src));
++    if (!src) return;
++    pl_tex st = pl_tex_create(gpu, pl_tex_params(.w=W,.h=H,.format=fmt,
++        .sampleable=true,.host_writable=true));
++    pl_tex dt = pl_tex_create(gpu, pl_tex_params(.w=W,.h=H,.format=fmt,
++        .renderable=true));
++    pl_renderer rr = pl_renderer_create(gpu->log, gpu);
++    if (!st || !dt || !rr) goto done;
++    struct pl_frame image = { .num_planes=1, .planes={{.texture=st,
++        .components=3,.component_mapping={0,1,2}}},
++        .repr={.sys=PL_COLOR_SYSTEM_RGB,.levels=PL_COLOR_LEVELS_FULL},
++        .color={.primaries=PL_COLOR_PRIM_BT_2020,.transfer=PL_COLOR_TRC_LINEAR},
++    };
++    image.color.hdr.max_luma = 10000.0f;
++    struct pl_frame target = { .num_planes=1, .planes={{.texture=dt,
++        .components=4,.component_mapping={0,1,2,3}}},.repr=image.repr,.color=image.color};
++    target.color.transfer = PL_COLOR_TRC_SRGB;
++    target.color.hdr.max_luma = 80.0f;
++    struct pl_peak_detect_params peak = pl_peak_detect_default_params;
++    peak.force = true;
++    peak.allow_delayed = false;
++    peak.metric = PL_TONE_MAP_METRIC_BT2020_ITP;
++    struct pl_render_params p = pl_render_default_params;
++    p.peak_detect_params = &peak;
++    p.causal_scene_detection = true;
++    p.causal_scene_acceleration = true;
++    for (uint64_t tag=1; tag<=7; tag++) {
++        const float v = tag == 2 ? 10000.0f / PL_COLOR_SDR_WHITE : 0.0f;
++        for (int i=0;i<W*H;i++) src[4*i]=src[4*i+1]=src[4*i+2]=v,src[4*i+3]=1.0f;
++        // A 20%-wide white stripe is deliberately below the immediate
++        // score/residual gate. Its unchanged following frame confirms the
++        // original candidate with one frame of latency.
++        if (tag == 6 || tag == 7) {
++            for (int y=0; y<H; y++) for (int x=0; x<64; x++)
++                src[4*(y*W+x)]=src[4*(y*W+x)+1]=src[4*(y*W+x)+2]=
++                    10000.0f / PL_COLOR_SDR_WHITE;
++        }
++        REQUIRE(pl_tex_upload(gpu, pl_tex_transfer_params(.tex=st,.ptr=src)));
++        image.causal_scene_tag=tag;
++        REQUIRE(pl_render_image(rr,&image,&target,&p));
++        struct pl_causal_scene_diagnostics d;
++        REQUIRE(pl_renderer_get_causal_scene_diagnostics(rr,&d));
++        REQUIRE(d.consumed_tag == tag && d.readback_latency_frames == 0);
++        if (tag == 2) {
++            REQUIRE(d.visual_trigger && d.cut_score > .99f && d.global_motion_residual > .99f);
++            REQUIRE(d.acceleration_applied);
++            struct pl_peak_detect_metrics m;
++            REQUIRE(pl_renderer_get_peak_detect_metrics(rr, &m));
++            REQUIRE(fabsf(m.raw_max_pq_y - m.smoothed_max_pq_y) < 2e-5f);
++            REQUIRE(fabsf(m.raw_avg_pq_y - m.smoothed_avg_pq_y) < 2e-5f);
++            REQUIRE(fabsf(m.raw_max_metric - m.smoothed_max_metric) < 2e-5f);
++            REQUIRE(fabsf(m.raw_avg_metric - m.smoothed_avg_metric) < 2e-5f);
++        }
++        if (tag == 3) {
++            REQUIRE(!d.visual_trigger && !d.acceleration_applied);
++            REQUIRE(d.last_trigger_tag == 2 && d.visual_trigger_count == 1);
++        }
++        if (tag == 6) {
++            REQUIRE(!d.visual_trigger && !d.acceleration_applied);
++            REQUIRE(d.cut_score >= .10f && d.cut_score < .16f);
++        }
++        if (tag == 7) {
++            REQUIRE(d.visual_trigger && d.acceleration_applied);
++            REQUIRE(d.last_trigger_tag == 6 && d.visual_trigger_count == 2);
++        }
++    }
++done:
++    pl_renderer_destroy(&rr); pl_tex_destroy(gpu,&st); pl_tex_destroy(gpu,&dt); free(src);
++}
++
++// A one-tile horizontal descriptor translation must be explained by the
++// +/-1 search, while the independently sampled grid retains zero residual.
++static void pl_causal_translation_fixture_test(pl_gpu gpu)
++{
++    enum { W=PL_CAUSAL_TEST_PROXY_W, H=PL_CAUSAL_TEST_PROXY_H };
++    float *a=calloc((size_t)W*H,sizeof(*a)), *b=calloc((size_t)W*H,sizeof(*b));
++    if (!a || !b) { free(a); free(b); return; }
++    for (int y=0;y<H;y++) for(int x=0;x<W;x++) {
++        a[y*W+x]=causal_pq_to_internal((float)(x/20)/16.0f);
++        b[y*W+x]=causal_pq_to_internal((float)PL_MIN((x/20)+1,15)/16.0f);
++    }
++    struct pl_causal_test_descriptors da,db;
++    REQUIRE(causal_fixture_render(gpu,a,1,NULL,&da));
++    REQUIRE(causal_fixture_render(gpu,b,2,NULL,&db));
++    float best=INFINITY;
++    for(int dy=-1;dy<=1;dy++) for(int dx=-1;dx<=1;dx++) {
++        float sum=0; int n=0;
++        for(int y=0;y<9;y++) for(int x=0;x<16;x++) {
++            int px=x+dx, py=y+dy;
++            if(px>=0&&px<16&&py>=0&&py<9) {
++                sum += fabsf(db.tiles[y*16+x]-da.tiles[py*16+px]); n++;
++            }
++        }
++        best=PL_MIN(best,sum/n);
++    }
++    REQUIRE(best < 2e-5f);
++    free(a); free(b);
++}
++
++static void pl_causal_descriptor_fixture_test(pl_gpu gpu)
++{
++    enum { W=PL_CAUSAL_TEST_PROXY_W, H=PL_CAUSAL_TEST_PROXY_H };
++    float *gray = malloc(W * H * sizeof(*gray));
++    if (!gray) return;
++    struct pl_causal_test_descriptors d;
++    // 100-nit neutral produces PQ 0.5080784; equal RGB must stay neutral.
++    for (int i=0;i<W*H;i++) gray[i]=100.0f/PL_COLOR_SDR_WHITE;
++    REQUIRE(causal_fixture_render(gpu,gray,1,NULL,&d));
++    REQUIRE(d.readback_count == 1 && !d.borrowed_peak_transaction);
++    REQUIRE(d.transaction_bytes > 0);
++    for (int i=0;i<PL_CAUSAL_TEST_HIST_BINS;i++)
++        REQUIRE(fabsf(d.histogram[i] - (i == 32 ? 1.0f : 0.0f)) < 2e-5f);
++    // Five equal-width PQ stripes exercise uniform bin edges including code 1.
++    const float codes[5]={0.0f,1.0f/64.0f,0.5f,63.0f/64.0f,1.0f};
++    for(int y=0;y<H;y++)for(int x=0;x<W;x++) gray[y*W+x]=causal_pq_to_internal(codes[x/64]);
++    REQUIRE(causal_fixture_render(gpu,gray,1,NULL,&d));
++    REQUIRE(fabsf(d.histogram[0]-.2f)<2e-5f && fabsf(d.histogram[1]-.2f)<2e-5f);
++    REQUIRE(fabsf(d.histogram[32]-.2f)<2e-5f && fabsf(d.histogram[63]-.4f)<2e-5f);
++    // Exact 16x9 row-major 20x20 tile layout.
++    for(int y=0;y<H;y++)for(int x=0;x<W;x++) gray[y*W+x]=causal_pq_to_internal(((y/20)*16+x/20+1)/145.0f);
++    REQUIRE(causal_fixture_render(gpu,gray,1,NULL,&d));
++    REQUIRE(fabsf(d.tiles[0]-1.0f/145.0f)<2e-5f);
++    REQUIRE(fabsf(d.tiles[15]-16.0f/145.0f)<2e-5f);
++    REQUIRE(fabsf(d.tiles[16]-17.0f/145.0f)<2e-5f);
++    REQUIRE(fabsf(d.tiles[72]-73.0f/145.0f)<2e-5f);
++    REQUIRE(fabsf(d.tiles[143]-144.0f/145.0f)<2e-5f);
++    // The 48x27 grid uses its own pixel-centre bilinear sample positions.
++    // This fixture is a *linear* 0..1 (relative 10,000 nits) x-ramp. The
++    // native path applies PQ only after its first 320x180 proxy stage.
++    for(int y=0;y<H;y++)for(int x=0;x<W;x++)
++        gray[y*W+x]=(float)x/(W-1) * (10000.0f / PL_COLOR_SDR_WHITE);
++    REQUIRE(causal_fixture_render(gpu,gray,1,NULL,&d));
++    REQUIRE(fabsf(d.grid[0]-.49527415f)<2e-5f && fabsf(d.grid[47]-.99906597f)<2e-5f);
++    REQUIRE(fabsf(d.grid[13*48+24]-.92876160f)<2e-5f);
++    free(gray);
++}
++
+ void gpu_shader_tests(pl_gpu gpu)
+ {
+     pl_buffer_tests(gpu);
+@@ -1979,6 +2388,11 @@ void gpu_shader_tests(pl_gpu gpu)
+     pl_render_tests(gpu);
+     pl_render_bits_tests(gpu);
+     pl_ycbcr_tests(gpu);
++    pl_causal_output_invariance_test(gpu);
++    pl_causal_native_cie_y_fixture_test(gpu);
++    pl_causal_descriptor_fixture_test(gpu);
++    pl_causal_temporal_fixture_test(gpu);
++    pl_causal_translation_fixture_test(gpu);
+ 
+     REQUIRE(!pl_gpu_is_failed(gpu));
+ }
+-- 
+2.54.0.windows.1

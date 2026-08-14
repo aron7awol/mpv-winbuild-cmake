@@ -1,0 +1,552 @@
+From 12effd59098606048417b55e010fe4d83028ee65 Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Thu, 13 Aug 2026 14:59:33 -0400
+Subject: [PATCH] gpu-next: add causal scene detection and acceleration
+
+---
+ DOCS/man/input.rst                  |  10 +++
+ DOCS/man/options.rst                |  13 +++
+ TOOLS/causal_scene_validate.md      |  24 ++++++
+ TOOLS/causal_scene_validate.py      | 123 ++++++++++++++++++++++++++++
+ TOOLS/test_causal_scene_validate.py |  55 +++++++++++++
+ player/command.c                    |  58 +++++++++++++
+ video/mp_image.h                    |  22 +++++
+ video/out/vo_gpu_next.c             |  78 ++++++++++++++++++
+ 8 files changed, 383 insertions(+)
+ create mode 100644 TOOLS/causal_scene_validate.md
+ create mode 100644 TOOLS/causal_scene_validate.py
+ create mode 100644 TOOLS/test_causal_scene_validate.py
+
+diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
+index e71e2c0d8..4c43efde0 100644
+--- a/DOCS/man/input.rst
++++ b/DOCS/man/input.rst
+@@ -2932,6 +2932,16 @@ Property list
+         black pixels. It is independent of ``--hdr-peak-percentile`` and is
+         not static MaxFALL metadata.
+ 
++    ``video-params/causal-scene-*``
++        Diagnostic-only causal scene trace: effective delayed-readback mode,
++        submitted and consumed source-frame tags, latency, descriptor
++        validity/withheld reason, histogram TV, tile MAD, translated-motion
++        fraction, residual, score, trigger/count, authored-boundary tag/source,
++        active tone-metric branch, and acceleration-applied state. These fields
++        are available only with ``--hdr-causal-scene-diagnostics=yes``. They do
++        not change tone mapping; ``acceleration-applied`` is always ``no`` in
++        this diagnostics stage.
++
+     ``video-params/raw-max-tone-metric-nits``, ``video-params/raw-avg-tone-metric-nits``
+         Unsmoothed percentile peak and PQ-domain frame average for the selected
+         non-standard ``--tone-mapping-metric``, expressed in cd/mÂ². Unavailable
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index 7e8701006..fcca228eb 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -7861,6 +7861,19 @@ them.
+     measurement even when delayed peak detection is enabled. Defaults to yes.
+     (Only for ``--vo=gpu-next``)
+ 
++``--hdr-causal-scene-diagnostics=<yes|no>``
++    Enable hidden, diagnostics-only causal scene descriptor instrumentation.
++    It analyzes consecutive tagged source frames before RGB hooks and exposes
++    a native trace through ``video-out-params`` and verbose logs. It does not
++    change HDR peak smoothing, tone mapping, or rendered output. This
++    session-only option defaults to no. (Only for ``--vo=gpu-next``)
++
++``--hdr-causal-scene-acceleration=<yes|no>``
++    Experimental, session-only visual scene acceleration. When enabled, a
++    causal visual trigger fully accelerates the current peak and average
++    smoothing update. Authored Dolby Vision/HDR10+ resets retain priority.
++    Defaults to no. (Only for ``--vo=gpu-next``)
++
+ ``--hdr-peak-percentile=<0.0..100.0>``
+     Which percentile of the input image brightness histogram to consider as the
+     true peak of the scene. If this is set to 100 (default), the
+diff --git a/TOOLS/causal_scene_validate.md b/TOOLS/causal_scene_validate.md
+new file mode 100644
+index 000000000..68fefc7ae
+--- /dev/null
++++ b/TOOLS/causal_scene_validate.md
+@@ -0,0 +1,24 @@
++# Causal Stage 1 trace validation
++
++Collect two JSONL property traces through mpv IPC: one with
++`--hdr-causal-scene-diagnostics=yes` and one without that session-only option.
++Each enabled record must contain the `video-out-params/causal-scene-*` values.
++Insert `{"event":"discontinuity"}` immediately after each seek, flush, track
++switch, renderer reset, or deliberately dropped association. The next sample
++must be withheld, never compared to its predecessor.
++``unsupported`` is a valid withheld reason when the renderer cannot provide
++the frozen proxy/descriptor path (for example an unsupported backend or source
++representation); it is not a visual trigger.
++
++For a rendered-output invariance check, produce deterministic frame-hash
++manifests from equivalent diagnostic-off/on runs and pass both files:
++
++```text
++python TOOLS/causal_scene_validate.py --enabled-trace on.jsonl --disabled-trace off.jsonl --output-off off.sha256 --output-on on.sha256
++```
++
++The harness checks exact tag ordering and latency (`submitted - consumed`),
++discontinuity withholding, option-off unavailability, complete property shape,
++and the Stage 1 prohibition on acceleration. It intentionally does not judge
++native descriptor values or cut quality; that belongs to the frozen CPU
++reference/corpus replay gate.
+diff --git a/TOOLS/causal_scene_validate.py b/TOOLS/causal_scene_validate.py
+new file mode 100644
+index 000000000..6351b74cd
+--- /dev/null
++++ b/TOOLS/causal_scene_validate.py
+@@ -0,0 +1,123 @@
++#!/usr/bin/env python3
++"""Validate Stage 1 causal-scene diagnostic traces without judging picture quality.
++
++Input is JSON Lines produced by an IPC/log collector.  Each record is a flat
++mapping of the native `video-out-params/causal-scene-*` suffixes (or the full
++property names) plus an optional `event` field.  `event=discontinuity` marks a
++seek, flush, track switch, renderer reset, or dropped association.  The first
++following descriptor must be withheld rather than compared across that boundary.
++"""
++import argparse
++import hashlib
++import json
++import sys
++from pathlib import Path
++
++PREFIX = "video-out-params/causal-scene-"
++REQUIRED = (
++    "effective-allow-delayed", "submitted-tag", "consumed-tag",
++    "latency-frames", "descriptor-valid", "withheld-reason", "histogram-tv",
++    "tile-mad", "shifted-tile-mad", "translated-motion-fraction",
++    "global-motion-residual", "score", "visual-trigger", "last-tag",
++    "authored-boundary-tag", "authored-boundary-source",
++    "active-metric-branch", "acceleration-applied",
++)
++WITHHELD_REASONS = {"none", "disabled", "no-tag", "pending", "discontinuity", "unsupported"}
++
++
++def key(row, name):
++    return row.get(name, row.get(PREFIX + name))
++
++
++def rows(path):
++    for line_no, line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
++        if line.strip():
++            try:
++                yield line_no, json.loads(line)
++            except json.JSONDecodeError as exc:
++                raise ValueError(f"{path}:{line_no}: invalid JSON: {exc}") from exc
++
++
++def check_trace(path, expect_enabled):
++    errors, last_submitted, last_consumed = [], None, None
++    must_withhold = False
++    saw = False
++    for line_no, row in rows(path):
++        if row.get("event") == "discontinuity":
++            must_withhold = True
++            last_submitted = last_consumed = None
++            continue
++        values = {name: key(row, name) for name in REQUIRED}
++        present = any(value is not None for value in values.values())
++        if not expect_enabled:
++            if present:
++                errors.append(f"{line_no}: diagnostics present while option is off")
++            continue
++        if not present:
++            errors.append(f"{line_no}: diagnostics absent while option is on")
++            continue
++        saw = True
++        missing = [name for name, value in values.items() if value is None]
++        if missing:
++            errors.append(f"{line_no}: missing fields: {', '.join(missing)}")
++            continue
++        if values["acceleration-applied"] is not False:
++            errors.append(f"{line_no}: Stage 1 must never apply acceleration")
++        valid = values["descriptor-valid"] is True
++        withheld = values["withheld-reason"]
++        if withheld not in WITHHELD_REASONS:
++            errors.append(f"{line_no}: unknown withheld reason {withheld!r}")
++        if valid and withheld != "none":
++            errors.append(f"{line_no}: valid descriptor has withheld reason {withheld!r}")
++        if not valid and withheld == "none":
++            errors.append(f"{line_no}: invalid descriptor was not withheld")
++        if must_withhold:
++            if valid or withheld not in {"discontinuity", "pending", "no-tag", "unsupported"}:
++                errors.append(f"{line_no}: discontinuity was compared instead of withheld")
++            must_withhold = False
++        submitted, consumed = values["submitted-tag"], values["consumed-tag"]
++        if not isinstance(submitted, int) or not isinstance(consumed, int):
++            errors.append(f"{line_no}: frame tags must be integers")
++            continue
++        if submitted and consumed and submitted < consumed:
++            errors.append(f"{line_no}: submitted tag precedes consumed tag")
++        latency = values["latency-frames"]
++        if submitted and consumed and latency != submitted - consumed:
++            errors.append(f"{line_no}: latency {latency} != submitted-consumed ({submitted-consumed})")
++        if last_submitted is not None and submitted and submitted < last_submitted:
++            errors.append(f"{line_no}: submitted tag regressed without discontinuity")
++        if last_consumed is not None and consumed and consumed < last_consumed:
++            errors.append(f"{line_no}: consumed tag regressed without discontinuity")
++        last_submitted = max(last_submitted or 0, submitted)
++        last_consumed = max(last_consumed or 0, consumed)
++    if expect_enabled and not saw:
++        errors.append("trace contains no enabled diagnostic samples")
++    return errors
++
++
++def digest(path):
++    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--enabled-trace", type=Path, required=True)
++    parser.add_argument("--disabled-trace", type=Path, required=True)
++    parser.add_argument("--output-off", type=Path, help="rendered output/hash manifest with diagnostics off")
++    parser.add_argument("--output-on", type=Path, help="same rendered output/hash manifest with diagnostics on")
++    args = parser.parse_args()
++    errors = check_trace(args.enabled_trace, True) + check_trace(args.disabled_trace, False)
++    if bool(args.output_off) != bool(args.output_on):
++        errors.append("provide both output manifests to test rendered-output invariance")
++    if args.output_off and digest(args.output_off) != digest(args.output_on):
++        errors.append("diagnostics changed rendered-output manifest")
++    if errors:
++        print("FAIL")
++        print("\n".join(f"- {error}" for error in errors))
++        return 1
++    print("PASS: causal Stage 1 tags, withholding, option-off state, and output invariance")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/TOOLS/test_causal_scene_validate.py b/TOOLS/test_causal_scene_validate.py
+new file mode 100644
+index 000000000..b5385d539
+--- /dev/null
++++ b/TOOLS/test_causal_scene_validate.py
+@@ -0,0 +1,55 @@
++import importlib.util
++import json
++import tempfile
++import unittest
++from pathlib import Path
++
++SPEC = importlib.util.spec_from_file_location(
++    "causal_scene_validate", Path(__file__).with_name("causal_scene_validate.py"))
++MODULE = importlib.util.module_from_spec(SPEC)
++SPEC.loader.exec_module(MODULE)
++
++
++def sample(**overrides):
++    values = {
++        "effective-allow-delayed": False, "submitted-tag": 4,
++        "consumed-tag": 4, "latency-frames": 0, "descriptor-valid": True,
++        "withheld-reason": "none", "histogram-tv": 0.1, "tile-mad": 0.1,
++        "shifted-tile-mad": 0.05, "translated-motion-fraction": 0.5,
++        "global-motion-residual": 0.02, "score": 0.05,
++        "visual-trigger": False, "last-tag": 0, "authored-boundary-tag": 0,
++        "authored-boundary-source": "none", "active-metric-branch": "standard",
++        "acceleration-applied": False,
++    }
++    values.update(overrides)
++    return values
++
++
++class CausalTraceTest(unittest.TestCase):
++    def write(self, *records):
++        handle = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False)
++        for record in records:
++            handle.write(json.dumps(record) + "\n")
++        handle.close()
++        self.addCleanup(Path(handle.name).unlink)
++        return handle.name
++
++    def test_enabled_trace_and_discontinuity(self):
++        trace = self.write(sample(), {"event": "discontinuity"}, sample(
++            **{"submitted-tag": 1, "consumed-tag": 0, "latency-frames": 0,
++               "descriptor-valid": False, "withheld-reason": "discontinuity"}))
++        self.assertEqual(MODULE.check_trace(trace, True), [])
++
++    def test_option_off_rejects_properties(self):
++        self.assertTrue(MODULE.check_trace(self.write(sample()), False))
++
++    def test_stage_one_rejects_acceleration(self):
++        self.assertTrue(MODULE.check_trace(self.write(sample(**{"acceleration-applied": True})), True))
++
++    def test_unsupported_is_a_valid_withheld_state(self):
++        self.assertEqual(MODULE.check_trace(self.write(sample(**{
++            "descriptor-valid": False, "withheld-reason": "unsupported"})), True), [])
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/player/command.c b/player/command.c
+index 56bd0bf88..663180321 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -34,6 +34,7 @@
+ #include <libavutil/avstring.h>
+ #include <libavutil/common.h>
+ #include <libavutil/timecode.h>
++#include <libplacebo/renderer.h>
+ 
+ #include "mpv_talloc.h"
+ #include "client.h"
+@@ -2520,6 +2521,25 @@ static int property_imgparams(const struct mp_image_params *p, int action, void
+     bool has_crop = mp_rect_w(p->crop) > 0 && mp_rect_h(p->crop) > 0;
+     const char *aspect_name = get_aspect_ratio_name(d_w / (double)d_h);
+     const char *sar_name = get_aspect_ratio_name(p->w / (double)p->h);
++    const char *causal_withheld_reason = peak->causal_withheld_reason ==
++        PL_CAUSAL_SCENE_WITHHELD_NONE ? "none" :
++        peak->causal_withheld_reason == PL_CAUSAL_SCENE_WITHHELD_DISABLED ? "disabled" :
++        peak->causal_withheld_reason == PL_CAUSAL_SCENE_WITHHELD_NO_TAG ? "no-tag" :
++        peak->causal_withheld_reason == PL_CAUSAL_SCENE_WITHHELD_DISCONTINUITY ? "discontinuity" :
++        peak->causal_withheld_reason == PL_CAUSAL_SCENE_WITHHELD_PENDING ? "pending" :
++        peak->causal_withheld_reason == PL_CAUSAL_SCENE_WITHHELD_UNSUPPORTED ? "unsupported" :
++        "unknown";
++    const char *causal_authored_boundary_source = peak->causal_authored_boundary_source ==
++        MP_SCENE_CUT_DOVI ? "dv" : peak->causal_authored_boundary_source ==
++        MP_SCENE_CUT_HDR10PLUS ? "hdr10plus" : peak->causal_authored_boundary_source ==
++        (MP_SCENE_CUT_DOVI | MP_SCENE_CUT_HDR10PLUS) ? "dv+hdr10plus" : "none";
++    const char *causal_active_metric_branch = peak->causal_active_metric_branch ==
++        PL_TONE_MAP_METRIC_STANDARD ? "standard" :
++        peak->causal_active_metric_branch >= PL_TONE_MAP_METRIC_BT2020_ITP &&
++        peak->causal_active_metric_branch <= PL_TONE_MAP_METRIC_BT2020_RGB ?
++        "perceptual" : peak->causal_active_metric_branch >=
++        PL_TONE_MAP_METRIC_MAXRGB_ITP && peak->causal_active_metric_branch <=
++        PL_TONE_MAP_METRIC_MAXRGB_RGB ? "maxrgb" : "unknown";
+     const char *pixelformat_name = p->imgfmt_name ? p->imgfmt_name :
+                                                    mp_imgfmt_to_name(p->imgfmt);
+     struct m_sub_property props[] = {
+@@ -2590,6 +2610,44 @@ static int property_imgparams(const struct mp_image_params *p, int action, void
+                            (MP_SCENE_CUT_DOVI | MP_SCENE_CUT_HDR10PLUS)
+                          ? "dv+hdr10plus" : "none"),
+             .unavailable = !peak->valid},
++        {"causal-scene-effective-allow-delayed", SUB_PROP_BOOL(peak->causal_allow_delayed),
++                            .unavailable = !peak->causal_available},
++        {"causal-scene-submitted-tag", SUB_PROP_INT64(peak->causal_submitted_tag),
++                            .unavailable = !peak->causal_available},
++        {"causal-scene-consumed-tag", SUB_PROP_INT64(peak->causal_consumed_tag),
++                            .unavailable = !peak->causal_available},
++        {"causal-scene-latency-frames", SUB_PROP_INT(peak->causal_latency_frames),
++                            .unavailable = !peak->causal_available},
++        {"causal-scene-descriptor-valid", SUB_PROP_BOOL(peak->causal_valid),
++                            .unavailable = !peak->causal_available},
++        {"causal-scene-withheld-reason", SUB_PROP_STR(causal_withheld_reason),
++                            .unavailable = !peak->causal_available},
++        {"causal-scene-histogram-tv", SUB_PROP_FLOAT(peak->causal_histogram_tv),
++                            .unavailable = !peak->causal_available},
++        {"causal-scene-tile-mad", SUB_PROP_FLOAT(peak->causal_tile_mad),
++                            .unavailable = !peak->causal_available},
++        {"causal-scene-shifted-tile-mad", SUB_PROP_FLOAT(peak->causal_shifted_tile_mad),
++                            .unavailable = !peak->causal_available},
++        {"causal-scene-translated-motion-fraction", SUB_PROP_FLOAT(peak->causal_translated_motion_fraction),
++                            .unavailable = !peak->causal_available},
++        {"causal-scene-global-motion-residual", SUB_PROP_FLOAT(peak->causal_global_motion_residual),
++                            .unavailable = !peak->causal_available},
++        {"causal-scene-score", SUB_PROP_FLOAT(peak->causal_cut_score),
++                            .unavailable = !peak->causal_available},
++        {"causal-scene-visual-trigger", SUB_PROP_BOOL(peak->causal_visual_trigger),
++                            .unavailable = !peak->causal_available},
++        {"causal-scene-visual-trigger-count", SUB_PROP_INT64(peak->causal_trigger_count),
++                            .unavailable = !peak->causal_available},
++        {"causal-scene-last-tag", SUB_PROP_INT64(peak->causal_last_tag),
++                            .unavailable = !peak->causal_available},
++        {"causal-scene-authored-boundary-tag", SUB_PROP_INT64(peak->causal_authored_boundary_tag),
++                            .unavailable = !peak->causal_available},
++        {"causal-scene-authored-boundary-source", SUB_PROP_STR(causal_authored_boundary_source),
++                            .unavailable = !peak->causal_available},
++        {"causal-scene-active-metric-branch", SUB_PROP_STR(causal_active_metric_branch),
++                            .unavailable = !peak->causal_available},
++        {"causal-scene-acceleration-applied", SUB_PROP_BOOL(peak->causal_acceleration_applied),
++                            .unavailable = !peak->causal_valid},
+         {"raw-max-tone-metric-nits", SUB_PROP_FLOAT(peak->raw_max_tone_metric),
+                             .unavailable = !peak->tone_metric_valid},
+         {"raw-avg-tone-metric-nits", SUB_PROP_FLOAT(peak->raw_avg_tone_metric),
+diff --git a/video/mp_image.h b/video/mp_image.h
+index defe0e61a..409d6958e 100644
+--- a/video/mp_image.h
++++ b/video/mp_image.h
+@@ -73,6 +73,28 @@ struct mp_peak_detect_metrics {
+     float raw_avg_tone_metric;       // average private-metric value
+     float smoothed_max_tone_metric;  // curve input peak after smoothing
+     float smoothed_avg_tone_metric;  // curve input average after smoothing
++    // Causal scene descriptors are a diagnostics-only, source-frame trace.
++    // They deliberately do not participate in image-parameter equality.
++    bool causal_valid;
++    bool causal_available;
++    bool causal_allow_delayed;
++    bool causal_visual_trigger;
++    bool causal_acceleration_applied;
++    uint64_t causal_submitted_tag;
++    uint64_t causal_consumed_tag;
++    uint64_t causal_last_tag;
++    uint64_t causal_trigger_count;
++    uint64_t causal_authored_boundary_tag;
++    int causal_latency_frames;
++    int causal_withheld_reason;
++    int causal_authored_boundary_source;
++    int causal_active_metric_branch;
++    float causal_histogram_tv;
++    float causal_tile_mad;
++    float causal_shifted_tile_mad;
++    float causal_translated_motion_fraction;
++    float causal_global_motion_residual;
++    float causal_cut_score;
+ };
+ 
+ // Describes image parameters that usually stay constant.
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 3bd8b045b..4540ab712 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -145,6 +145,7 @@ struct priv {
+     bool flush_cache;
+     bool frame_pending;
+     bool paused;
++    uint64_t causal_scene_last_logged_tag;
+ 
+     uint64_t hdr10plus_stable_signature;
+     uint64_t hdr10plus_candidate_signature;
+@@ -184,6 +185,8 @@ static void update_lut(struct priv *p, struct user_lut *lut);
+ 
+ struct gl_next_opts {
+     bool delayed_peak;
++    bool causal_scene_diagnostics;
++    bool causal_scene_acceleration;
+     bool authored_scene_reset;
+     int sub_hdr_peak;
+     int image_subs_hdr_peak;
+@@ -217,6 +220,10 @@ const struct m_sub_options gl_next_conf = {
+         {"image-subs-hdr-peak", OPT_CHOICE(image_subs_hdr_peak, {"sdr", PL_COLOR_SDR_WHITE},
+             {"video", -1}, {"video-static", -2}, {"video-dynamic", -3}),  M_RANGE(10, 10000)},
+         {"allow-delayed-peak-detect", OPT_BOOL(delayed_peak)},
++        // Hidden Stage 1 instrumentation. This collects descriptors only and
++        // must never alter tone-map state or rendered output.
++        {"hdr-causal-scene-diagnostics", OPT_BOOL(causal_scene_diagnostics), M_OPT_NOCFG},
++        {"hdr-causal-scene-acceleration", OPT_BOOL(causal_scene_acceleration), M_OPT_NOCFG},
+         {"hdr-authored-scene-reset", OPT_BOOL(authored_scene_reset)},
+         {"border-background", OPT_CHOICE(border_background,
+             {"none",  BACKGROUND_NONE},
+@@ -248,6 +255,8 @@ const struct m_sub_options gl_next_conf = {
+         .target_hint = -1,
+         .target_hint_strict = true,
+         .authored_scene_reset = true,
++        .causal_scene_diagnostics = false,
++        .causal_scene_acceleration = false,
+     },
+     .size = sizeof(struct gl_next_opts),
+     .change_flags = UPDATE_VIDEO,
+@@ -492,6 +501,9 @@ struct frame_priv {
+     pl_tex el_tex[4];
+     struct pl_frame el_frame;
+     unsigned authored_scene_cut;
++    // Exact monotonic presentation identity from vo_frame::frame_id. It is
++    // deliberately not a PTS and is carried into libplacebo's readback tag.
++    uint64_t causal_scene_tag;
+ };
+ 
+ static void reset_authored_scene_state(struct priv *p)
+@@ -947,11 +959,15 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
+         },
+         .rotation = par.rotate / 90,
+         .user_data = mpi,
++        .causal_scene_tag = fp->causal_scene_tag,
+     };
+     fp->authored_scene_cut = detect_authored_scene_cut(p, &mpi->params);
+     frame->scene_cut = p->next_opts->authored_scene_reset &&
+                        fp->authored_scene_cut != MP_SCENE_CUT_NONE;
+     frame->scene_cut_tag = fp->authored_scene_cut;
++    // Keep the authored boundary's exact source separate from the opaque tag
++    // used by libplacebo's existing smoothing reset transaction.
++    frame->scene_cut_source = fp->authored_scene_cut;
+     if (frame->scene_cut) {
+         const char *source = fp->authored_scene_cut == MP_SCENE_CUT_DOVI
+             ? "Dolby Vision" : fp->authored_scene_cut == MP_SCENE_CUT_HDR10PLUS
+@@ -1385,6 +1401,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+         struct frame_priv *fp = talloc_zero(mpi, struct frame_priv);
+         mpi->priv = fp;
+         fp->vo = vo;
++        // Zero is reserved by libplacebo for an unavailable identity.
++        fp->causal_scene_tag = (uint64_t) id + 1;
+ 
+         pl_queue_push(p->queue, &(struct pl_source_frame) {
+             .pts = mpi->pts,
+@@ -1808,6 +1826,64 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+         } else {
+             vo->params->peak_detect = (struct mp_peak_detect_metrics) {0};
+         }
++
++        // This is intentionally independent of peak metrics: a withheld
++        // causal result is diagnostic evidence, not an unavailable property.
++        // The renderer reports it even when no source-frame comparison may be
++        // made (flush, duplicate, delayed readback, or disabled instrumentation).
++        struct pl_causal_scene_diagnostics causal;
++        if (pl_renderer_get_causal_scene_diagnostics(p->rr, &causal)) {
++            struct mp_peak_detect_metrics *out = &vo->params->peak_detect;
++            out->causal_available = true;
++            out->causal_valid = causal.descriptor_valid;
++            out->causal_allow_delayed = causal.effective_allow_delayed;
++            out->causal_visual_trigger = causal.visual_trigger;
++            out->causal_acceleration_applied = causal.acceleration_applied;
++            out->causal_submitted_tag = causal.submitted_tag;
++            out->causal_consumed_tag = causal.consumed_tag;
++            out->causal_last_tag = causal.last_trigger_tag;
++            out->causal_trigger_count = causal.visual_trigger_count;
++            out->causal_authored_boundary_tag = causal.authored_boundary_tag;
++            out->causal_latency_frames = causal.readback_latency_frames;
++            out->causal_withheld_reason = causal.withheld_reason;
++            out->causal_authored_boundary_source = causal.authored_boundary_source;
++            out->causal_active_metric_branch = causal.active_metric_branch;
++            out->causal_histogram_tv = causal.histogram_tv;
++            out->causal_tile_mad = causal.tile_mad;
++            out->causal_shifted_tile_mad = causal.shifted_tile_mad;
++            out->causal_translated_motion_fraction = causal.translated_motion_fraction;
++            out->causal_global_motion_residual = causal.global_motion_residual;
++            out->causal_cut_score = causal.cut_score;
++
++            if (causal.consumed_tag && causal.consumed_tag != p->causal_scene_last_logged_tag) {
++                MP_VERBOSE(vo, "Causal scene diagnostics: submitted=%"PRIu64
++                           " consumed=%"PRIu64" latency=%d valid=%d withheld=%d "
++                           "hist-tv=%f tile-mad=%f shifted-tile-mad=%f motion=%f "
++                           "residual=%f score=%f trigger=%d count=%"PRIu64
++                           " allow-delayed=%d acceleration-applied=%d\n",
++                           causal.submitted_tag, causal.consumed_tag,
++                           causal.readback_latency_frames, causal.descriptor_valid,
++                           causal.withheld_reason, causal.histogram_tv, causal.tile_mad,
++                           causal.shifted_tile_mad,
++                           causal.translated_motion_fraction,
++                           causal.global_motion_residual, causal.cut_score,
++                           causal.visual_trigger, causal.visual_trigger_count,
++                           causal.effective_allow_delayed,
++                           causal.acceleration_applied);
++                p->causal_scene_last_logged_tag = causal.consumed_tag;
++            }
++        } else if (p->next_opts->causal_scene_diagnostics ||
++                   p->next_opts->causal_scene_acceleration) {
++            // Some deliberately unsupported source layouts can bypass the
++            // renderer's analysis scheduling path entirely. Keep diagnostics
++            // fail-closed but observable instead of making the property vanish.
++            struct mp_peak_detect_metrics *out = &vo->params->peak_detect;
++            out->causal_available = true;
++            out->causal_valid = false;
++            out->causal_allow_delayed = p->next_opts->delayed_peak;
++            out->causal_submitted_tag = p->last_id + 1;
++            out->causal_withheld_reason = PL_CAUSAL_SCENE_WITHHELD_UNSUPPORTED;
++        }
+     }
+     mp_mutex_unlock(&vo->params_mutex);
+ 
+@@ -3017,6 +3093,8 @@ static void update_render_options(struct vo *vo)
+     pars->peak_detect_params.scene_threshold_high = opts->tone_map.scene_threshold_high;
+     pars->peak_detect_params.percentile = opts->tone_map.peak_percentile;
+     pars->peak_detect_params.allow_delayed = p->next_opts->delayed_peak;
++    pars->params.causal_scene_detection = p->next_opts->causal_scene_diagnostics;
++    pars->params.causal_scene_acceleration = p->next_opts->causal_scene_acceleration;
+     pars->peak_detect_params.force = opts->tone_map.compute_peak > 0;
+ 
+     const struct pl_tone_map_function * const tone_map_funs[] = {
+-- 
+2.54.0.windows.1

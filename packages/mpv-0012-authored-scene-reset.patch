@@ -10,8 +10,8 @@ Subject: [PATCH] vo_gpu_next: reset peak smoothing at authored scene cuts
  video/filter/vf_format.c     |  2 ++
  video/mp_image.c             | 18 ++++++++++
  video/mp_image.h             | 14 ++++++++
- video/out/vo_gpu_next.c      | 68 ++++++++++++++++++++++++++++++++++++
- 7 files changed, 123 insertions(+)
+ video/out/vo_gpu_next.c      | 75 ++++++++++++++++++++++++++++++++++++++++
+ 7 files changed, 130 insertions(+)
 
 diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
 index 54bff121d..87fba24f2 100644
@@ -172,13 +172,14 @@ diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
 index 700280ac2..bdcb454bd 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
-@@ -146,6 +146,10 @@ struct priv {
+@@ -146,6 +146,11 @@ struct priv {
      bool frame_pending;
      bool paused;
  
 +    uint64_t hdr10plus_stable_signature;
 +    uint64_t hdr10plus_candidate_signature;
 +    int hdr10plus_candidate_frames;
++    bool hdr10plus_candidate_covered_by_dovi;
 +
      pl_options pars;
      struct m_config_cache *opts_cache;
@@ -207,7 +208,7 @@ index 700280ac2..bdcb454bd 100644
      },
      .size = sizeof(struct gl_next_opts),
      .change_flags = UPDATE_VIDEO,
-@@ -484,8 +491,54 @@ struct frame_priv {
+@@ -484,8 +491,60 @@ struct frame_priv {
      struct ra_hwdec *el_hwdec;
      pl_tex el_tex[4];
      struct pl_frame el_frame;
@@ -219,6 +220,7 @@ index 700280ac2..bdcb454bd 100644
 +    p->hdr10plus_stable_signature = 0;
 +    p->hdr10plus_candidate_signature = 0;
 +    p->hdr10plus_candidate_frames = 0;
++    p->hdr10plus_candidate_covered_by_dovi = false;
 +}
 +
 +static unsigned detect_authored_scene_cut(struct priv *p,
@@ -240,20 +242,25 @@ index 700280ac2..bdcb454bd 100644
 +    if (sig == p->hdr10plus_stable_signature) {
 +        p->hdr10plus_candidate_signature = 0;
 +        p->hdr10plus_candidate_frames = 0;
++        p->hdr10plus_candidate_covered_by_dovi = false;
 +        return cut;
 +    }
 +
 +    if (sig != p->hdr10plus_candidate_signature) {
 +        p->hdr10plus_candidate_signature = sig;
 +        p->hdr10plus_candidate_frames = 1;
++        p->hdr10plus_candidate_covered_by_dovi =
++            (cut & MP_SCENE_CUT_DOVI) != 0;
 +        return cut;
 +    }
 +
 +    if (++p->hdr10plus_candidate_frames >= 2) {
-+        cut |= MP_SCENE_CUT_HDR10PLUS;
++        if (!p->hdr10plus_candidate_covered_by_dovi)
++            cut |= MP_SCENE_CUT_HDR10PLUS;
 +        p->hdr10plus_stable_signature = sig;
 +        p->hdr10plus_candidate_signature = 0;
 +        p->hdr10plus_candidate_frames = 0;
++        p->hdr10plus_candidate_covered_by_dovi = false;
 +    }
 +
 +    return cut;
@@ -262,7 +269,7 @@ index 700280ac2..bdcb454bd 100644
  static int plane_data_from_imgfmt(struct pl_plane_data out_data[4],
                                    struct pl_bit_encoding *out_bits,
                                    enum mp_imgfmt imgfmt, bool use_uint)
-@@ -895,6 +948,17 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
+@@ -895,6 +955,17 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
          .rotation = par.rotate / 90,
          .user_data = mpi,
      };
@@ -280,7 +287,7 @@ index 700280ac2..bdcb454bd 100644
  
      const struct gl_video_opts *opts = p->opts_cache->opts;
      float ref_luma;
-@@ -1287,6 +1351,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1287,6 +1358,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
              pl_queue_reset(p->queue);
              p->last_pts = 0.0;
              p->last_id = 0;
@@ -288,7 +295,7 @@ index 700280ac2..bdcb454bd 100644
              p->want_reset = false;
              p->flush_cache = true;
          }
-@@ -1701,6 +1766,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1701,6 +1773,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
              vo->params->peak_detect = (struct mp_peak_detect_metrics) {
                  .valid               = true,
                  .tone_metric_valid   = metrics.metric != PL_TONE_MAP_METRIC_STANDARD,
