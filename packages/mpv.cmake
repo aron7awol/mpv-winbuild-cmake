@@ -62,7 +62,9 @@ ExternalProject_Add(mpv
         -Dsixel=enabled
         ${mpv_gl}
         -Dc_args='-Wno-error=int-conversion'
-    BUILD_COMMAND ${EXEC} LTO_JOB=1 PDB=1 ninja -C <BINARY_DIR>
+    # ThinLTO's mpv.exe and libmpv-2.dll links are individually memory-heavy.
+    # Do not let Ninja run both final links concurrently on GitHub runners.
+    BUILD_COMMAND ${EXEC} LTO_JOB=1 PDB=1 ninja -j1 -C <BINARY_DIR>
     INSTALL_COMMAND ""
     LOG_DOWNLOAD 1 LOG_UPDATE 1 LOG_CONFIGURE 1 LOG_BUILD 1 LOG_INSTALL 1
 )
