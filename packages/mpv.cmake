@@ -77,9 +77,10 @@ ExternalProject_Add(mpv
         -Dc_args='-Wno-error=int-conversion'
         -Dc_link_args='-flto-jobs=1'
         -Dcpp_link_args='-flto-jobs=1'
-    # ThinLTO's mpv.exe and libmpv-2.dll links are individually memory-heavy.
-    # Serialize both the targets and each link's internal ThinLTO backends.
-    BUILD_COMMAND ${EXEC} LTO_JOB=1 PDB=1 ninja -j1 -C <BINARY_DIR>
+    # The packaged debug artifact only needs mpv.pdb. Link the much larger
+    # libmpv DLL without a PDB first, then generate the player PDB separately.
+    BUILD_COMMAND ${EXEC} LTO_JOB=1 ninja -j1 -C <BINARY_DIR> libmpv-2.dll
+    COMMAND ${EXEC} LTO_JOB=1 PDB=1 ninja -j1 -C <BINARY_DIR>
     INSTALL_COMMAND ""
     LOG_DOWNLOAD 1 LOG_UPDATE 1 LOG_CONFIGURE 1 LOG_BUILD 1 LOG_INSTALL 1
 )
