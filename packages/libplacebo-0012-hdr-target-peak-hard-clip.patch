@@ -1,0 +1,194 @@
+From f395a10d859033bbc420df92326cb6f84b60e225 Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Fri, 14 Aug 2026 16:19:23 -0400
+Subject: [PATCH] colorspace: hard-clip HDR tone maps to target peak
+
+---
+ src/include/libplacebo/shaders/colorspace.h |  5 ++
+ src/shaders/colorspace.c                    | 36 ++++++++-
+ src/tests/gpu_tests.c                       | 83 +++++++++++++++++++++
+ 3 files changed, 123 insertions(+), 1 deletion(-)
+
+diff --git a/src/include/libplacebo/shaders/colorspace.h b/src/include/libplacebo/shaders/colorspace.h
+index 7731b582..cae1cfec 100644
+--- a/src/include/libplacebo/shaders/colorspace.h
++++ b/src/include/libplacebo/shaders/colorspace.h
+@@ -378,6 +378,11 @@ struct pl_color_map_params {
+     // (normal ITP hull processing) to 1.0 (full adaptive formula).
+     float adaptive_chroma_strength;
+ 
++    // Clamp each destination-linear RGB channel to the inferred output peak
++    // before HDR transfer encoding. Intended for explicit HDR output targets;
++    // leave disabled for metadata passthrough.
++    bool hard_clip_hdr_target;
++
+     // Tone mapping LUT size. Defaults to 256.
+     int lut_size;
+ 
+diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
+index b93409af..63432b0a 100644
+--- a/src/shaders/colorspace.c
++++ b/src/shaders/colorspace.c
+@@ -2717,17 +2717,35 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+             return;
+     }
+ 
++    params = PL_DEF(params, &pl_color_map_default_params);
+     pl_color_space_infer_map(&src, &dst);
+     if (pl_color_space_equal(&src, &dst)) {
+ #ifdef PL_BLACK_LEVEL_DIAGNOSTICS
+         blkdiag_identity(sh, obj, &src, &dst);
+ #endif
++        if (params->hard_clip_hdr_target &&
++            pl_color_transfer_is_hdr(src.transfer) &&
++            pl_color_transfer_is_hdr(dst.transfer))
++        {
++            float output_max;
++            pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
++                .color    = &dst,
++                .metadata = PL_HDR_METADATA_HDR10,
++                .scaling  = PL_HDR_NORM,
++                .out_max  = &output_max,
++            ));
++            if (!args->prelinearized)
++                pl_shader_linearize(sh, &src);
++            GLSL("color.rgb = min(color.rgb, vec3("$")); \n",
++                 SH_FLOAT_DYN(output_max));
++            pl_shader_delinearize(sh, &dst);
++            return;
++        }
+         if (args->prelinearized)
+             pl_shader_delinearize(sh, &dst);
+         return;
+     }
+ 
+-    params = PL_DEF(params, &pl_color_map_default_params);
+     bool metric_active = false;
+     float metric_max = 0.0f, metric_avg = 0.0f;
+     if (args->state && obj &&
+@@ -3244,6 +3262,22 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+     }
+ 
+ done:
++    // An explicit HDR-to-HDR tone map promises a strict target signal peak.
++    // Gamut reconstruction can leave individual destination RGB channels
++    // above the scalar tone-curve endpoint, so apply the final ceiling in
++    // destination-linear light immediately before transfer encoding. This is
++    // deliberately gated on an explicit target request, leaving HDR
++    // passthrough and all SDR output paths unchanged.
++    if (params->hard_clip_hdr_target &&
++        pl_color_transfer_is_hdr(src.transfer) &&
++        pl_color_transfer_is_hdr(dst.transfer))
++    {
++        const float output_max = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NORM,
++                                                tone.output_max);
++        GLSL("color.rgb = min(color.rgb, vec3("$")); \n",
++             SH_FLOAT_DYN(output_max));
++    }
++
+     pl_shader_delinearize(sh, &dst);
+     GLSL("}\n");
+ }
+diff --git a/src/tests/gpu_tests.c b/src/tests/gpu_tests.c
+index 958a2043..da4c2049 100644
+--- a/src/tests/gpu_tests.c
++++ b/src/tests/gpu_tests.c
+@@ -2381,6 +2381,88 @@ static void pl_causal_descriptor_fixture_test(pl_gpu gpu)
+     free(gray);
+ }
+ 
++static void pl_hdr_target_clip_test(pl_gpu gpu)
++{
++    if (gpu->glsl.version < 410)
++        return;
++
++    printf("pl_hdr_target_clip_test:\n");
++    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 16, 32,
++                             PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_LINEAR);
++    if (!fmt)
++        return;
++
++    const float pq_1000 = pl_hdr_rescale(PL_HDR_NITS, PL_HDR_PQ, 1000.0f);
++    const float pq_200 = pl_hdr_rescale(PL_HDR_NITS, PL_HDR_PQ, 200.0f);
++    const float input[4] = { pq_1000, pq_1000, pq_1000, 1.0f };
++    float output[4] = {0};
++
++    pl_tex src = pl_tex_create(gpu, pl_tex_params(
++        .format = fmt,
++        .w = 1,
++        .h = 1,
++        .sampleable = true,
++        .initial_data = input,
++    ));
++    pl_tex dst = pl_tex_create(gpu, pl_tex_params(
++        .format = fmt,
++        .w = 1,
++        .h = 1,
++        .renderable = true,
++        .host_readable = true,
++    ));
++    REQUIRE(src && dst);
++
++    pl_dispatch dp = pl_dispatch_create(gpu->log, gpu);
++    REQUIRE(dp);
++    pl_shader_obj state = NULL;
++    struct pl_color_space csp = pl_color_space_hdr10;
++    csp.hdr.max_luma = 200.0f;
++
++    struct pl_color_map_params params = pl_color_map_default_params;
++    for (int clipped = 0; clipped <= 1; clipped++) {
++        params.hard_clip_hdr_target = clipped;
++        pl_shader sh = pl_dispatch_begin(dp);
++        pl_shader_sample_nearest(sh, pl_sample_src(.tex = src));
++        pl_shader_color_map(sh, &params, csp, csp, &state, false);
++        REQUIRE(pl_dispatch_finish(dp, pl_dispatch_params(
++            .shader = &sh,
++            .target = dst,
++        )));
++        REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(
++            .tex = dst,
++            .ptr = output,
++        )));
++        const float expected = clipped ? pq_200 : pq_1000;
++        REQUIRE_FEQ(output[0], expected, 2e-5f);
++        REQUIRE_FEQ(output[1], expected, 2e-5f);
++        REQUIRE_FEQ(output[2], expected, 2e-5f);
++    }
++
++    // The option is deliberately inert for SDR, even when explicitly set.
++    params.hard_clip_hdr_target = true;
++    pl_shader sh = pl_dispatch_begin(dp);
++    pl_shader_sample_nearest(sh, pl_sample_src(.tex = src));
++    pl_shader_color_map(sh, &params, pl_color_space_bt709,
++                        pl_color_space_bt709, &state, false);
++    REQUIRE(pl_dispatch_finish(dp, pl_dispatch_params(
++        .shader = &sh,
++        .target = dst,
++    )));
++    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(
++        .tex = dst,
++        .ptr = output,
++    )));
++    REQUIRE_FEQ(output[0], pq_1000, 2e-5f);
++    REQUIRE_FEQ(output[1], pq_1000, 2e-5f);
++    REQUIRE_FEQ(output[2], pq_1000, 2e-5f);
++
++    pl_shader_obj_destroy(&state);
++    pl_dispatch_destroy(&dp);
++    pl_tex_destroy(gpu, &src);
++    pl_tex_destroy(gpu, &dst);
++}
++
+ void gpu_shader_tests(pl_gpu gpu)
+ {
+     pl_buffer_tests(gpu);
+@@ -2396,6 +2478,7 @@ void gpu_shader_tests(pl_gpu gpu)
+     pl_causal_descriptor_fixture_test(gpu);
+     pl_causal_temporal_fixture_test(gpu);
+     pl_causal_translation_fixture_test(gpu);
++    pl_hdr_target_clip_test(gpu);
+ 
+     REQUIRE(!pl_gpu_is_failed(gpu));
+ }
+-- 
+2.54.0.windows.1
