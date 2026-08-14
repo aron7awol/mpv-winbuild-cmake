@@ -1,0 +1,147 @@
+From c45a39fe68957c73b50e7aef140c36ae67548022 Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Fri, 14 Aug 2026 08:26:52 -0400
+Subject: [PATCH] gpu-next: add live Dolby Vision EL toggle
+
+---
+ DOCS/man/options.rst    |  6 ++++++
+ video/out/vo_gpu_next.c | 35 ++++++++++++++++++++++++++++++-----
+ 2 files changed, 36 insertions(+), 5 deletions(-)
+
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index fcca228eb4bf06acbb19f2d1a19eeda9b2ab4199..41e6f476820d241b60085bed1b3636a69cf70add 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -7853,6 +7853,12 @@ them.
+     advanced scaling is enabled. Defaults to no. (Only affects
+     ``--vo=gpu-next``, note that ``--vo=gpu`` always delays the peak.)
+ 
++``--dovi-enhancement-layer=<yes|no>``
++    Render the Dolby Vision enhancement layer when one is attached to the
++    current frame (default: yes). Changing this option redraws a cached paused
++    frame without seeking or decoding it again. This option affects only the
++    ``gpu-next`` video output and does not disable enhancement-layer decoding.
++
+ ``--hdr-authored-scene-reset=<yes|no>``
+     When measured HDR peak detection is active, reset its temporal smoothing at
+     authored scene boundaries. Dolby Vision uses the RPU scene refresh flag.
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index a65b0ce746f1b374489d064206b4aea8de54f66c..c883c006daad7d6bd5cc5298659ed9b400754ace 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -185,6 +185,7 @@ static void update_lut(struct priv *p, struct user_lut *lut);
+ 
+ struct gl_next_opts {
+     bool delayed_peak;
++    bool dovi_enhancement_layer;
+     bool causal_scene_diagnostics;
+     bool causal_scene_acceleration;
+     bool authored_scene_reset;
+@@ -220,6 +221,7 @@ const struct m_sub_options gl_next_conf = {
+         {"image-subs-hdr-peak", OPT_CHOICE(image_subs_hdr_peak, {"sdr", PL_COLOR_SDR_WHITE},
+             {"video", -1}, {"video-static", -2}, {"video-dynamic", -3}),  M_RANGE(10, 10000)},
+         {"allow-delayed-peak-detect", OPT_BOOL(delayed_peak)},
++        {"dovi-enhancement-layer", OPT_BOOL(dovi_enhancement_layer)},
+         // Hidden Stage 1 instrumentation. This collects descriptors only and
+         // must never alter tone-map state or rendered output.
+         {"hdr-causal-scene-diagnostics", OPT_BOOL(causal_scene_diagnostics), M_OPT_NOCFG},
+@@ -254,6 +256,7 @@ const struct m_sub_options gl_next_conf = {
+         .image_subs_hdr_peak = 1000,
+         .target_hint = -1,
+         .target_hint_strict = true,
++        .dovi_enhancement_layer = true,
+         .authored_scene_reset = true,
+         .causal_scene_diagnostics = false,
+         .causal_scene_acceleration = false,
+@@ -500,12 +503,22 @@ struct frame_priv {
+     struct ra_hwdec *el_hwdec;
+     pl_tex el_tex[4];
+     struct pl_frame el_frame;
++    bool has_el_frame;
+     unsigned authored_scene_cut;
+     // Exact monotonic presentation identity from vo_frame::frame_id. It is
+     // deliberately not a PTS and is carried into libplacebo's readback tag.
+     uint64_t causal_scene_tag;
+ };
+ 
++#if PL_API_VER >= 367
++static void apply_dovi_enhancement_layer(struct priv *p, struct pl_frame *frame,
++                                         struct frame_priv *fp)
++{
++    frame->enhancement_layer = p->next_opts->dovi_enhancement_layer &&
++                               fp->has_el_frame ? &fp->el_frame : NULL;
++}
++#endif
++
+ static void reset_authored_scene_state(struct priv *p)
+ {
+     p->hdr10plus_stable_signature = 0;
+@@ -1051,6 +1064,7 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
+ 
+         if (el_ok) {
+             pl_frame_set_chroma_location(&fp->el_frame, el_par.chroma_location);
++            fp->has_el_frame = true;
+             frame->enhancement_layer = &fp->el_frame;
+         } else {
+             MP_WARN(vo, "Failed setting up enhancement layer; "
+@@ -1121,10 +1135,13 @@ static void update_options(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
+     pl_options pars = p->pars;
++    bool old_dovi_enhancement_layer = p->next_opts->dovi_enhancement_layer;
+     bool changed = m_config_cache_update(p->opts_cache);
+     changed = m_config_cache_update(p->next_opts_cache) || changed;
+     if (changed)
+         update_render_options(vo);
++    if (old_dovi_enhancement_layer != p->next_opts->dovi_enhancement_layer)
++        p->flush_cache = true;
+ 
+     update_lut(p, &p->next_opts->lut);
+     pars->params.lut = p->next_opts->lut.lut;
+@@ -1376,6 +1393,13 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+         }
+     }
+ 
++    // A paused redraw can have no incoming frames, so flush before the push
++    // loop rather than waiting for a newly decoded frame.
++    if (p->flush_cache) {
++        pl_renderer_flush_cache(p->rr);
++        p->flush_cache = false;
++    }
++
+     // Push all incoming frames into the frame queue
+     for (int n = 0; n < frame->num_frames; n++) {
+         int id = frame->frame_id + n;
+@@ -1386,12 +1410,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+             p->last_id = 0;
+             reset_authored_scene_state(p);
+             p->want_reset = false;
+-            p->flush_cache = true;
+-        }
+-
+-        if (p->flush_cache) {
+             pl_renderer_flush_cache(p->rr);
+-            p->flush_cache = false;
+         }
+ 
+         if (id <= p->last_id)
+@@ -1731,6 +1750,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+             struct pl_frame *image = (struct pl_frame *) mix.frames[i];
+             struct mp_image *mpi = image->user_data;
+             struct frame_priv *fp = mpi->priv;
++#if PL_API_VER >= 367
++            apply_dovi_enhancement_layer(p, image, fp);
++#endif
+             apply_crop(image, p->src, vo->params->w, vo->params->h);
+             if (opts->blend_subs) {
+                 if (frame->redraw)
+@@ -2205,6 +2227,9 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
+         osd_flags |= OSD_DRAW_SUB_ONLY;
+ 
+     struct frame_priv *fp = mpi->priv;
++#if PL_API_VER >= 367
++    apply_dovi_enhancement_layer(p, &image, fp);
++#endif
+     if (opts->blend_subs) {
+         float w = pl_rect_w(opts->blend_subs == BLEND_SUBS_VIDEO ? image.crop : target.crop);
+         float h = pl_rect_h(opts->blend_subs == BLEND_SUBS_VIDEO ? image.crop : target.crop);
