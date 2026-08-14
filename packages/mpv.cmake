@@ -54,8 +54,9 @@ ExternalProject_Add(mpv
         -Ddebug=true
         -Db_ndebug=true
         -Doptimization=3
-        -Db_lto=true
-        ${mpv_lto_mode}
+        # The current mpv-sk engine stack exceeds the GitHub runner's linker
+        # memory even for a single-job, no-PDB ThinLTO link of libmpv.
+        -Db_lto=false
         -Dlibmpv=true
         -Dpdf-build=enabled
         -Dlua=enabled
@@ -75,12 +76,10 @@ ExternalProject_Add(mpv
         -Dsixel=enabled
         ${mpv_gl}
         -Dc_args='-Wno-error=int-conversion'
-        -Dc_link_args='-flto-jobs=1'
-        -Dcpp_link_args='-flto-jobs=1'
     # The packaged debug artifact only needs mpv.pdb. Link the much larger
     # libmpv DLL without a PDB first, then generate the player PDB separately.
-    BUILD_COMMAND ${EXEC} LTO_JOB=1 ninja -j1 -C <BINARY_DIR> libmpv-2.dll
-    COMMAND ${EXEC} LTO_JOB=1 PDB=1 ninja -j1 -C <BINARY_DIR>
+    BUILD_COMMAND ${EXEC} ninja -j1 -C <BINARY_DIR> libmpv-2.dll
+    COMMAND ${EXEC} PDB=1 ninja -j1 -C <BINARY_DIR>
     INSTALL_COMMAND ""
     LOG_DOWNLOAD 1 LOG_UPDATE 1 LOG_CONFIGURE 1 LOG_BUILD 1 LOG_INSTALL 1
 )
