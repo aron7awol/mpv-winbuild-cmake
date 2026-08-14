@@ -1,27 +1,27 @@
-From 12effd59098606048417b55e010fe4d83028ee65 Mon Sep 17 00:00:00 2001
+From cd5fc7897c9bc403debcb1693ccc90547a172ca7 Mon Sep 17 00:00:00 2001
 From: Aaron <aaronmedeiros@gmail.com>
 Date: Thu, 13 Aug 2026 14:59:33 -0400
 Subject: [PATCH] gpu-next: add causal scene detection and acceleration
 
 ---
- DOCS/man/input.rst                  |  10 +++
+ DOCS/man/input.rst                  |  11 +++
  DOCS/man/options.rst                |  13 +++
  TOOLS/causal_scene_validate.md      |  24 ++++++
- TOOLS/causal_scene_validate.py      | 123 ++++++++++++++++++++++++++++
- TOOLS/test_causal_scene_validate.py |  55 +++++++++++++
- player/command.c                    |  58 +++++++++++++
- video/mp_image.h                    |  22 +++++
- video/out/vo_gpu_next.c             |  78 ++++++++++++++++++
- 8 files changed, 383 insertions(+)
+ TOOLS/causal_scene_validate.py      | 125 ++++++++++++++++++++++++++++
+ TOOLS/test_causal_scene_validate.py |  55 ++++++++++++
+ player/command.c                    |  60 +++++++++++++
+ video/mp_image.h                    |  23 +++++
+ video/out/vo_gpu_next.c             |  81 ++++++++++++++++++
+ 8 files changed, 392 insertions(+)
  create mode 100644 TOOLS/causal_scene_validate.md
  create mode 100644 TOOLS/causal_scene_validate.py
  create mode 100644 TOOLS/test_causal_scene_validate.py
 
 diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
-index e71e2c0d8..4c43efde0 100644
+index e71e2c0d8dd2069518336fb0c2d295ef748f225a..851760c1537e0e75143e2667713d2b35c724b717 100644
 --- a/DOCS/man/input.rst
 +++ b/DOCS/man/input.rst
-@@ -2932,6 +2932,16 @@ Property list
+@@ -2932,6 +2932,17 @@ Property list
          black pixels. It is independent of ``--hdr-peak-percentile`` and is
          not static MaxFALL metadata.
  
@@ -30,7 +30,8 @@ index e71e2c0d8..4c43efde0 100644
 +        submitted and consumed source-frame tags, latency, descriptor
 +        validity/withheld reason, histogram TV, tile MAD, translated-motion
 +        fraction, residual, score, trigger/count, authored-boundary tag/source,
-+        active tone-metric branch, and acceleration-applied state. These fields
++        active tone-metric branch, acceleration-applied state, and cumulative
++        acceleration count. These fields
 +        are available only with ``--hdr-causal-scene-diagnostics=yes``. They do
 +        not change tone mapping; ``acceleration-applied`` is always ``no`` in
 +        this diagnostics stage.
@@ -39,7 +40,7 @@ index e71e2c0d8..4c43efde0 100644
          Unsmoothed percentile peak and PQ-domain frame average for the selected
          non-standard ``--tone-mapping-metric``, expressed in cd/mÂ². Unavailable
 diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
-index 7e8701006..fcca228eb 100644
+index 7e870100627827fe6045a7e5da662177475c65c8..fcca228eb4bf06acbb19f2d1a19eeda9b2ab4199 100644
 --- a/DOCS/man/options.rst
 +++ b/DOCS/man/options.rst
 @@ -7861,6 +7861,19 @@ them.
@@ -64,7 +65,7 @@ index 7e8701006..fcca228eb 100644
      true peak of the scene. If this is set to 100 (default), the
 diff --git a/TOOLS/causal_scene_validate.md b/TOOLS/causal_scene_validate.md
 new file mode 100644
-index 000000000..68fefc7ae
+index 0000000000000000000000000000000000000000..68fefc7aeb3cea9277197eeb47f959c539e00ed1
 --- /dev/null
 +++ b/TOOLS/causal_scene_validate.md
 @@ -0,0 +1,24 @@
@@ -94,10 +95,10 @@ index 000000000..68fefc7ae
 +reference/corpus replay gate.
 diff --git a/TOOLS/causal_scene_validate.py b/TOOLS/causal_scene_validate.py
 new file mode 100644
-index 000000000..6351b74cd
+index 0000000000000000000000000000000000000000..6037e76840c2dab96e0c550e7783443f15f70380
 --- /dev/null
 +++ b/TOOLS/causal_scene_validate.py
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,125 @@
 +#!/usr/bin/env python3
 +"""Validate Stage 1 causal-scene diagnostic traces without judging picture quality.
 +
@@ -120,7 +121,7 @@ index 000000000..6351b74cd
 +    "tile-mad", "shifted-tile-mad", "translated-motion-fraction",
 +    "global-motion-residual", "score", "visual-trigger", "last-tag",
 +    "authored-boundary-tag", "authored-boundary-source",
-+    "active-metric-branch", "acceleration-applied",
++    "active-metric-branch", "acceleration-applied", "acceleration-count",
 +)
 +WITHHELD_REASONS = {"none", "disabled", "no-tag", "pending", "discontinuity", "unsupported"}
 +
@@ -163,6 +164,8 @@ index 000000000..6351b74cd
 +            continue
 +        if values["acceleration-applied"] is not False:
 +            errors.append(f"{line_no}: Stage 1 must never apply acceleration")
++        if not isinstance(values["acceleration-count"], int) or values["acceleration-count"] < 0:
++            errors.append(f"{line_no}: invalid acceleration count")
 +        valid = values["descriptor-valid"] is True
 +        withheld = values["withheld-reason"]
 +        if withheld not in WITHHELD_REASONS:
@@ -223,7 +226,7 @@ index 000000000..6351b74cd
 +    sys.exit(main())
 diff --git a/TOOLS/test_causal_scene_validate.py b/TOOLS/test_causal_scene_validate.py
 new file mode 100644
-index 000000000..b5385d539
+index 0000000000000000000000000000000000000000..13d18af4a0359bb0382249787652be6941db4fdd
 --- /dev/null
 +++ b/TOOLS/test_causal_scene_validate.py
 @@ -0,0 +1,55 @@
@@ -248,7 +251,7 @@ index 000000000..b5385d539
 +        "global-motion-residual": 0.02, "score": 0.05,
 +        "visual-trigger": False, "last-tag": 0, "authored-boundary-tag": 0,
 +        "authored-boundary-source": "none", "active-metric-branch": "standard",
-+        "acceleration-applied": False,
++        "acceleration-applied": False, "acceleration-count": 0,
 +    }
 +    values.update(overrides)
 +    return values
@@ -283,7 +286,7 @@ index 000000000..b5385d539
 +if __name__ == "__main__":
 +    unittest.main()
 diff --git a/player/command.c b/player/command.c
-index 56bd0bf88..663180321 100644
+index 56bd0bf884459047f86974b942d78e2706b0a38c..4a5bcfcd890aa1badf8f2ef5ab258fdd1590a089 100644
 --- a/player/command.c
 +++ b/player/command.c
 @@ -34,6 +34,7 @@
@@ -320,7 +323,7 @@ index 56bd0bf88..663180321 100644
      const char *pixelformat_name = p->imgfmt_name ? p->imgfmt_name :
                                                     mp_imgfmt_to_name(p->imgfmt);
      struct m_sub_property props[] = {
-@@ -2590,6 +2610,44 @@ static int property_imgparams(const struct mp_image_params *p, int action, void
+@@ -2590,6 +2610,46 @@ static int property_imgparams(const struct mp_image_params *p, int action, void
                             (MP_SCENE_CUT_DOVI | MP_SCENE_CUT_HDR10PLUS)
                           ? "dv+hdr10plus" : "none"),
              .unavailable = !peak->valid},
@@ -362,14 +365,16 @@ index 56bd0bf88..663180321 100644
 +                            .unavailable = !peak->causal_available},
 +        {"causal-scene-acceleration-applied", SUB_PROP_BOOL(peak->causal_acceleration_applied),
 +                            .unavailable = !peak->causal_valid},
++        {"causal-scene-acceleration-count", SUB_PROP_INT64(peak->causal_acceleration_count),
++                            .unavailable = !peak->causal_available},
          {"raw-max-tone-metric-nits", SUB_PROP_FLOAT(peak->raw_max_tone_metric),
                              .unavailable = !peak->tone_metric_valid},
          {"raw-avg-tone-metric-nits", SUB_PROP_FLOAT(peak->raw_avg_tone_metric),
 diff --git a/video/mp_image.h b/video/mp_image.h
-index defe0e61a..409d6958e 100644
+index defe0e61a42f3005cb0bc9642ae9f303384eeb5a..ccc620098380278987eee400a27d560d4764ccea 100644
 --- a/video/mp_image.h
 +++ b/video/mp_image.h
-@@ -73,6 +73,28 @@ struct mp_peak_detect_metrics {
+@@ -73,6 +73,29 @@ struct mp_peak_detect_metrics {
      float raw_avg_tone_metric;       // average private-metric value
      float smoothed_max_tone_metric;  // curve input peak after smoothing
      float smoothed_avg_tone_metric;  // curve input average after smoothing
@@ -384,6 +389,7 @@ index defe0e61a..409d6958e 100644
 +    uint64_t causal_consumed_tag;
 +    uint64_t causal_last_tag;
 +    uint64_t causal_trigger_count;
++    uint64_t causal_acceleration_count;
 +    uint64_t causal_authored_boundary_tag;
 +    int causal_latency_frames;
 +    int causal_withheld_reason;
@@ -399,7 +405,7 @@ index defe0e61a..409d6958e 100644
  
  // Describes image parameters that usually stay constant.
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index 3bd8b045b..4540ab712 100644
+index 3bd8b045bd776e89a9167aab18007fb523c0c969..a65b0ce746f1b374489d064206b4aea8de54f66c 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
 @@ -145,6 +145,7 @@ struct priv {
@@ -474,7 +480,7 @@ index 3bd8b045b..4540ab712 100644
  
          pl_queue_push(p->queue, &(struct pl_source_frame) {
              .pts = mpi->pts,
-@@ -1808,6 +1826,64 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1808,6 +1826,67 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
          } else {
              vo->params->peak_detect = (struct mp_peak_detect_metrics) {0};
          }
@@ -495,6 +501,7 @@ index 3bd8b045b..4540ab712 100644
 +            out->causal_consumed_tag = causal.consumed_tag;
 +            out->causal_last_tag = causal.last_trigger_tag;
 +            out->causal_trigger_count = causal.visual_trigger_count;
++            out->causal_acceleration_count = causal.acceleration_count;
 +            out->causal_authored_boundary_tag = causal.authored_boundary_tag;
 +            out->causal_latency_frames = causal.readback_latency_frames;
 +            out->causal_withheld_reason = causal.withheld_reason;
@@ -512,7 +519,8 @@ index 3bd8b045b..4540ab712 100644
 +                           " consumed=%"PRIu64" latency=%d valid=%d withheld=%d "
 +                           "hist-tv=%f tile-mad=%f shifted-tile-mad=%f motion=%f "
 +                           "residual=%f score=%f trigger=%d count=%"PRIu64
-+                           " allow-delayed=%d acceleration-applied=%d\n",
++                           " allow-delayed=%d acceleration-applied=%d"
++                           " acceleration-count=%"PRIu64"\n",
 +                           causal.submitted_tag, causal.consumed_tag,
 +                           causal.readback_latency_frames, causal.descriptor_valid,
 +                           causal.withheld_reason, causal.histogram_tv, causal.tile_mad,
@@ -521,7 +529,8 @@ index 3bd8b045b..4540ab712 100644
 +                           causal.global_motion_residual, causal.cut_score,
 +                           causal.visual_trigger, causal.visual_trigger_count,
 +                           causal.effective_allow_delayed,
-+                           causal.acceleration_applied);
++                           causal.acceleration_applied,
++                           causal.acceleration_count);
 +                p->causal_scene_last_logged_tag = causal.consumed_tag;
 +            }
 +        } else if (p->next_opts->causal_scene_diagnostics ||
@@ -539,7 +548,7 @@ index 3bd8b045b..4540ab712 100644
      }
      mp_mutex_unlock(&vo->params_mutex);
  
-@@ -3017,6 +3093,8 @@ static void update_render_options(struct vo *vo)
+@@ -3017,6 +3096,8 @@ static void update_render_options(struct vo *vo)
      pars->peak_detect_params.scene_threshold_high = opts->tone_map.scene_threshold_high;
      pars->peak_detect_params.percentile = opts->tone_map.peak_percentile;
      pars->peak_detect_params.allow_delayed = p->next_opts->delayed_peak;
@@ -548,5 +557,3 @@ index 3bd8b045b..4540ab712 100644
      pars->peak_detect_params.force = opts->tone_map.compute_peak > 0;
  
      const struct pl_tone_map_function * const tone_map_funs[] = {
--- 
-2.54.0.windows.1

@@ -1,21 +1,21 @@
-From f972950c31fed62eaa932fad70eaa6638dec959e Mon Sep 17 00:00:00 2001
+From d6f3d96368f97b4f81aae7f5137f355c3925a01d Mon Sep 17 00:00:00 2001
 From: Aaron <aaronmedeiros@gmail.com>
 Date: Thu, 13 Aug 2026 15:21:41 -0400
 Subject: [PATCH] causal scene detection: add native descriptors and
  acceleration
 
 ---
- src/include/libplacebo/renderer.h           |  34 ++
+ src/include/libplacebo/renderer.h           |  35 ++
  src/include/libplacebo/shaders/colorspace.h |  18 +
  src/renderer.c                              | 468 +++++++++++++++++++-
- src/shaders/colorspace.c                    | 409 ++++++++++++++++-
+ src/shaders/colorspace.c                    | 415 ++++++++++++++++-
  src/tests/causal_test.h                     |  31 ++
- src/tests/gpu_tests.c                       | 414 +++++++++++++++++
- 6 files changed, 1345 insertions(+), 29 deletions(-)
+ src/tests/gpu_tests.c                       | 417 +++++++++++++++++
+ 6 files changed, 1355 insertions(+), 29 deletions(-)
  create mode 100644 src/tests/causal_test.h
 
 diff --git a/src/include/libplacebo/renderer.h b/src/include/libplacebo/renderer.h
-index 44514bbf..6a13bf5b 100644
+index 44514bbf6fc70ae5c3b0ebbbd096d487a5b72380..74140f9d566c78427d64281fd0b5bf956189e035 100644
 --- a/src/include/libplacebo/renderer.h
 +++ b/src/include/libplacebo/renderer.h
 @@ -192,6 +192,13 @@ struct pl_render_params {
@@ -44,7 +44,7 @@ index 44514bbf..6a13bf5b 100644
      // Optional ICC profile associated with this frame.
      pl_icc_object icc;
  
-@@ -771,6 +782,29 @@ PL_API bool pl_renderer_get_hdr_metadata(pl_renderer rr,
+@@ -771,6 +782,30 @@ PL_API bool pl_renderer_get_hdr_metadata(pl_renderer rr,
  PL_API bool pl_renderer_get_peak_detect_metrics(
      pl_renderer rr, struct pl_peak_detect_metrics *metrics);
  
@@ -61,6 +61,7 @@ index 44514bbf..6a13bf5b 100644
 +    bool effective_allow_delayed, descriptor_valid, visual_trigger;
 +    bool acceleration_applied;
 +    uint64_t submitted_tag, consumed_tag, last_trigger_tag, visual_trigger_count;
++    uint64_t acceleration_count;
 +    uint64_t authored_boundary_tag, authored_boundary_source;
 +    enum pl_causal_scene_withheld_reason withheld_reason;
 +    enum pl_tone_map_metric active_metric_branch;
@@ -75,7 +76,7 @@ index 44514bbf..6a13bf5b 100644
  //
  // NOTE: Frames must be sorted by timestamp, i.e. `timestamps` must be
 diff --git a/src/include/libplacebo/shaders/colorspace.h b/src/include/libplacebo/shaders/colorspace.h
-index 837f0d16..7731b582 100644
+index 837f0d1678096d7eee6bef23fc4ff9965d021006..7731b5821c804f82a76bf6e88bf1b772bff93f02 100644
 --- a/src/include/libplacebo/shaders/colorspace.h
 +++ b/src/include/libplacebo/shaders/colorspace.h
 @@ -22,6 +22,8 @@
@@ -118,7 +119,7 @@ index 837f0d16..7731b582 100644
  // pl_get_detected_hdr_metadata it never re-labels physical CIE Y metadata.
  PL_API bool pl_get_detected_tone_map_range(const pl_shader_obj state,
 diff --git a/src/renderer.c b/src/renderer.c
-index bf839c54..ace040c1 100644
+index bf839c54f17cf427b9523c784882b6fae9906432..ace040c1663c5ea86efb0b8efcbf6f1ec98b113d 100644
 --- a/src/renderer.c
 +++ b/src/renderer.c
 @@ -22,6 +22,7 @@
@@ -806,7 +807,7 @@ index bf839c54..ace040c1 100644
      return true;
  }
 diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
-index 86cad57f..3f161f95 100644
+index 86cad57f64a65be6c63f936875174b529b4c41ea..b93409af718d3ebf01d84d30b6fd38f343130cad 100644
 --- a/src/shaders/colorspace.c
 +++ b/src/shaders/colorspace.c
 @@ -20,8 +20,10 @@
@@ -920,7 +921,7 @@ index 86cad57f..3f161f95 100644
      } peak;
  };
  
-@@ -1536,8 +1607,110 @@ static float measure_peak(const unsigned max_pq[SLICES],
+@@ -1536,8 +1607,114 @@ static float measure_peak(const unsigned max_pq[SLICES],
      pl_unreachable();
  }
  
@@ -944,9 +945,11 @@ index 86cad57f..3f161f95 100644
 +    for (int i = 0; i < CAUSAL_HIST_BINS; i++) total += d->causal_hist[i];
 +    const uint64_t last_trigger_tag = o->last_trigger_tag;
 +    const uint64_t trigger_count = o->visual_trigger_count;
++    const uint64_t acceleration_count = o->acceleration_count;
 +    memset(o, 0, sizeof(*o));
 +    o->last_trigger_tag = last_trigger_tag;
 +    o->visual_trigger_count = trigger_count;
++    o->acceleration_count = acceleration_count;
 +    o->effective_allow_delayed = p->allow_delayed;
 +    o->submitted_tag = obj->peak.causal_latest_submitted_tag;
 +    o->consumed_tag = p->tag;
@@ -962,6 +965,7 @@ index 86cad57f..3f161f95 100644
 +        obj->peak.causal_have_previous = false;
 +        obj->peak.causal_pending_valid = false;
 +        o->last_trigger_tag = o->visual_trigger_count = 0;
++        o->acceleration_count = 0;
 +        return false;
 +    }
 +    float hist[CAUSAL_HIST_BINS], tiles[CAUSAL_TILES], grid[CAUSAL_GRID];
@@ -1011,6 +1015,7 @@ index 86cad57f..3f161f95 100644
 +        if (obj->peak.causal_have_previous) {
 +            o->last_trigger_tag = 0;
 +            o->visual_trigger_count = 0;
++            o->acceleration_count = 0;
 +        }
 +        obj->peak.causal_pending_valid = false;
 +        obj->peak.causal_previous_cut_score = 0.0f;
@@ -1032,7 +1037,7 @@ index 86cad57f..3f161f95 100644
  {
      const struct pl_peak_detect_params *params = &obj->peak.params;
      if (!obj->peak.buf)
-@@ -1554,7 +1727,10 @@ static void update_peak_buf(pl_gpu gpu, struct sh_color_map_obj *obj, bool force
+@@ -1554,7 +1731,10 @@ static void update_peak_buf(pl_gpu gpu, struct sh_color_map_obj *obj, bool force
      } else {
          ok = pl_buf_read(gpu, obj->peak.buf, 0, &data, sizeof(data));
      }
@@ -1044,7 +1049,7 @@ index 86cad57f..3f161f95 100644
          // Peak detection completed successfully
          pl_buf_destroy(gpu, &obj->peak.buf);
      } else {
-@@ -1574,6 +1750,27 @@ static void update_peak_buf(pl_gpu gpu, struct sh_color_map_obj *obj, bool force
+@@ -1574,6 +1754,29 @@ static void update_peak_buf(pl_gpu gpu, struct sh_color_map_obj *obj, bool force
          return;
      }
  
@@ -1054,6 +1059,8 @@ index 86cad57f..3f161f95 100644
 +        causal_acceleration = causal_consume(sink, &data,
 +                                              &obj->peak.causal_sink_params);
 +        sink->peak.causal.acceleration_applied = causal_acceleration;
++        if (causal_acceleration)
++            sink->peak.causal.acceleration_count++;
 +        sink->peak.causal_test.readback_count++;
 +        sink->peak.causal_test.borrowed_peak_transaction = true;
 +        sink->peak.causal_test.transaction_bytes = sizeof(data);
@@ -1072,7 +1079,7 @@ index 86cad57f..3f161f95 100644
      uint64_t frame_sum_pq = 0u, frame_sum_rgb = 0u, frame_sum_metric = 0u;
      uint64_t frame_wg_count = 0u, frame_wg_active = 0u;
      unsigned frame_max_rgb = 0u;
-@@ -1646,6 +1843,11 @@ static void update_peak_buf(pl_gpu gpu, struct sh_color_map_obj *obj, bool force
+@@ -1646,6 +1849,11 @@ static void update_peak_buf(pl_gpu gpu, struct sh_color_map_obj *obj, bool force
          obj->peak.max_metric += coeff *
              (raw_max_metric - obj->peak.max_metric);
  
@@ -1084,7 +1091,7 @@ index 86cad57f..3f161f95 100644
          // Accelerate both smoothed values on scene changes, exactly as the
          // standard detector does, but detect the change from this metric's
          // frame average rather than CIE Y.
-@@ -1690,6 +1892,11 @@ static void update_peak_buf(pl_gpu gpu, struct sh_color_map_obj *obj, bool force
+@@ -1690,6 +1898,11 @@ static void update_peak_buf(pl_gpu gpu, struct sh_color_map_obj *obj, bool force
      obj->peak.avg_pq += coeff * (avg_pq - obj->peak.avg_pq);
      obj->peak.max_pq += coeff * (max_pq - obj->peak.max_pq);
  
@@ -1096,7 +1103,7 @@ index 86cad57f..3f161f95 100644
      // Scene change hysteresis
      if (params->scene_threshold_low > 0 && params->scene_threshold_high > 0) {
          const float log10_pq = 1e-2f; // experimentally determined approximate
-@@ -1741,17 +1948,26 @@ bool pl_shader_detect_peak(pl_shader sh, struct pl_color_space csp,
+@@ -1741,17 +1954,26 @@ bool pl_shader_detect_peak(pl_shader sh, struct pl_color_space csp,
      if (!obj)
          return false;
  
@@ -1127,7 +1134,7 @@ index 86cad57f..3f161f95 100644
          obj->peak.buf = pl_buf_create(gpu, pl_buf_params(
              .size           = sizeof(struct peak_buf_data),
              .storable       = true,
-@@ -1783,7 +1999,17 @@ retry_ssbo:
+@@ -1783,7 +2005,17 @@ retry_ssbo:
          return false;
      }
  
@@ -1146,7 +1153,7 @@ index 86cad57f..3f161f95 100644
      pl_color_space_infer(&csp);
  
      sh_desc(sh, (struct pl_shader_desc) {
-@@ -1997,6 +2223,130 @@ retry_ssbo:
+@@ -1997,6 +2229,130 @@ retry_ssbo:
      return true;
  }
  
@@ -1277,7 +1284,7 @@ index 86cad57f..3f161f95 100644
  bool pl_get_detected_hdr_metadata(const pl_shader_obj state,
                                    struct pl_hdr_metadata *out)
  {
-@@ -2004,7 +2354,7 @@ bool pl_get_detected_hdr_metadata(const pl_shader_obj state,
+@@ -2004,7 +2360,7 @@ bool pl_get_detected_hdr_metadata(const pl_shader_obj state,
          return false;
  
      struct sh_color_map_obj *obj = state->priv;
@@ -1286,7 +1293,7 @@ index 86cad57f..3f161f95 100644
      if (!obj->peak.avg_pq)
          return false;
  
-@@ -2020,7 +2370,7 @@ bool pl_get_peak_detect_metrics(const pl_shader_obj state,
+@@ -2020,7 +2376,7 @@ bool pl_get_peak_detect_metrics(const pl_shader_obj state,
          return false;
  
      struct sh_color_map_obj *obj = state->priv;
@@ -1295,7 +1302,7 @@ index 86cad57f..3f161f95 100644
      if (!obj->peak.avg_pq)
          return false;
  
-@@ -2043,6 +2393,45 @@ bool pl_get_peak_detect_metrics(const pl_shader_obj state,
+@@ -2043,6 +2399,45 @@ bool pl_get_peak_detect_metrics(const pl_shader_obj state,
      return true;
  }
  
@@ -1341,7 +1348,7 @@ index 86cad57f..3f161f95 100644
  bool pl_get_detected_tone_map_range(const pl_shader_obj state,
                                      enum pl_tone_map_metric metric,
                                      float *max_pq, float *avg_pq)
-@@ -2050,7 +2439,7 @@ bool pl_get_detected_tone_map_range(const pl_shader_obj state,
+@@ -2050,7 +2445,7 @@ bool pl_get_detected_tone_map_range(const pl_shader_obj state,
      if (!state || state->type != PL_SHADER_OBJ_COLOR_MAP)
          return false;
      struct sh_color_map_obj *obj = state->priv;
@@ -1352,7 +1359,7 @@ index 86cad57f..3f161f95 100644
              return false;
 diff --git a/src/tests/causal_test.h b/src/tests/causal_test.h
 new file mode 100644
-index 00000000..5d21d29e
+index 0000000000000000000000000000000000000000..5d21d29eaf8c6b03cb9772aeafde7bf3a00b6ac3
 --- /dev/null
 +++ b/src/tests/causal_test.h
 @@ -0,0 +1,31 @@
@@ -1388,7 +1395,7 @@ index 00000000..5d21d29e
 +bool pl_get_causal_test_descriptors(pl_shader_obj state,
 +                                    struct pl_causal_test_descriptors *out);
 diff --git a/src/tests/gpu_tests.c b/src/tests/gpu_tests.c
-index 965221f5..92ce14fa 100644
+index 965221f58168d408e7141aad69c752f8b2697608..958a2043f6e22c1a9e528f857b735b56d8593f15 100644
 --- a/src/tests/gpu_tests.c
 +++ b/src/tests/gpu_tests.c
 @@ -1,5 +1,6 @@
@@ -1398,7 +1405,7 @@ index 965221f5..92ce14fa 100644
  
  #include <libplacebo/renderer.h>
  #include <libplacebo/utils/frame_queue.h>
-@@ -1969,6 +1970,414 @@ static void pl_test_host_ptr(pl_gpu gpu)
+@@ -1969,6 +1970,417 @@ static void pl_test_host_ptr(pl_gpu gpu)
  #endif // unix
  }
  
@@ -1718,7 +1725,7 @@ index 965221f5..92ce14fa 100644
 +        REQUIRE(d.consumed_tag == tag && d.readback_latency_frames == 0);
 +        if (tag == 2) {
 +            REQUIRE(d.visual_trigger && d.cut_score > .99f && d.global_motion_residual > .99f);
-+            REQUIRE(d.acceleration_applied);
++            REQUIRE(d.acceleration_applied && d.acceleration_count == 1);
 +            struct pl_peak_detect_metrics m;
 +            REQUIRE(pl_renderer_get_peak_detect_metrics(rr, &m));
 +            REQUIRE(fabsf(m.raw_max_pq_y - m.smoothed_max_pq_y) < 2e-5f);
@@ -1728,15 +1735,18 @@ index 965221f5..92ce14fa 100644
 +        }
 +        if (tag == 3) {
 +            REQUIRE(!d.visual_trigger && !d.acceleration_applied);
-+            REQUIRE(d.last_trigger_tag == 2 && d.visual_trigger_count == 1);
++            REQUIRE(d.last_trigger_tag == 2 && d.visual_trigger_count == 1 &&
++                    d.acceleration_count == 1);
 +        }
 +        if (tag == 6) {
 +            REQUIRE(!d.visual_trigger && !d.acceleration_applied);
++            REQUIRE(d.acceleration_count == 1);
 +            REQUIRE(d.cut_score >= .10f && d.cut_score < .16f);
 +        }
 +        if (tag == 7) {
 +            REQUIRE(d.visual_trigger && d.acceleration_applied);
-+            REQUIRE(d.last_trigger_tag == 6 && d.visual_trigger_count == 2);
++            REQUIRE(d.last_trigger_tag == 6 && d.visual_trigger_count == 2 &&
++                    d.acceleration_count == 2);
 +        }
 +    }
 +done:
@@ -1813,7 +1823,7 @@ index 965221f5..92ce14fa 100644
  void gpu_shader_tests(pl_gpu gpu)
  {
      pl_buffer_tests(gpu);
-@@ -1979,6 +2388,11 @@ void gpu_shader_tests(pl_gpu gpu)
+@@ -1979,6 +2391,11 @@ void gpu_shader_tests(pl_gpu gpu)
      pl_render_tests(gpu);
      pl_render_bits_tests(gpu);
      pl_ycbcr_tests(gpu);
@@ -1825,5 +1835,3 @@ index 965221f5..92ce14fa 100644
  
      REQUIRE(!pl_gpu_is_failed(gpu));
  }
--- 
-2.54.0.windows.1
