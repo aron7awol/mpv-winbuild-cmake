@@ -17,6 +17,7 @@ ExternalProject_Add(openal-soft
         -DALSOFT_UTILS=OFF
         -DALSOFT_EXAMPLES=OFF
         -DALSOFT_TESTS=OFF
+        -DALSOFT_EAX=OFF
         -DALSOFT_BACKEND_PIPEWIRE=OFF
         -DCMAKE_C_FLAGS='-include stdlib.h'
         -DCMAKE_CXX_FLAGS='-I<SOURCE_DIR>/gsl/include -include cstdlib'
