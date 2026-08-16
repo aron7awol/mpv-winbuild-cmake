@@ -1,4 +1,4 @@
-From d6f3d96368f97b4f81aae7f5137f355c3925a01d Mon Sep 17 00:00:00 2001
+From 1607d55e6bcbade09788c90a8644af45025eaa29 Mon Sep 17 00:00:00 2001
 From: Aaron <aaronmedeiros@gmail.com>
 Date: Thu, 13 Aug 2026 15:21:41 -0400
 Subject: [PATCH] causal scene detection: add native descriptors and
@@ -7,15 +7,15 @@ Subject: [PATCH] causal scene detection: add native descriptors and
 ---
  src/include/libplacebo/renderer.h           |  35 ++
  src/include/libplacebo/shaders/colorspace.h |  18 +
- src/renderer.c                              | 468 +++++++++++++++++++-
- src/shaders/colorspace.c                    | 415 ++++++++++++++++-
+ src/renderer.c                              | 485 +++++++++++++++++++-
+ src/shaders/colorspace.c                    | 416 ++++++++++++++++-
  src/tests/causal_test.h                     |  31 ++
- src/tests/gpu_tests.c                       | 417 +++++++++++++++++
- 6 files changed, 1355 insertions(+), 29 deletions(-)
+ src/tests/gpu_tests.c                       | 444 ++++++++++++++++++
+ 6 files changed, 1400 insertions(+), 29 deletions(-)
  create mode 100644 src/tests/causal_test.h
 
 diff --git a/src/include/libplacebo/renderer.h b/src/include/libplacebo/renderer.h
-index 44514bbf6fc70ae5c3b0ebbbd096d487a5b72380..74140f9d566c78427d64281fd0b5bf956189e035 100644
+index 44514bbf..74140f9d 100644
 --- a/src/include/libplacebo/renderer.h
 +++ b/src/include/libplacebo/renderer.h
 @@ -192,6 +192,13 @@ struct pl_render_params {
@@ -76,7 +76,7 @@ index 44514bbf6fc70ae5c3b0ebbbd096d487a5b72380..74140f9d566c78427d64281fd0b5bf95
  //
  // NOTE: Frames must be sorted by timestamp, i.e. `timestamps` must be
 diff --git a/src/include/libplacebo/shaders/colorspace.h b/src/include/libplacebo/shaders/colorspace.h
-index 837f0d1678096d7eee6bef23fc4ff9965d021006..7731b5821c804f82a76bf6e88bf1b772bff93f02 100644
+index 837f0d16..7731b582 100644
 --- a/src/include/libplacebo/shaders/colorspace.h
 +++ b/src/include/libplacebo/shaders/colorspace.h
 @@ -22,6 +22,8 @@
@@ -119,7 +119,7 @@ index 837f0d1678096d7eee6bef23fc4ff9965d021006..7731b5821c804f82a76bf6e88bf1b772
  // pl_get_detected_hdr_metadata it never re-labels physical CIE Y metadata.
  PL_API bool pl_get_detected_tone_map_range(const pl_shader_obj state,
 diff --git a/src/renderer.c b/src/renderer.c
-index bf839c54f17cf427b9523c784882b6fae9906432..ace040c1663c5ea86efb0b8efcbf6f1ec98b113d 100644
+index bf839c54..63280ecd 100644
 --- a/src/renderer.c
 +++ b/src/renderer.c
 @@ -22,6 +22,7 @@
@@ -213,10 +213,20 @@ index bf839c54f17cf427b9523c784882b6fae9906432..ace040c1663c5ea86efb0b8efcbf6f1e
  
      // Map of acquired frames
      struct {
-@@ -1189,6 +1211,94 @@ hook_error:
+@@ -1189,6 +1211,106 @@ hook_error:
      return ret;
  }
  
++// Scene analysis is meaningful only when an HDR source is being mapped. Keep
++// the sidecar completely out of SDR and HDR-passthrough render paths.
++static bool causal_scene_eligible(const struct pass_state *pass)
++{
++    const struct pl_render_params *params = pass->params;
++    return (params->causal_scene_detection || params->causal_scene_acceleration) &&
++           pl_color_space_is_hdr(&pass->image.color) &&
++           !pl_color_space_equal(&pass->image.color, &pass->target.color);
++}
++
 +// Freeze the native-cie-y-v1 representation before PL_HOOK_RGB. Rendering to
 +// this fixed target makes the sampler evaluate at 320x180 pixel centres; the
 +// explicit bilinear sampler clamps edge fetches through the texture binding.
@@ -264,6 +274,7 @@ index bf839c54f17cf427b9523c784882b6fae9906432..ace040c1663c5ea86efb0b8efcbf6f1e
 +    default: break;
 +    }
 +    pl_shader_linearize(sh, &csp);
++    sh_describe(sh, "causal scene CIE Y conversion");
 +    // The raw primary matrix may be rounded very slightly away from a white
 +    // row sum of one. Normalise that row so neutral RGB follows the frozen
 +    // physical CIE-Y definition exactly at uniform PQ bin boundaries.
@@ -280,6 +291,7 @@ index bf839c54f17cf427b9523c784882b6fae9906432..ace040c1663c5ea86efb0b8efcbf6f1e
 +    // 48x27 bilinear grid is formed.
 +    const struct pl_sample_src proxy_src = *pl_sample_src(
 +        .tex = linear_y, .new_w = W, .new_h = H);
++    sh_describe(sh, "causal scene 320x180 proxy");
 +    bool sampled = pass->img.w == W && pass->img.h == H
 +        ? pl_shader_sample_direct(sh, &proxy_src)
 +        : pl_shader_sample_bilinear(sh, &proxy_src);
@@ -308,7 +320,7 @@ index bf839c54f17cf427b9523c784882b6fae9906432..ace040c1663c5ea86efb0b8efcbf6f1e
  static void hdr_update_peak(struct pass_state *pass)
  {
      const struct pl_render_params *params = pass->params;
-@@ -1246,6 +1356,14 @@ static void hdr_update_peak(struct pass_state *pass)
+@@ -1246,6 +1368,15 @@ static void hdr_update_peak(struct pass_state *pass)
                                 : PL_TONE_MAP_METRIC_STANDARD;
      peak_params.scene_reset = pass->image.scene_cut;
      peak_params.scene_reset_tag = pass->image.scene_cut_tag;
@@ -316,14 +328,15 @@ index bf839c54f17cf427b9523c784882b6fae9906432..ace040c1663c5ea86efb0b8efcbf6f1e
 +    // This tag identifies a transaction for an optional descriptor append;
 +    // it is intentionally excluded from peak parameter equality and cannot
 +    // change peak math or tone-map state.
-+    peak_params.causal_scene_enabled = params->causal_scene_detection ||
-+                                        params->causal_scene_acceleration;
-+    peak_params.causal_scene_acceleration = params->causal_scene_acceleration;
++    const bool causal_eligible = causal_scene_eligible(pass);
++    peak_params.causal_scene_enabled = causal_eligible;
++    peak_params.causal_scene_acceleration = causal_eligible &&
++                                              params->causal_scene_acceleration;
 +    peak_params.causal_scene_tag = pass->image.causal_scene_tag;
      bool ok = pl_shader_detect_peak(img_sh(pass, &pass->img), pass->img.color,
                                      &rr->tone_map_state, &peak_params);
      if (!ok) {
-@@ -1253,7 +1371,6 @@ static void hdr_update_peak(struct pass_state *pass)
+@@ -1253,7 +1384,6 @@ static void hdr_update_peak(struct pass_state *pass)
          rr->errors |= PL_RENDER_ERR_PEAK_DETECT;
          goto cleanup;
      }
@@ -331,7 +344,7 @@ index bf839c54f17cf427b9523c784882b6fae9906432..ace040c1663c5ea86efb0b8efcbf6f1e
      pass->need_peak_fbo = !params->peak_detect_params->allow_delayed;
      return;
  
-@@ -1275,6 +1392,133 @@ bool pl_renderer_get_peak_detect_metrics(
+@@ -1275,6 +1405,137 @@ bool pl_renderer_get_peak_detect_metrics(
      return pl_get_peak_detect_metrics(rr->tone_map_state, metrics);
  }
  
@@ -339,8 +352,12 @@ index bf839c54f17cf427b9523c784882b6fae9906432..ace040c1663c5ea86efb0b8efcbf6f1e
 +{
 +    const struct pl_render_params *params = pass->params;
 +    pl_renderer rr = pass->rr;
-+    if (!params->causal_scene_detection && !params->causal_scene_acceleration)
++    if (!causal_scene_eligible(pass)) {
++        rr->causal_unavailable_valid = false;
++        rr->causal_last_dispatched_valid = false;
++        pl_reset_causal_scene(rr->causal_state);
 +        return;
++    }
 +
 +    // Mixing may enter pass_scale_main more than once for the same decoded
 +    // source tag. A descriptor transaction is source-frame scoped, never an
@@ -465,7 +482,7 @@ index bf839c54f17cf427b9523c784882b6fae9906432..ace040c1663c5ea86efb0b8efcbf6f1e
  struct plane_state {
      enum plane_type type;
      struct pl_plane plane;
-@@ -1515,10 +1759,14 @@ static pl_fmt merge_fmt(struct pass_state *pass, const struct img *a,
+@@ -1515,10 +1776,14 @@ static pl_fmt merge_fmt(struct pass_state *pass, const struct img *a,
  // Applies a series of rough heuristics to figure out whether we expect any
  // performance gains from plane merging. This is basically a series of checks
  // for operations that we *know* benefit from merged planes
@@ -481,7 +498,7 @@ index bf839c54f17cf427b9523c784882b6fae9906432..ace040c1663c5ea86efb0b8efcbf6f1e
      const struct pl_render_params *params = pass->params;
      const pl_renderer rr = pass->rr;
      if (!pass->fbofmt[4])
-@@ -1682,7 +1930,10 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
+@@ -1682,7 +1947,10 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
  #endif // PL_HAVE_DOVI
  
  // This scales and merges all of the source images, and initializes pass->img.
@@ -493,7 +510,7 @@ index bf839c54f17cf427b9523c784882b6fae9906432..ace040c1663c5ea86efb0b8efcbf6f1e
  {
      const struct pl_render_params *params = pass->params;
      struct pl_frame *image = &pass->image;
-@@ -1721,7 +1972,7 @@ static bool pass_read_image(struct pass_state *pass)
+@@ -1721,7 +1989,7 @@ static bool pass_read_image(struct pass_state *pass)
          }
  
          // Deinterlace plane if needed
@@ -502,7 +519,7 @@ index bf839c54f17cf427b9523c784882b6fae9906432..ace040c1663c5ea86efb0b8efcbf6f1e
              pass->fbofmt[4] && !(rr->errors & PL_RENDER_ERR_DEINTERLACING))
          {
              struct img *img = &planes[i].img;
-@@ -1751,7 +2002,7 @@ static bool pass_read_image(struct pass_state *pass)
+@@ -1751,7 +2019,7 @@ static bool pass_read_image(struct pass_state *pass)
          struct plane_state *sti = &planes[i];
          if (!sti->type)
              continue;
@@ -511,7 +528,7 @@ index bf839c54f17cf427b9523c784882b6fae9906432..ace040c1663c5ea86efb0b8efcbf6f1e
              continue;
  
          bool did_merge = false;
-@@ -1833,7 +2084,7 @@ static bool pass_read_image(struct pass_state *pass)
+@@ -1833,7 +2101,7 @@ static bool pass_read_image(struct pass_state *pass)
      // If plane was not merged, convert it alone.
      for (int i = 0; i < image->num_planes; i++) {
          struct plane_state *st = &planes[i];
@@ -520,7 +537,7 @@ index bf839c54f17cf427b9523c784882b6fae9906432..ace040c1663c5ea86efb0b8efcbf6f1e
              continue;
  
          if (st->img.tex && st->img.tex->params.format->type == PL_FMT_UINT) {
-@@ -1898,17 +2149,17 @@ static bool pass_read_image(struct pass_state *pass)
+@@ -1898,17 +2166,17 @@ static bool pass_read_image(struct pass_state *pass)
          // it's reduced in quality after e.g. plane scalers as well. It's also
          // made less effective by performing film grain synthesis first.
  
@@ -541,7 +558,7 @@ index bf839c54f17cf427b9523c784882b6fae9906432..ace040c1663c5ea86efb0b8efcbf6f1e
              st->plane.texture = st->img.tex;
              st->plane_w = st->img.w;
              st->plane_h = st->img.h;
-@@ -1993,8 +2244,12 @@ static bool pass_read_image(struct pass_state *pass)
+@@ -1993,8 +2261,12 @@ static bool pass_read_image(struct pass_state *pass)
              src.tex = img_tex(pass, &st->img);
              st->img.tex = NULL;
              st->img.sh = pl_dispatch_begin_ex(rr->dp, true);
@@ -556,7 +573,7 @@ index bf839c54f17cf427b9523c784882b6fae9906432..ace040c1663c5ea86efb0b8efcbf6f1e
              st->img.err_enum |= PL_RENDER_ERR_SAMPLING;
              st->img.rect.x0 = st->img.rect.y0 = 0.0f;
              st->img.w = st->img.rect.x1 = src.new_w;
-@@ -2002,7 +2257,8 @@ static bool pass_read_image(struct pass_state *pass)
+@@ -2002,7 +2274,8 @@ static bool pass_read_image(struct pass_state *pass)
              src.scale = 1.0;
          }
  
@@ -566,7 +583,7 @@ index bf839c54f17cf427b9523c784882b6fae9906432..ace040c1663c5ea86efb0b8efcbf6f1e
          ident_t sub = sh_subpass(sh, img_sh(pass, &st->img));
          if (!sub) {
              if (!img_tex(pass, &st->img)) {
-@@ -2046,14 +2302,15 @@ static bool pass_read_image(struct pass_state *pass)
+@@ -2046,14 +2319,15 @@ static bool pass_read_image(struct pass_state *pass)
      // Update the reference rect to our adjusted image coordinates
      pass->ref_rect = pass->img.rect;
  
@@ -584,7 +601,7 @@ index bf839c54f17cf427b9523c784882b6fae9906432..ace040c1663c5ea86efb0b8efcbf6f1e
          // Fix bit depth normalization before applying LUT
          float scale = pl_color_repr_normalize(&pass->img.repr);
          GLSL("color *= vec4("$"); \n", SH_FLOAT(scale));
-@@ -2089,18 +2346,20 @@ static bool pass_read_image(struct pass_state *pass)
+@@ -2089,18 +2363,20 @@ static bool pass_read_image(struct pass_state *pass)
  #endif
          pl_shader_decode_color_ex(sh, pl_color_decode_args(
              .repr              = &pass->img.repr,
@@ -608,7 +625,7 @@ index bf839c54f17cf427b9523c784882b6fae9906432..ace040c1663c5ea86efb0b8efcbf6f1e
          pl_shader_set_alpha(sh, &pass->img.repr, PL_ALPHA_INDEPENDENT);
          pl_icc_decode(sh, image->icc, &rr->icc_state[ICC_IMAGE], &pass->img.color);
      }
-@@ -2109,11 +2368,175 @@ static bool pass_read_image(struct pass_state *pass)
+@@ -2109,11 +2385,175 @@ static bool pass_read_image(struct pass_state *pass)
      // bleeding colors from transparent regions into non-transparent regions
      pl_shader_set_alpha(sh, &pass->img.repr, PL_ALPHA_PREMULTIPLIED);
  
@@ -734,6 +751,7 @@ index bf839c54f17cf427b9523c784882b6fae9906432..ace040c1663c5ea86efb0b8efcbf6f1e
 +            pl_dispatch_abort(dp, &plane_sh);
 +            goto error;
 +        }
++        sh_describe(plane_sh, "causal scene source reconstruction");
 +        ident_t sub = sh_subpass(sh, plane_sh);
 +        pl_dispatch_abort(dp, &plane_sh);
 +        if (!sub)
@@ -775,8 +793,7 @@ index bf839c54f17cf427b9523c784882b6fae9906432..ace040c1663c5ea86efb0b8efcbf6f1e
 +
 +static bool pass_read_image(struct pass_state *pass)
 +{
-+    if (pass->params->causal_scene_detection ||
-+        pass->params->causal_scene_acceleration)
++    if (causal_scene_eligible(pass))
 +        causal_extract_source(pass);
 +    bool ok = pass_build_source(pass, true);
 +    return ok;
@@ -785,7 +802,7 @@ index bf839c54f17cf427b9523c784882b6fae9906432..ace040c1663c5ea86efb0b8efcbf6f1e
  static bool pass_scale_main(struct pass_state *pass)
  {
      const struct pl_render_params *params = pass->params;
-@@ -2122,6 +2545,8 @@ static bool pass_scale_main(struct pass_state *pass)
+@@ -2122,6 +2562,8 @@ static bool pass_scale_main(struct pass_state *pass)
      pl_fmt fbofmt = pass->fbofmt[pass->img.comps];
      if (!fbofmt) {
          PL_TRACE(rr, "Skipping main scaler (no FBOs)");
@@ -794,7 +811,7 @@ index bf839c54f17cf427b9523c784882b6fae9906432..ace040c1663c5ea86efb0b8efcbf6f1e
          return true;
      }
  
-@@ -2235,6 +2660,11 @@ static bool pass_scale_main(struct pass_state *pass)
+@@ -2235,6 +2677,11 @@ static bool pass_scale_main(struct pass_state *pass)
  done:
      if (info.dir != SAMPLER_UP)
          hdr_update_peak(pass);
@@ -807,7 +824,7 @@ index bf839c54f17cf427b9523c784882b6fae9906432..ace040c1663c5ea86efb0b8efcbf6f1e
      return true;
  }
 diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
-index 86cad57f64a65be6c63f936875174b529b4c41ea..b93409af718d3ebf01d84d30b6fd38f343130cad 100644
+index 86cad57f..60294bb1 100644
 --- a/src/shaders/colorspace.c
 +++ b/src/shaders/colorspace.c
 @@ -20,8 +20,10 @@
@@ -1153,7 +1170,7 @@ index 86cad57f64a65be6c63f936875174b529b4c41ea..b93409af718d3ebf01d84d30b6fd38f3
      pl_color_space_infer(&csp);
  
      sh_desc(sh, (struct pl_shader_desc) {
-@@ -1997,6 +2229,130 @@ retry_ssbo:
+@@ -1997,6 +2229,131 @@ retry_ssbo:
      return true;
  }
  
@@ -1174,6 +1191,7 @@ index 86cad57f64a65be6c63f936875174b529b4c41ea..b93409af718d3ebf01d84d30b6fd38f3
 +        return false;
 +
 +    pl_shader dsh = pl_dispatch_begin(dp);
++    sh_describe(dsh, "causal scene descriptor reduction");
 +    pl_shader sh = dsh;
 +    struct sh_color_map_obj *obj = SH_OBJ(dsh, state, PL_SHADER_OBJ_COLOR_MAP,
 +                                          struct sh_color_map_obj,
@@ -1284,7 +1302,7 @@ index 86cad57f64a65be6c63f936875174b529b4c41ea..b93409af718d3ebf01d84d30b6fd38f3
  bool pl_get_detected_hdr_metadata(const pl_shader_obj state,
                                    struct pl_hdr_metadata *out)
  {
-@@ -2004,7 +2360,7 @@ bool pl_get_detected_hdr_metadata(const pl_shader_obj state,
+@@ -2004,7 +2361,7 @@ bool pl_get_detected_hdr_metadata(const pl_shader_obj state,
          return false;
  
      struct sh_color_map_obj *obj = state->priv;
@@ -1293,7 +1311,7 @@ index 86cad57f64a65be6c63f936875174b529b4c41ea..b93409af718d3ebf01d84d30b6fd38f3
      if (!obj->peak.avg_pq)
          return false;
  
-@@ -2020,7 +2376,7 @@ bool pl_get_peak_detect_metrics(const pl_shader_obj state,
+@@ -2020,7 +2377,7 @@ bool pl_get_peak_detect_metrics(const pl_shader_obj state,
          return false;
  
      struct sh_color_map_obj *obj = state->priv;
@@ -1302,7 +1320,7 @@ index 86cad57f64a65be6c63f936875174b529b4c41ea..b93409af718d3ebf01d84d30b6fd38f3
      if (!obj->peak.avg_pq)
          return false;
  
-@@ -2043,6 +2399,45 @@ bool pl_get_peak_detect_metrics(const pl_shader_obj state,
+@@ -2043,6 +2400,45 @@ bool pl_get_peak_detect_metrics(const pl_shader_obj state,
      return true;
  }
  
@@ -1348,7 +1366,7 @@ index 86cad57f64a65be6c63f936875174b529b4c41ea..b93409af718d3ebf01d84d30b6fd38f3
  bool pl_get_detected_tone_map_range(const pl_shader_obj state,
                                      enum pl_tone_map_metric metric,
                                      float *max_pq, float *avg_pq)
-@@ -2050,7 +2445,7 @@ bool pl_get_detected_tone_map_range(const pl_shader_obj state,
+@@ -2050,7 +2446,7 @@ bool pl_get_detected_tone_map_range(const pl_shader_obj state,
      if (!state || state->type != PL_SHADER_OBJ_COLOR_MAP)
          return false;
      struct sh_color_map_obj *obj = state->priv;
@@ -1359,7 +1377,7 @@ index 86cad57f64a65be6c63f936875174b529b4c41ea..b93409af718d3ebf01d84d30b6fd38f3
              return false;
 diff --git a/src/tests/causal_test.h b/src/tests/causal_test.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..5d21d29eaf8c6b03cb9772aeafde7bf3a00b6ac3
+index 00000000..5d21d29e
 --- /dev/null
 +++ b/src/tests/causal_test.h
 @@ -0,0 +1,31 @@
@@ -1395,7 +1413,7 @@ index 0000000000000000000000000000000000000000..5d21d29eaf8c6b03cb9772aeafde7bf3
 +bool pl_get_causal_test_descriptors(pl_shader_obj state,
 +                                    struct pl_causal_test_descriptors *out);
 diff --git a/src/tests/gpu_tests.c b/src/tests/gpu_tests.c
-index 965221f58168d408e7141aad69c752f8b2697608..958a2043f6e22c1a9e528f857b735b56d8593f15 100644
+index 965221f5..a14f9eee 100644
 --- a/src/tests/gpu_tests.c
 +++ b/src/tests/gpu_tests.c
 @@ -1,5 +1,6 @@
@@ -1405,7 +1423,7 @@ index 965221f58168d408e7141aad69c752f8b2697608..958a2043f6e22c1a9e528f857b735b56
  
  #include <libplacebo/renderer.h>
  #include <libplacebo/utils/frame_queue.h>
-@@ -1969,6 +1970,417 @@ static void pl_test_host_ptr(pl_gpu gpu)
+@@ -1969,6 +1970,444 @@ static void pl_test_host_ptr(pl_gpu gpu)
  #endif // unix
  }
  
@@ -1444,6 +1462,7 @@ index 965221f58168d408e7141aad69c752f8b2697608..958a2043f6e22c1a9e528f857b735b56
 +        .repr={.sys=PL_COLOR_SYSTEM_RGB,.levels=PL_COLOR_LEVELS_FULL},
 +        .color={.primaries=PL_COLOR_PRIM_BT_2020,.transfer=PL_COLOR_TRC_LINEAR},
 +        .causal_scene_tag=1 };
++    image.color.hdr.max_luma = 10000.0f;
 +    struct pl_frame target = { .num_planes=1, .planes={{.texture=dt,
 +        .components=4, .component_mapping={0,1,2,3}}},
 +        .repr={.sys=PL_COLOR_SYSTEM_RGB,.levels=PL_COLOR_LEVELS_FULL},
@@ -1457,25 +1476,39 @@ index 965221f58168d408e7141aad69c752f8b2697608..958a2043f6e22c1a9e528f857b735b56
 +    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex=dt,.ptr=out)));
 +    REQUIRE_MEMEQ(ref, out, sizeof(ref));
 +    p.causal_scene_detection = true;
-+    // A zero tag must exercise source proxy creation but withhold the reducer.
-+    // This narrows output-invariance regressions to extraction vs. analysis.
++    // Equal HDR source/target spaces are passthrough. The saved request may be
++    // on, but the sidecar must remain completely inactive.
 +    image.causal_scene_tag = 0;
 +    target.planes[0].texture = dt_causal;
 +    REQUIRE(pl_render_image(rr, &image, &target, &p));
 +    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex=dt_causal,.ptr=out)));
 +    REQUIRE_MEMEQ(ref, out, sizeof(ref));
-+    // A normal tagged transaction, including reducer/readback setup, remains
-+    // strictly observational.
 +    image.causal_scene_tag = 1;
 +    REQUIRE(pl_render_image(rr, &image, &target, &p));
 +    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex=dt_causal,.ptr=out)));
 +    REQUIRE_MEMEQ(ref, out, sizeof(ref));
 +
-+    // The private test seam downloads the exact fixed proxy and the completed
-+    // reducer descriptors. This is intentionally not part of libplacebo's API.
 +    float *proxy = malloc(PL_CAUSAL_TEST_PROXY_W * PL_CAUSAL_TEST_PROXY_H * sizeof(*proxy));
 +    struct pl_causal_test_descriptors causal_desc = {0};
 +    REQUIRE(proxy);
++    REQUIRE(!pl_renderer_get_causal_test_data(rr, proxy,
++            PL_CAUSAL_TEST_PROXY_W * PL_CAUSAL_TEST_PROXY_H, &causal_desc));
++
++    // An explicit HDR-to-SDR target activates tone mapping. A normal tagged
++    // transaction, including reducer/readback setup, remains observational.
++    struct pl_frame mapped_target = target;
++    mapped_target.color.transfer = PL_COLOR_TRC_SRGB;
++    mapped_target.color.hdr.max_luma = 80.0f;
++    mapped_target.planes[0].texture = dt;
++    REQUIRE(pl_render_image(rr_ref, &image, &mapped_target, NULL));
++    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex=dt,.ptr=ref)));
++    mapped_target.planes[0].texture = dt_causal;
++    REQUIRE(pl_render_image(rr, &image, &mapped_target, &p));
++    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex=dt_causal,.ptr=out)));
++    REQUIRE_MEMEQ(ref, out, sizeof(ref));
++
++    // The private test seam downloads the exact fixed proxy and completed
++    // reducer descriptors. This is intentionally not part of libplacebo's API.
 +    REQUIRE(pl_renderer_get_causal_test_data(rr, proxy,
 +            PL_CAUSAL_TEST_PROXY_W * PL_CAUSAL_TEST_PROXY_H, &causal_desc));
 +    float hist_sum = 0.0f;
@@ -1561,7 +1594,7 @@ index 965221f58168d408e7141aad69c752f8b2697608..958a2043f6e22c1a9e528f857b735b56
 +    image.field = PL_FIELD_TOP;
 +    image.first_field = PL_FIELD_TOP;
 +    image.causal_scene_tag++;
-+    REQUIRE(pl_render_image(rr, &image, &target, &p));
++    REQUIRE(pl_render_image(rr, &image, &mapped_target, &p));
 +    struct pl_causal_scene_diagnostics d;
 +    REQUIRE(pl_renderer_get_causal_scene_diagnostics(rr, &d));
 +    REQUIRE(d.withheld_reason == PL_CAUSAL_SCENE_WITHHELD_UNSUPPORTED);
@@ -1597,10 +1630,16 @@ index 965221f58168d408e7141aad69c752f8b2697608..958a2043f6e22c1a9e528f857b735b56
 +        .repr={.sys=PL_COLOR_SYSTEM_RGB,.levels=PL_COLOR_LEVELS_FULL},
 +        .color={.primaries=PL_COLOR_PRIM_BT_2020,.transfer=PL_COLOR_TRC_LINEAR},
 +        .causal_scene_tag=1 };
++    image.color.hdr.max_luma = 10000.0f;
 +    struct pl_frame target = { .num_planes=1, .planes={{.texture=dt,
 +        .components=4,.component_mapping={0,1,2,3}}}, .repr=image.repr,
 +        .color=image.color };
++    target.color.transfer = PL_COLOR_TRC_SRGB;
++    target.color.hdr.max_luma = 80.0f;
 +    struct pl_render_params p = pl_render_default_params;
++    // Descriptor-only fixtures deliberately exercise the causal-owned
++    // transaction while static tone mapping is active.
++    p.peak_detect_params = NULL;
 +    p.causal_scene_detection = true;
 +    REQUIRE(pl_render_image(rr, &image, &target, &p));
 +    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(.tex=dt,.ptr=out)));
@@ -1653,9 +1692,15 @@ index 965221f58168d408e7141aad69c752f8b2697608..958a2043f6e22c1a9e528f857b735b56
 +        .repr={.sys=PL_COLOR_SYSTEM_RGB,.levels=PL_COLOR_LEVELS_FULL},
 +        .color={.primaries=PL_COLOR_PRIM_BT_2020,.transfer=PL_COLOR_TRC_LINEAR},
 +        .causal_scene_tag=tag };
++    image.color.hdr.max_luma = 10000.0f;
 +    struct pl_frame target = { .num_planes=1, .planes={{.texture=dt,
 +        .components=4,.component_mapping={0,1,2,3}}}, .repr=image.repr,.color=image.color };
++    target.color.transfer = PL_COLOR_TRC_SRGB;
++    target.color.hdr.max_luma = 80.0f;
 +    struct pl_render_params p = pl_render_default_params;
++    // Descriptor-only fixtures deliberately exercise the causal-owned
++    // transaction while static tone mapping is active.
++    p.peak_detect_params = NULL;
 +    p.causal_scene_detection = true;
 +    bool ok = st && dt && rr && pl_render_image(rr, &image, &target, &p) &&
 +        pl_renderer_get_causal_test_data(rr, proxy, W * H, out);
@@ -1823,7 +1868,7 @@ index 965221f58168d408e7141aad69c752f8b2697608..958a2043f6e22c1a9e528f857b735b56
  void gpu_shader_tests(pl_gpu gpu)
  {
      pl_buffer_tests(gpu);
-@@ -1979,6 +2391,11 @@ void gpu_shader_tests(pl_gpu gpu)
+@@ -1979,6 +2418,11 @@ void gpu_shader_tests(pl_gpu gpu)
      pl_render_tests(gpu);
      pl_render_bits_tests(gpu);
      pl_ycbcr_tests(gpu);
