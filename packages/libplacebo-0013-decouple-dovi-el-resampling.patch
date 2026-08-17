@@ -1,82 +1,33 @@
-From 609039c0f2bc8c8f8020a95e4a3d025ea9d714d9 Mon Sep 17 00:00:00 2001
+From 0c701ace59ba2306ff880296c73e69e1f1085c43 Mon Sep 17 00:00:00 2001
 From: mpv-sk <mpv-sk@localhost>
 Date: Sun, 16 Aug 2026 21:27:38 -0400
-Subject: [PATCH] renderer: decouple Dolby Vision EL resampling from the chroma
- scaler
+Subject: [PATCH] renderer: use staged Dolby Vision EL reference resampling
 
-`sample_el()` upsamples enhancement layer planes through `dispatch_sampler`
-with `SAMPLER_PLANE`, so they inherit `plane_upscaler` -- the chroma scaler.
-That is the wrong signal class. The EL is a quantized residual that is
-consumed by `sh_dovi_compose_nlq` *before* the inverse non-linear quantizer,
-so overshoot introduced while resampling it in the coded domain is amplified
-asymmetrically by the dequantizer instead of merely softening an edge. A
-sharpened or EWA chroma filter (mpv's `--cscale=ewa_lanczossharp`, for
-example) is therefore applied to a signal the encoder never expected it on:
-the reference decoder assumes a short, fixed, linear-phase resampler.
-
-Give EL planes their own sampler selection (`SAMPLER_EL`) and a new
-`pl_render_params.el_upscaler`, where NULL selects a built-in default rather
-than `plane_upscaler`.
-
-The default is the reference resampler of ETSI GS CCM 001 V1.1.1 (2017-02)
-annex B, added as `pl_filter_dovi_el`. Annex B specifies two different FIRs,
-because the EL grid is co-sited horizontally and centered vertically relative
-to the BL grid -- exactly the siting `sample_el()` already applies:
-
-  B.2 SPATIAL_RESAMPLING_FILTER_H (annex B.3 reuses it for all EL components):
-    r[2n]   = y[n]
-    r[2n+1] = (22 y[n-3] + 94 y[n-2] - 524 y[n-1] + 2456 y[n]
-             + 2456 y[n+1] - 524 y[n+2] + 94 y[n+3] + 22 y[n+4] + 2048) >> 12
-
-  B.3 vertical EL filter, cmp == 0:
-    r[2n]   = (- 3 y[n-2] + 29 y[n-1] + 111 y[n] -  9 y[n+1] + 64) >> 7
-    r[2n+1] = (- 9 y[n-1] + 111 y[n] +  29 y[n+1] -  3 y[n+2] + 64) >> 7
-
-At a dyadic 2x ratio those two filters sample the kernel at disjoint tap
-distances -- {0, 1, 2, 3, 4} and {0.5, 1.5, 2.5, 3.5} for the co-sited
-horizontal phases, {0.25, 0.75, 1.25, 1.75} and {2.25, 2.75, 3.25, 3.75} for
-the centered vertical phases. A single radius-4 kernel defined by linear
-interpolation through the tabulated values therefore reproduces *both*
-reference FIRs exactly, and both phase sets already sum to 1 so the energy
-renormalization in `compute_row()` is a no-op. Verified numerically against
-`compute_row()`: exact at the kernel level, and within 6.4e-4 worst-case tap
-weight through the 256-entry polyphase LUT (less than one 10-bit code), which
-is the same quantization every other separable filter is subject to.
-
-The kernel is only meaningful at exactly 2x, so it is deliberately not
-registered in `pl_filter_configs[]` / `pl_filter_functions[]`, and the
-selection falls back to `pl_filter_bilinear` at any other ratio. That case is
-real: for 4:2:0 content the subsampled EL chroma planes are resampled 4x in a
-single step directly onto the luma grid, which is outside annex B's model
-(the reference pipeline resamples the EL 2x and chroma-upsamples separately).
-
-Frames without an enhancement layer never reach this code, so MEL and
-non-Dolby-Vision content are unaffected.
 ---
- meson.build                       |  1 +
- src/filters.c                     | 72 +++++++++++++++++++++++++++++++
- src/include/libplacebo/filters.h  | 10 +++++
- src/include/libplacebo/renderer.h | 17 ++++++++
- src/renderer.c                    | 25 +++++++++--
- 5 files changed, 122 insertions(+), 3 deletions(-)
+ meson.build                      |   1 +
+ src/filters.c                    | 123 +++++++++++++++++++++++++++
+ src/include/libplacebo/filters.h |  12 +++
+ src/renderer.c                   | 138 ++++++++++++++++++++++++++-----
+ src/tests/filters.c              |  18 ++++
+ 5 files changed, 271 insertions(+), 21 deletions(-)
 
 diff --git a/meson.build b/meson.build
-index d73bbfbc..f2b8b1bd 100644
+index d73bbfbc..2d675a07 100644
 --- a/meson.build
 +++ b/meson.build
 @@ -12,6 +12,7 @@ project('libplacebo', ['c', 'cpp'],
      7,
      # API version
      {
-+      '374': 'add pl_render_params.el_upscaler and pl_filter_dovi_el',
++      '374': 'add reference Dolby Vision EL spatial resampling filters',
        '373': 'add BT.2020 perceptual detector tone-map range',
        '372': 'add pl_{renderer_,}get_peak_detect_metrics',
        '371': 'input frame.hdr.max_luma is now respecte when frame has ICC profile',
 diff --git a/src/filters.c b/src/filters.c
-index 0cbc5731..6693fa5f 100644
+index 0cbc5731..9cc06e7e 100644
 --- a/src/filters.c
 +++ b/src/filters.c
-@@ -601,6 +601,67 @@ const struct pl_filter_function pl_filter_function_spline64 = {
+@@ -601,6 +601,110 @@ const struct pl_filter_function pl_filter_function_spline64 = {
      .radius = 4.0,
  };
  
@@ -141,10 +92,53 @@ index 0cbc5731..6693fa5f 100644
 +    .radius = 4.0,
 +};
 +
++// Chroma uses the same horizontal filter as luma, but B.3 specifies a
++// different vertical filter for cmp 1 and 2:
++//
++//   r[2n]   = ( 64 y[n-1] + 192 y[n]   + 128) >> 8
++//   r[2n+1] = (192 y[n]   +  64 y[n+1] + 128) >> 8
++//
++// Horizontal and vertical phases occupy disjoint quarter-sample nodes, so one
++// kernel reproduces both separable reference stages exactly.
++static double dovi_el_chroma(const struct pl_filter_ctx *f, double x)
++{
++    static const double nodes[17] = {
++        [0]  = 1.0,             // 0.00  horizontal, r[2n] = y[n]
++        [1]  = 192 / 256.0,     // 0.25  vertical chroma
++        [2]  = 2456 / 4096.0,   // 0.50  horizontal
++        [3]  =  64 / 256.0,     // 0.75  vertical chroma
++        [4]  = 0.0,             // 1.00  horizontal
++        [5]  = 0.0,             // 1.25  vertical chroma
++        [6]  = -524 / 4096.0,   // 1.50  horizontal
++        [7]  = 0.0,             // 1.75  vertical chroma
++        [8]  = 0.0,             // 2.00  horizontal
++        [9]  = 0.0,             // 2.25  vertical chroma
++        [10] =   94 / 4096.0,   // 2.50  horizontal
++        [11] = 0.0,             // 2.75  vertical chroma
++        [12] = 0.0,             // 3.00  horizontal
++        [13] = 0.0,             // 3.25  vertical chroma
++        [14] =   22 / 4096.0,   // 3.50  horizontal
++        [15] = 0.0,             // 3.75  vertical chroma
++        [16] = 0.0,             // 4.00  horizontal
++    };
++
++    const double t = x * 4.0;
++    const int i = (int) t;
++    if (i >= 16)
++        return 0.0;
++    return nodes[i] + (t - i) * (nodes[i + 1] - nodes[i]);
++}
++
++const struct pl_filter_function pl_filter_function_dovi_el_chroma = {
++    .name   = "dovi_el_chroma",
++    .weight = dovi_el_chroma,
++    .radius = 4.0,
++};
++
  static double oversample(const struct pl_filter_ctx *f, double x)
  {
      return 0.0;
-@@ -703,6 +764,17 @@ const struct pl_filter_config pl_filter_box = {
+@@ -703,6 +807,25 @@ const struct pl_filter_config pl_filter_box = {
      .recommended = PL_FILTER_DOWNSCALING,
  };
  
@@ -159,14 +153,22 @@ index 0cbc5731..6693fa5f 100644
 +    .recommended = PL_FILTER_UPSCALING,
 +};
 +
++const struct pl_filter_config pl_filter_dovi_el_chroma = {
++    .name        = "dovi_el_chroma",
++    .description = "Dolby Vision EL chroma resampling (ETSI GS CCM 001 annex B)",
++    .kernel      = &pl_filter_function_dovi_el_chroma,
++    .allowed     = PL_FILTER_UPSCALING,
++    .recommended = PL_FILTER_UPSCALING,
++};
++
  const struct pl_filter_config pl_filter_bilinear = {
      .name        = "bilinear",
      .description = "Bilinear",
 diff --git a/src/include/libplacebo/filters.h b/src/include/libplacebo/filters.h
-index 248f7bbb..8392c4aa 100644
+index 248f7bbb..3542b116 100644
 --- a/src/include/libplacebo/filters.h
 +++ b/src/include/libplacebo/filters.h
-@@ -160,6 +160,13 @@ PL_API extern const struct pl_filter_function pl_filter_function_spline64;
+@@ -160,6 +160,14 @@ PL_API extern const struct pl_filter_function pl_filter_function_spline64;
  // nearest neighbour sampling. (See `pl_shader_sample_oversample`)
  PL_API extern const struct pl_filter_function pl_filter_function_oversample;
  
@@ -176,70 +178,53 @@ index 248f7bbb..8392c4aa 100644
 +// a general-purpose scaler, and is deliberately absent from
 +// `pl_filter_functions[]` and the filter presets.
 +PL_API extern const struct pl_filter_function pl_filter_function_dovi_el;
++PL_API extern const struct pl_filter_function pl_filter_function_dovi_el_chroma;
 +
  // A list of built-in filter functions, terminated by NULL
  //
  // Note: May contain extra aliases for the above functions.
-@@ -297,6 +304,9 @@ PL_API extern const struct pl_filter_config pl_filter_ewa_robidoux;
+@@ -297,6 +305,10 @@ PL_API extern const struct pl_filter_config pl_filter_ewa_robidoux;
  PL_API extern const struct pl_filter_config pl_filter_ewa_robidouxsharp;
  // Special/opaque filters
  PL_API extern const struct pl_filter_config pl_filter_oversample;
 +// Special-geometry filters (see `pl_filter_function_dovi_el`); not listed in
 +// `pl_filter_configs[]`.
 +PL_API extern const struct pl_filter_config pl_filter_dovi_el;
++PL_API extern const struct pl_filter_config pl_filter_dovi_el_chroma;
  
  // Backwards compatibility
  #define pl_filter_triangle          pl_filter_bilinear
-diff --git a/src/include/libplacebo/renderer.h b/src/include/libplacebo/renderer.h
-index 74140f9d..926c5bee 100644
---- a/src/include/libplacebo/renderer.h
-+++ b/src/include/libplacebo/renderer.h
-@@ -156,6 +156,23 @@ struct pl_render_params {
-     const struct pl_filter_config *plane_upscaler;
-     const struct pl_filter_config *plane_downscaler;
- 
-+    // If set, this overrides the scaler used to upsample Dolby Vision
-+    // enhancement layer planes (`pl_frame.enhancement_layer`) onto the base
-+    // layer grid.
-+    //
-+    // A value of NULL selects the built-in EL default, which is deliberately
-+    // *not* `plane_upscaler`: the EL is a quantized residual consumed before
-+    // the inverse non-linear quantizer, so overshoot introduced in the coded
-+    // domain is amplified asymmetrically by the dequantizer. The built-in
-+    // default uses `pl_filter_dovi_el` (the ETSI GS CCM 001 annex B reference
-+    // resampler) for the exact 2x case it is defined for, and
-+    // `pl_filter_bilinear` for any other ratio, such as the single-step 4x
-+    // resample of a subsampled EL chroma plane onto the luma grid.
-+    //
-+    // To restore the historical behaviour of following `plane_upscaler`, set
-+    // this to the same value.
-+    const struct pl_filter_config *el_upscaler;
-+
-     // The anti-ringing strength to apply to filters. See the equivalent option
-     // in `pl_sample_filter_params` for more information.
-     float antiringing_strength;
 diff --git a/src/renderer.c b/src/renderer.c
-index 63280ecd..ecace107 100644
+index 63280ecd..55e470d4 100644
 --- a/src/renderer.c
 +++ b/src/renderer.c
-@@ -614,6 +614,7 @@ enum sampler_dir {
+@@ -614,9 +614,16 @@ enum sampler_dir {
  enum sampler_usage {
      SAMPLER_MAIN,
      SAMPLER_PLANE,
-+    SAMPLER_EL,     // Dolby Vision enhancement layer plane
++    SAMPLER_EL_LUMA,   // Dolby Vision enhancement layer luma spatial stage
++    SAMPLER_EL_CHROMA, // Dolby Vision enhancement layer chroma spatial stage
      SAMPLER_LOWPASS,
  };
  
-@@ -660,14 +661,32 @@ static struct sampler_info sample_src_info(struct pass_state *pass,
++static inline bool sampler_is_el(enum sampler_usage usage)
++{
++    return usage == SAMPLER_EL_LUMA || usage == SAMPLER_EL_CHROMA;
++}
++
+ struct sampler_info {
+     const struct pl_filter_config *config; // if applicable
+     enum sampler_usage usage;
+@@ -660,14 +667,32 @@ static struct sampler_info sample_src_info(struct pass_state *pass,
      case SAMPLER_DOWN:
          if (usage == SAMPLER_LOWPASS) {
              info.config = &pl_filter_bicubic;
 -        } else if (usage == SAMPLER_PLANE && params->plane_downscaler) {
-+        } else if ((usage == SAMPLER_PLANE || usage == SAMPLER_EL) &&
++        } else if ((usage == SAMPLER_PLANE || sampler_is_el(usage)) &&
 +                   params->plane_downscaler)
 +        {
 +            // An enhancement layer is never larger than its base layer, so
-+            // this is unreachable for `SAMPLER_EL` in practice.
++            // this is unreachable for EL spatial stages in practice.
              info.config = params->plane_downscaler;
          } else {
              info.config = params->downscaler;
@@ -247,32 +232,182 @@ index 63280ecd..ecace107 100644
          break;
      case SAMPLER_UP:
 -        if (usage == SAMPLER_PLANE && params->plane_upscaler) {
-+        if (usage == SAMPLER_EL) {
++        if (sampler_is_el(usage)) {
 +            // The enhancement layer is a quantized residual, consumed before
-+            // the inverse NLQ; it must not follow the (possibly sharpened or
-+            // EWA) chroma scaler. Use the ETSI GS CCM 001 annex B reference
-+            // resampler for the dyadic 2x geometry it is defined for, and a
-+            // plain linear filter otherwise (e.g. a subsampled EL chroma plane
-+            // resampled 4x directly onto the luma grid).
-+            if (params->el_upscaler) {
-+                info.config = params->el_upscaler;
-+            } else if (fabsf(rx - 2.0f) < 1e-4f && fabsf(ry - 2.0f) < 1e-4f) {
-+                info.config = &pl_filter_dovi_el;
++            // inverse NLQ. Its mandated dyadic spatial reconstruction must be
++            // independent of user image/chroma scaling. Luma and chroma use
++            // different vertical FIRs in ETSI GS CCM 001 annex B.
++            if (fabsf(rx - 2.0f) < 1e-4f && fabsf(ry - 2.0f) < 1e-4f) {
++                info.config = usage == SAMPLER_EL_LUMA
++                            ? &pl_filter_dovi_el
++                            : &pl_filter_dovi_el_chroma;
 +            } else {
++                // Annex B defines only the dyadic stage. This internal fallback
++                // keeps unusual/non-conforming geometry renderable.
 +                info.config = &pl_filter_bilinear;
 +            }
 +        } else if (usage == SAMPLER_PLANE && params->plane_upscaler) {
              info.config = params->plane_upscaler;
          } else {
              pl_assert(usage != SAMPLER_LOWPASS);
-@@ -1922,7 +1941,7 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
+@@ -1891,8 +1916,10 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
+         if (!plane->texture)
+             continue;
+ 
+-        // Sample this plane straight from the base layer `crop`, with both
+-        // chroma and layer sitings folded in, for correct alignment.
++        bool is_luma = false;
++        for (int c = 0; c < plane->components; c++)
++            is_luma |= plane->component_mapping[c] == PL_CHANNEL_Y;
++
+         float rx = (float) plane->texture->params.w / el_ref->params.w,
+               ry = (float) plane->texture->params.h / el_ref->params.h;
+         float rrx = rlx * (rx >= 1 ? roundf(rx) : 1.0 / roundf(1.0 / rx)),
+@@ -1900,19 +1927,92 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
+         float sx = layer_x + plane->shift_x / rlx,
+               sy = layer_y + plane->shift_y / rly;
+ 
+-        struct pl_sample_src src = {
+-            .tex          = plane->texture,
+-            .components   = plane->components,
+-            .address_mode = plane->address_mode,
+-            .new_w        = pass->img.w,
+-            .new_h        = pass->img.h,
+-            .rect = {
+-                .x0 = (bl_crop.x0 - sx) * rrx,
+-                .y0 = (bl_crop.y0 - sy) * rry,
+-                .x1 = (bl_crop.x1 - sx) * rrx,
+-                .y1 = (bl_crop.y1 - sy) * rry,
+-            },
+-        };
++        pl_shader plane_sh = pl_dispatch_begin_ex(rr->dp, true);
++        struct pl_sample_src src;
++
++        // Standard Profile 7 EL geometry is reconstructed in two explicit
++        // stages. First apply the normative 2x spatial FIR on the EL's own
++        // component grid. For 4:2:0 chroma this produces a 1920x1080 chroma
++        // grid, rather than incorrectly treating it as a generic 4x resize.
++        bool reference_geometry = fabsf(rlx - 0.5f) < 1e-6f &&
++                                  fabsf(rly - 0.5f) < 1e-6f;
++        if (reference_geometry) {
++            int spatial_w = lroundf(plane->texture->params.w / rlx);
++            int spatial_h = lroundf(plane->texture->params.h / rly);
++            struct pl_sample_src spatial_src = {
++                .tex          = plane->texture,
++                .components   = plane->components,
++                .address_mode = plane->address_mode,
++                .new_w        = spatial_w,
++                .new_h        = spatial_h,
++                .rect = {
++                    .x0 = -layer_x * rx * rlx,
++                    .y0 = -layer_y * ry * rly,
++                    .x1 = plane->texture->params.w - layer_x * rx * rlx,
++                    .y1 = plane->texture->params.h - layer_y * ry * rly,
++                },
++            };
++
++            dispatch_sampler(pass, plane_sh, &rr->samplers_el[i],
++                             is_luma ? SAMPLER_EL_LUMA : SAMPLER_EL_CHROMA,
++                             NULL, &spatial_src);
++
++            struct img spatial = {
++                .sh    = plane_sh,
++                .w     = spatial_w,
++                .h     = spatial_h,
++                .comps = plane->components,
++            };
++            pl_tex spatial_tex = img_tex(pass, &spatial);
++            if (!spatial_tex) {
++                pl_dispatch_abort(rr->dp, &sh);
++                return NULL;
++            }
++
++            // Then reconstruct the component grid onto the full decoded
++            // image grid. This is chroma reconstruction, not another EL
++            // spatial filter, so use conservative bilinear sampling.
++            plane_sh = pl_dispatch_begin_ex(rr->dp, true);
++            src = (struct pl_sample_src) {
++                .tex          = spatial_tex,
++                .components   = plane->components,
++                .address_mode = plane->address_mode,
++                .new_w        = pass->img.w,
++                .new_h        = pass->img.h,
++                .rect = {
++                    .x0 = (bl_crop.x0 - plane->shift_x / rlx) * rx,
++                    .y0 = (bl_crop.y0 - plane->shift_y / rly) * ry,
++                    .x1 = (bl_crop.x1 - plane->shift_x / rlx) * rx,
++                    .y1 = (bl_crop.y1 - plane->shift_y / rly) * ry,
++                },
++            };
++            if (!pl_shader_sample_bilinear(plane_sh, &src)) {
++                pl_dispatch_abort(rr->dp, &plane_sh);
++                pl_dispatch_abort(rr->dp, &sh);
++                return NULL;
++            }
++        } else {
++            // No reference filter is defined for non-dyadic geometry. Preserve
++            // alignment and render it with an internal linear fallback.
++            src = (struct pl_sample_src) {
++                .tex          = plane->texture,
++                .components   = plane->components,
++                .address_mode = plane->address_mode,
++                .new_w        = pass->img.w,
++                .new_h        = pass->img.h,
++                .rect = {
++                    .x0 = (bl_crop.x0 - sx) * rrx,
++                    .y0 = (bl_crop.y0 - sy) * rry,
++                    .x1 = (bl_crop.x1 - sx) * rrx,
++                    .y1 = (bl_crop.y1 - sy) * rry,
++                },
++            };
++            if (!pl_shader_sample_bilinear(plane_sh, &src)) {
++                pl_dispatch_abort(rr->dp, &plane_sh);
++                pl_dispatch_abort(rr->dp, &sh);
++                return NULL;
++            }
++        }
+ 
+         PL_TRACE(rr, "EL plane %d: %dx%d -> %dx%d (EL ref %dx%d, BL ref %dx%d) "
+                  "shift {%.3f %.3f} rect {%.3f %.3f %.3f %.3f}",
+@@ -1921,10 +2021,6 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
+                  ref_tex->params.w, ref_tex->params.h, sx, sy,
                   src.rect.x0, src.rect.y0, src.rect.x1, src.rect.y1);
  
-         pl_shader plane_sh = pl_dispatch_begin_ex(rr->dp, true);
+-        pl_shader plane_sh = pl_dispatch_begin_ex(rr->dp, true);
 -        dispatch_sampler(pass, plane_sh, &rr->samplers_el[i], SAMPLER_PLANE,
-+        dispatch_sampler(pass, plane_sh, &rr->samplers_el[i], SAMPLER_EL,
-                          NULL, &src);
- 
+-                         NULL, &src);
+-
          ident_t sub = sh_subpass(sh, plane_sh);
+         pl_dispatch_abort(rr->dp, &plane_sh);
+         if (!sub) {
+diff --git a/src/tests/filters.c b/src/tests/filters.c
+index 89e7820a..9450e3f7 100644
+--- a/src/tests/filters.c
++++ b/src/tests/filters.c
+@@ -6,6 +6,24 @@ int main()
+ {
+     pl_log log = pl_test_logger();
+ 
++    // The Dolby Vision EL filters are deliberately private to the renderer's
++    // exact 2x spatial stage, so they are not in the general filter lists.
++    // Freeze the ETSI GS CCM 001 annex B phase weights explicitly here.
++    REQUIRE_FEQ(pl_filter_sample(&pl_filter_dovi_el, 0.00), 1.0, 1e-12);
++    REQUIRE_FEQ(pl_filter_sample(&pl_filter_dovi_el, 0.25), 111.0 / 128.0, 1e-12);
++    REQUIRE_FEQ(pl_filter_sample(&pl_filter_dovi_el, 0.50), 2456.0 / 4096.0, 1e-12);
++    REQUIRE_FEQ(pl_filter_sample(&pl_filter_dovi_el, 0.75), 29.0 / 128.0, 1e-12);
++    REQUIRE_FEQ(pl_filter_sample(&pl_filter_dovi_el, 1.25), -9.0 / 128.0, 1e-12);
++    REQUIRE_FEQ(pl_filter_sample(&pl_filter_dovi_el, 1.50), -524.0 / 4096.0, 1e-12);
++    REQUIRE_FEQ(pl_filter_sample(&pl_filter_dovi_el, 1.75), -3.0 / 128.0, 1e-12);
++
++    REQUIRE_FEQ(pl_filter_sample(&pl_filter_dovi_el_chroma, 0.00), 1.0, 1e-12);
++    REQUIRE_FEQ(pl_filter_sample(&pl_filter_dovi_el_chroma, 0.25), 192.0 / 256.0, 1e-12);
++    REQUIRE_FEQ(pl_filter_sample(&pl_filter_dovi_el_chroma, 0.50), 2456.0 / 4096.0, 1e-12);
++    REQUIRE_FEQ(pl_filter_sample(&pl_filter_dovi_el_chroma, 0.75), 64.0 / 256.0, 1e-12);
++    REQUIRE_FEQ(pl_filter_sample(&pl_filter_dovi_el_chroma, 1.25), 0.0, 1e-12);
++    REQUIRE_FEQ(pl_filter_sample(&pl_filter_dovi_el_chroma, 1.50), -524.0 / 4096.0, 1e-12);
++
+     for (int i = 0; i < pl_num_filter_functions; i++) {
+         const struct pl_filter_function *fun = pl_filter_functions[i];
+         if (fun->opaque)
 -- 
 2.54.0.windows.1
