@@ -1,0 +1,109 @@
+From 5d6221eb088aeebda3e0e8c86657856972c5d939 Mon Sep 17 00:00:00 2001
+From: mpv-sk <mpv-sk@localhost>
+Date: Sun, 16 Aug 2026 21:27:39 -0400
+Subject: [PATCH] vo_gpu_next: add --dovi-el-scaler
+
+libplacebo used to upsample Dolby Vision enhancement layer planes with
+`plane_upscaler`, which vo_gpu_next maps from `--cscale`. The enhancement
+layer is a quantized residual consumed before the inverse non-linear
+quantizer, so ringing introduced while resampling it is amplified
+asymmetrically by the dequantizer rather than merely softening an edge; it
+should not follow the chroma scaler.
+
+libplacebo now exposes `pl_render_params.el_upscaler` with its own default
+(the ETSI GS CCM 001 annex B reference resampler for the 2x case that
+specification defines, bilinear otherwise). Expose that as
+`--dovi-el-scaler=<default|bilinear|cscale>`, defaulting to `default`.
+`cscale` restores the previous behaviour so the two can be compared directly.
+
+Requires libplacebo API version 374.
+---
+ DOCS/man/options.rst    | 19 +++++++++++++++++++
+ video/out/vo_gpu_next.c | 25 +++++++++++++++++++++++++
+ 2 files changed, 44 insertions(+)
+
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index 41e6f4768..907af31ac 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -7859,6 +7859,25 @@ them.
+     frame without seeking or decoding it again. This option affects only the
+     ``gpu-next`` video output and does not disable enhancement-layer decoding.
+ 
++``--dovi-el-scaler=<default|bilinear|cscale>``
++    Filter used to upsample Dolby Vision enhancement layer planes onto the base
++    layer grid (default: ``default``).
++
++    The enhancement layer is a quantized residual that is consumed before the
++    inverse non-linear quantizer, so overshoot introduced while resampling it
++    is amplified asymmetrically by the dequantizer rather than simply softened.
++    It therefore does not follow ``--cscale``.
++
++    :default:  Let libplacebo choose. It reproduces the reference
++               enhancement-layer resampler of ETSI GS CCM 001 annex B for the
++               2x luma case that specification defines, and uses bilinear for
++               any other ratio, such as a subsampled enhancement-layer chroma
++               plane resampled directly onto the luma grid.
++    :bilinear: Use bilinear for every enhancement layer plane.
++    :cscale:   Legacy behaviour: follow ``--cscale``, for A/B comparison.
++
++    (Only for ``--vo=gpu-next``)
++
+ ``--hdr-authored-scene-reset=<yes|no>``
+     When measured HDR peak detection is active, reset its temporal smoothing at
+     authored scene boundaries. Dolby Vision uses the RPU scene refresh flag.
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 1e3ea02d1..14403cf4c 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -184,9 +184,16 @@ struct priv {
+ static void update_render_options(struct vo *vo);
+ static void update_lut(struct priv *p, struct user_lut *lut);
+ 
++enum {
++    DOVI_EL_SCALER_DEFAULT = 0, // libplacebo's enhancement-layer default
++    DOVI_EL_SCALER_BILINEAR,
++    DOVI_EL_SCALER_CSCALE,      // legacy behaviour: follow --cscale
++};
++
+ struct gl_next_opts {
+     bool delayed_peak;
+     bool dovi_enhancement_layer;
++    int dovi_el_scaler;
+     bool causal_scene_diagnostics;
+     bool causal_scene_acceleration;
+     bool authored_scene_reset;
+@@ -223,6 +230,10 @@ const struct m_sub_options gl_next_conf = {
+             {"video", -1}, {"video-static", -2}, {"video-dynamic", -3}),  M_RANGE(10, 10000)},
+         {"allow-delayed-peak-detect", OPT_BOOL(delayed_peak)},
+         {"dovi-enhancement-layer", OPT_BOOL(dovi_enhancement_layer)},
++        {"dovi-el-scaler", OPT_CHOICE(dovi_el_scaler,
++            {"default",  DOVI_EL_SCALER_DEFAULT},
++            {"bilinear", DOVI_EL_SCALER_BILINEAR},
++            {"cscale",   DOVI_EL_SCALER_CSCALE})},
+         // Hidden Stage 1 instrumentation. This collects descriptors only and
+         // must never alter tone-map state or rendered output.
+         {"hdr-causal-scene-diagnostics", OPT_BOOL(causal_scene_diagnostics), M_OPT_NOCFG},
+@@ -3101,6 +3112,20 @@ static void update_render_options(struct vo *vo)
+     pars->params.upscaler = map_scaler(p, SCALER_SCALE);
+     pars->params.downscaler = map_scaler(p, SCALER_DSCALE);
+     pars->params.plane_upscaler = map_scaler(p, SCALER_CSCALE);
++
++    // The Dolby Vision enhancement layer is a quantized residual, so by
++    // default it does not follow the chroma scaler.
++    switch (p->next_opts->dovi_el_scaler) {
++    case DOVI_EL_SCALER_BILINEAR:
++        pars->params.el_upscaler = &pl_filter_bilinear;
++        break;
++    case DOVI_EL_SCALER_CSCALE:
++        pars->params.el_upscaler = pars->params.plane_upscaler;
++        break;
++    default:
++        pars->params.el_upscaler = NULL;
++        break;
++    }
+     pars->params.frame_mixer = opts->interpolation ? map_scaler(p, SCALER_TSCALE) : NULL;
+ 
+     // Request as many frames as required from the decoder, depending on the
+-- 
+2.54.0.windows.1
