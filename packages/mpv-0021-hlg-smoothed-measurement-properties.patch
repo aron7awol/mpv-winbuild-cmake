@@ -1,0 +1,54 @@
+From bcb2e92a734a423b362bd7d966ef0734f89ef746 Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Mon, 17 Aug 2026 21:33:59 -0400
+Subject: [PATCH] vo_gpu_next: expose smoothed peak measurement stats
+
+---
+ player/command.c        | 4 ++++
+ video/mp_image.h        | 2 ++
+ video/out/vo_gpu_next.c | 2 ++
+ 3 files changed, 8 insertions(+)
+
+diff --git a/player/command.c b/player/command.c
+index 4a5bcfcd8..1d706af82 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -2595,6 +2595,10 @@ static int property_imgparams(const struct mp_image_params *p, int action, void
+                             .unavailable = !peak->valid},
+         {"raw-avg-pq-y", SUB_PROP_FLOAT(peak->raw_avg_pq_y),
+                             .unavailable = !peak->valid},
++        {"smoothed-max-pq-y", SUB_PROP_FLOAT(peak->smoothed_max_pq_y),
++                            .unavailable = !peak->valid},
++        {"smoothed-avg-pq-y", SUB_PROP_FLOAT(peak->smoothed_avg_pq_y),
++                            .unavailable = !peak->valid},
+         {"raw-max-rgb-nits", SUB_PROP_FLOAT(peak->raw_max_rgb),
+                             .unavailable = !peak->valid},
+         {"raw-avg-rgb-nits", SUB_PROP_FLOAT(peak->raw_avg_rgb),
+diff --git a/video/mp_image.h b/video/mp_image.h
+index ccc620098..67da683c4 100644
+--- a/video/mp_image.h
++++ b/video/mp_image.h
+@@ -67,6 +67,8 @@ struct mp_peak_detect_metrics {
+     uint64_t scene_reset_count;
+     float raw_max_pq_y;         // percentile CIE Y peak, PQ 0-1
+     float raw_avg_pq_y;         // average CIE Y, PQ 0-1
++    float smoothed_max_pq_y;    // CIE Y peak after temporal smoothing, PQ 0-1
++    float smoothed_avg_pq_y;    // CIE Y average after temporal smoothing, PQ 0-1
+     float raw_max_rgb;          // percentile maxRGB peak, cd/m^2
+     float raw_avg_rgb;          // average maxRGB, cd/m^2
+     float raw_max_tone_metric;       // percentile private-metric peak
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 1e3ea02d1..6f2fd0907 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -1848,6 +1848,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+                 .scene_reset_count   = metrics.scene_reset_count,
+                 .raw_max_pq_y        = metrics.raw_max_pq_y,
+                 .raw_avg_pq_y        = metrics.raw_avg_pq_y,
++                .smoothed_max_pq_y   = metrics.smoothed_max_pq_y,
++                .smoothed_avg_pq_y   = metrics.smoothed_avg_pq_y,
+                 .raw_max_rgb         = metrics.raw_max_rgb,
+                 .raw_avg_rgb         = metrics.raw_avg_rgb,
+                 .raw_max_tone_metric      = metrics.raw_max_metric,
+-- 
+2.54.0.windows.1

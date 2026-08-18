@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mpv-sk <mpv-sk@local>
+Date: Mon, 17 Aug 2026 00:00:00 -0400
+Subject: [PATCH] colorspace: use Dolby Vision fixed-point normalization
+
+ETSI GS CCM 001 defines Dolby Vision reshaping samples and pivots in the
+S / 2^bit_depth domain. Converting full-range carriers through the usual
+UNORM MAX_INT domain leaves a positive chroma residue at neutral code values,
+which produces a raised red black floor in Profile 5 content.
+
+Normalize Dolby Vision carrier samples and pivots in the specified
+power-of-two domain, and apply RPU nonlinear offsets in that same domain.
+Add a regression for exact black from a neutral 10-bit Profile 5 carrier.
+---
+ src/colorspace.c                              |  5 ++++-
+ src/include/libplacebo/utils/libav_internal.h |  4 +++-
+ src/shaders/colorspace.c                      | 11 +++++++++--
+ src/tests/colorspace.c                        | 24 ++++++++++++++++++++++++
+ 4 files changed, 40 insertions(+), 4 deletions(-)
+
+diff --git a/src/colorspace.c b/src/colorspace.c
+index 8074f617..ec9b0a39 100644
+--- a/src/colorspace.c
++++ b/src/colorspace.c
+@@ -1872,7 +1872,10 @@ pl_transform3x3 pl_color_repr_decode(struct pl_color_repr *repr,
+         // case we also have to respect the signalled color offsets
+         for (int i = 0; i < 3; i++) {
+             mul[i] = 1.0;
+-            black[i] = repr->dovi->nonlinear_offset[i] * scale;
++            // Dolby Vision reshape output and RPU offsets share the
++            // S / 2^bit_depth domain. Applying MAX_INT normalization here
++            // leaves a chroma residue at neutral code values (notably P5).
++            black[i] = repr->dovi->nonlinear_offset[i];
+         }
+     } else
+ #endif
+diff --git a/src/include/libplacebo/utils/libav_internal.h b/src/include/libplacebo/utils/libav_internal.h
+index 94d6203c..841a0a4f 100644
+--- a/src/include/libplacebo/utils/libav_internal.h
++++ b/src/include/libplacebo/utils/libav_internal.h
+@@ -937,7 +937,9 @@ PL_LIBAV_API void pl_map_dovi_metadata(struct pl_dovi_metadata *out,
+         struct pl_reshape_data *cdst = &out->comp[c];
+         cdst->num_pivots = csrc->num_pivots;
+         for (int i = 0; i < csrc->num_pivots; i++) {
+-            const float scale = 1.0f / ((1 << header->bl_bit_depth) - 1);
++            // ETSI GS CCM 001 defines pivots in the S / 2^BL_bit_depth
++            // reshaping domain, rather than the UNORM MAX_INT domain.
++            const float scale = 1.0f / (1 << header->bl_bit_depth);
+             cdst->pivots[i] = scale * csrc->pivots[i];
+         }
+         for (int i = 0; i < csrc->num_pivots - 1; i++) {
+diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
+index 68cab59b..acadd790 100644
+--- a/src/shaders/colorspace.c
++++ b/src/shaders/colorspace.c
+@@ -332,8 +332,15 @@ void pl_shader_decode_color_ex(pl_shader sh,
+ 
+     if (repr->sys == PL_COLOR_SYSTEM_DOLBYVISION)
+     {
+-        ident_t scale = SH_FLOAT(pl_color_repr_normalize(repr));
+-        GLSL("color.rgb *= vec3("$"); \n", scale);
++        int bits = PL_DEF(repr->bits.color_depth, repr->bits.sample_depth);
++        if (!bits)
++            bits = 8;
++        float scale = pl_color_repr_normalize(repr);
++        // ETSI GS CCM 001 defines reshaping in the S / 2^bit_depth domain,
++        // while UNORM texture sampling uses MAX_INT.
++        scale *= ((1LL << bits) - 1.) / (1LL << bits);
++        ident_t scale_var = SH_FLOAT(scale);
++        GLSL("color.rgb *= vec3("$"); \n", scale_var);
+     }
+ 
+     if (repr->sys == PL_COLOR_SYSTEM_DOLBYVISION)
+diff --git a/src/tests/colorspace.c b/src/tests/colorspace.c
+index 7112ffba..1eb402b9 100644
+--- a/src/tests/colorspace.c
++++ b/src/tests/colorspace.c
+@@ -169,6 +169,30 @@ int main()
+     float pc10to16 = pl_color_repr_normalize(&pc_repr);
+     REQUIRE_FEQ(pc10to16 * 1000/65535., 1000/1023., 1e-7);
+ 
++    // Dolby Vision reshaping uses S / 2^bit_depth, not S / MAX_INT. Verify
++    // that a neutral full-range Profile 5 carrier reconstructs exact black
++    // after applying its RPU chroma offsets.
++    struct pl_dovi_metadata dovi_black = {
++        .nonlinear = {{{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}},
++        .nonlinear_offset = {0.0f, 0.5f, 0.5f},
++    };
++    struct pl_color_repr dovi_repr = {
++        .sys = PL_COLOR_SYSTEM_DOLBYVISION,
++        .bits = { .sample_depth = 10, .color_depth = 10 },
++        .dovi = &dovi_black,
++    };
++    pl_color_repr_normalize(&dovi_repr);
++    float dovi_neutral[3] = {
++        0.0f,
++        0.5f,
++        0.5f,
++    };
++    pl_transform3x3 dovi2rgb = pl_color_repr_decode(&dovi_repr, NULL);
++    pl_transform3x3_apply(&dovi2rgb, dovi_neutral);
++    REQUIRE_FEQ(dovi_neutral[0], 0.0f, 1e-7);
++    REQUIRE_FEQ(dovi_neutral[1], 0.0f, 1e-7);
++    REQUIRE_FEQ(dovi_neutral[2], 0.0f, 1e-7);
++
+     const struct pl_raw_primaries *bt709, *bt2020, *dcip3;
+     bt709 = pl_raw_primaries_get(PL_COLOR_PRIM_BT_709);
+     bt2020 = pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020);
+-- 
+2.51.0

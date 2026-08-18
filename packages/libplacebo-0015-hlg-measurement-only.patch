@@ -1,0 +1,223 @@
+From 61fcfa890da9e6995c92a8243330d66c665d110f Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Mon, 17 Aug 2026 21:11:04 -0400
+Subject: [PATCH] renderer: measure forced HLG peaks without tone mapping
+
+---
+ src/renderer.c | 114 ++++++++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 88 insertions(+), 26 deletions(-)
+
+diff --git a/src/renderer.c b/src/renderer.c
+index 55e470d4..56ccaab0 100644
+--- a/src/renderer.c
++++ b/src/renderer.c
+@@ -71,6 +71,10 @@ struct pl_renderer_t {
+ 
+     // Shader resource objects and intermediate textures (FBOs)
+     pl_shader_obj tone_map_state;
++    // Forced HLG measurements must not become color-map metadata. Keeping
++    // them separate preserves reference HLG rendering while exposing stats.
++    pl_shader_obj hlg_measure_state;
++    pl_tex hlg_measure_tex; // private output; never enters the live render graph
+     pl_shader_obj dither_state;
+     pl_shader_obj grain_state[4];
+     pl_shader_obj lut_state[3];
+@@ -172,11 +176,13 @@ void pl_renderer_destroy(pl_renderer *p_rr)
+         pl_tex_destroy(rr->gpu, &rr->frame_fbos.elem[i]);
+     pl_tex_destroy(rr->gpu, &rr->causal_linear_tex);
+     pl_tex_destroy(rr->gpu, &rr->causal_proxy_tex);
++    pl_tex_destroy(rr->gpu, &rr->hlg_measure_tex);
+ 
+     // Free all shader resource objects
+     // The live peak transaction may hold a weak causal sink until its single
+     // readback is consumed, so destroy the owner before the sink.
+     pl_shader_obj_destroy(&rr->tone_map_state);
++    pl_shader_obj_destroy(&rr->hlg_measure_state);
+     pl_shader_obj_destroy(&rr->causal_state);
+     pl_shader_obj_destroy(&rr->dither_state);
+     for (int i = 0; i < PL_ARRAY_SIZE(rr->lut_state); i++)
+@@ -224,6 +230,7 @@ void pl_renderer_flush_cache(pl_renderer rr)
+     // Reset the live owner first; it drops any weak causal sink before the
+     // isolated state is cleared.
+     pl_reset_detected_peak(rr->tone_map_state);
++    pl_reset_detected_peak(rr->hlg_measure_state);
+     pl_reset_causal_scene(rr->causal_state);
+ }
+ 
+@@ -1243,6 +1250,8 @@ static bool causal_scene_eligible(const struct pass_state *pass)
+     const struct pl_render_params *params = pass->params;
+     return (params->causal_scene_detection || params->causal_scene_acceleration) &&
+            pl_color_space_is_hdr(&pass->image.color) &&
++           !(pass->image.color.transfer == PL_COLOR_TRC_HLG &&
++             pl_color_space_is_hdr(&pass->target.color)) &&
+            !pl_color_space_equal(&pass->image.color, &pass->target.color);
+ }
+ 
+@@ -1335,6 +1344,8 @@ error:
+ }
+ 
+ static void causal_update(struct pass_state *pass);
++static bool hlg_measure_peak(struct pass_state *pass,
++                             const struct pl_peak_detect_params *params);
+ 
+ static void hdr_update_peak(struct pass_state *pass)
+ {
+@@ -1359,7 +1370,12 @@ static void hdr_update_peak(struct pass_state *pass)
+                      PL_COLOR_SDR_WHITE;
+     if (pass->image.color.transfer == PL_COLOR_TRC_HLG)
+         max_peak = pass->img.color.hdr.max_luma;
+-    if (max_peak <= pass->target.color.hdr.max_luma + 1e-6)
++    const bool hlg_measure_only = params->peak_detect_params->force &&
++        pass->image.color.transfer == PL_COLOR_TRC_HLG &&
++        pl_color_space_is_hdr(&pass->target.color) &&
++        max_peak <= pass->target.color.hdr.max_luma + 1e-6;
++    if (max_peak <= pass->target.color.hdr.max_luma + 1e-6 &&
++        !hlg_measure_only)
+         goto cleanup; // no adaptation needed
+ 
+     if (pass->img.color.hdr.avg_pq_y && !params->peak_detect_params->force)
+@@ -1397,11 +1413,22 @@ static void hdr_update_peak(struct pass_state *pass)
+     // This tag identifies a transaction for an optional descriptor append;
+     // it is intentionally excluded from peak parameter equality and cannot
+     // change peak math or tone-map state.
+-    const bool causal_eligible = causal_scene_eligible(pass);
++    const bool causal_eligible = !hlg_measure_only && causal_scene_eligible(pass);
+     peak_params.causal_scene_enabled = causal_eligible;
+     peak_params.causal_scene_acceleration = causal_eligible &&
+                                               params->causal_scene_acceleration;
+     peak_params.causal_scene_tag = pass->image.causal_scene_tag;
++    if (hlg_measure_only) {
++        pl_reset_detected_peak(rr->tone_map_state);
++        if (!hlg_measure_peak(pass, &peak_params)) {
++            PL_WARN(rr, "Failed creating isolated HLG measurement shader");
++            rr->errors |= PL_RENDER_ERR_PEAK_DETECT;
++            goto cleanup;
++        }
++        return;
++    } else {
++        pl_reset_detected_peak(rr->hlg_measure_state);
++    }
+     bool ok = pl_shader_detect_peak(img_sh(pass, &pass->img), pass->img.color,
+                                     &rr->tone_map_state, &peak_params);
+     if (!ok) {
+@@ -1416,6 +1443,7 @@ cleanup:
+     // No peak detection required or supported, so clean up the state to avoid
+     // confusing it with later frames where peak detection is enabled again
+     pl_reset_detected_peak(rr->tone_map_state);
++    pl_reset_detected_peak(rr->hlg_measure_state);
+ }
+ 
+ bool pl_renderer_get_hdr_metadata(pl_renderer rr,
+@@ -1427,6 +1455,8 @@ bool pl_renderer_get_hdr_metadata(pl_renderer rr,
+ bool pl_renderer_get_peak_detect_metrics(
+     pl_renderer rr, struct pl_peak_detect_metrics *metrics)
+ {
++    if (pl_get_peak_detect_metrics(rr->hlg_measure_state, metrics))
++        return true;
+     return pl_get_peak_detect_metrics(rr->tone_map_state, metrics);
+ }
+ 
+@@ -2510,19 +2540,14 @@ bool pl_renderer_get_causal_test_data(pl_renderer rr, float *proxy,
+     return pl_get_causal_test_descriptors(rr->causal_state, out);
+ }
+ 
+-// Build the Stage-1 diagnostic source directly from immutable decoded planes.
+-// This deliberately does not reuse pass_build_source: that function owns
+-// renderer samplers, FBO bookkeeping, hook/LUT state and failure bits used by
+-// the live render.  The diagnostic path must not touch any of those.
+-static bool causal_extract_source(struct pass_state *live)
++// Reconstruct source RGB directly from immutable decoded planes. This does not
++// reuse pass_build_source: that function owns renderer samplers, FBO
++// bookkeeping, hook/LUT state and failure bits used by the live render.
++static bool extract_immutable_source(struct pass_state *live, pl_dispatch dp,
++                                     struct img *out)
+ {
+     struct pl_frame *image = &live->image;
+-    pl_renderer rr = live->rr;
+-    // Use the renderer dispatch so source uploads and proxy reads share one
+-    // ordered GPU queue. State, textures and readback remain causal-private.
+-    pl_dispatch dp = rr->dp;
+-    // A failed preflight must never leave the preceding frame's proxy live.
+-    live->causal_proxy = NULL;
++    *out = (struct img) {0};
+     if (image->field != PL_FIELD_NONE || image->rotation != PL_ROTATION_0 ||
+         image->color.primaries == PL_COLOR_PRIM_UNKNOWN)
+         return false;
+@@ -2623,25 +2648,62 @@ static bool causal_extract_source(struct pass_state *live)
+         goto error; // EL/NLQ is deliberately fail-closed until direct EL is added.
+     pl_shader_decode_color_ex(sh, pl_color_decode_args(.repr = &repr));
+ 
+-    struct pass_state causal = {
+-        .rr = rr,
+-        .img = {
+-            .sh = sh,
+-            .w = pl_rect_w(rounded),
+-            .h = pl_rect_h(rounded),
+-            .repr = repr,
+-            .color = image->color,
+-            .comps = 3,
+-            .rect = {0, 0, pl_rect_w(rounded), pl_rect_h(rounded)},
+-        },
++    *out = (struct img) {
++        .sh = sh,
++        .w = pl_rect_w(rounded),
++        .h = pl_rect_h(rounded),
++        .repr = repr,
++        .color = image->color,
++        .comps = 3,
++        .rect = {0, 0, pl_rect_w(rounded), pl_rect_h(rounded)},
+     };
+-    return causal_make_proxy(&causal, dp) &&
+-           (live->causal_proxy = causal.causal_proxy, true);
++    return true;
+ error:
+     pl_dispatch_abort(dp, &sh);
+     return false;
+ }
+ 
++static bool causal_extract_source(struct pass_state *live)
++{
++    pl_renderer rr = live->rr;
++    struct img source;
++    // Source uploads, proxy writes and the shared causal transaction must keep
++    // their existing order on the renderer dispatch.
++    live->causal_proxy = NULL;
++    if (!extract_immutable_source(live, rr->dp, &source))
++        return false;
++    struct pass_state causal = { .rr = rr, .img = source };
++    return causal_make_proxy(&causal, rr->dp) &&
++           (live->causal_proxy = causal.causal_proxy, true);
++}
++
++static bool hlg_measure_peak(struct pass_state *pass,
++                             const struct pl_peak_detect_params *params)
++{
++    pl_renderer rr = pass->rr;
++    struct img source;
++    if (!extract_immutable_source(pass, rr->causal_dp, &source))
++        return false;
++
++    pl_fmt fmt = pl_find_fmt(rr->gpu, PL_FMT_FLOAT, 4, 16, 0,
++                             PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_STORABLE);
++    struct pl_tex_params tparams = {
++        .w = source.w, .h = source.h, .format = fmt,
++        .renderable = true, .storable = true,
++        .debug_tag = "isolated HLG peak measurement",
++    };
++    if (!fmt || !pl_tex_recreate(rr->gpu, &rr->hlg_measure_tex, &tparams))
++        goto error;
++    if (!pl_shader_detect_peak(source.sh, source.color,
++                               &rr->hlg_measure_state, params))
++        goto error;
++    return pl_dispatch_finish(rr->causal_dp, pl_dispatch_params(
++        .shader = &source.sh, .target = rr->hlg_measure_tex));
++error:
++    pl_dispatch_abort(rr->causal_dp, &source.sh);
++    return false;
++}
++
+ static bool pass_read_image(struct pass_state *pass)
+ {
+     if (causal_scene_eligible(pass))
+-- 
+2.54.0.windows.1
