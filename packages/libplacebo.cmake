@@ -45,7 +45,6 @@ ExternalProject_Add(libplacebo
         -Dd3d11=enabled
         -Ddebug=true
         -Dblack-level-diagnostics=false
-        -Dperceptual-diagnostics=false
         -Db_ndebug=true
         -Doptimization=3
         -Dvulkan-registry='${MINGW_INSTALL_PREFIX}/share/vulkan/registry/vk.xml'
