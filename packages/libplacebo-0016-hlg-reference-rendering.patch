@@ -1,0 +1,75 @@
+From 5df9dda143cc224cc2bd1a05d5aa1bd92b3fa691 Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Wed, 19 Aug 2026 00:01:29 -0400
+Subject: [PATCH] colorspace: add fixed-reference HLG rendering
+
+---
+ src/include/libplacebo/shaders/colorspace.h |  5 +++++
+ src/renderer.c                              | 12 ++++++++++--
+ src/shaders/colorspace.c                    |  3 +++
+ 3 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/src/include/libplacebo/shaders/colorspace.h b/src/include/libplacebo/shaders/colorspace.h
+index cae1cfec..d948a4ac 100644
+--- a/src/include/libplacebo/shaders/colorspace.h
++++ b/src/include/libplacebo/shaders/colorspace.h
+@@ -370,6 +370,11 @@ struct pl_color_map_params {
+     // value allows overriding the default metadata preference logic.
+     enum pl_hdr_metadata_type metadata;
+ 
++    // If non-zero, interpret HLG using this reference display peak instead
++    // of adapting its OOTF directly to the HDR output peak. This lets the
++    // resulting display-linear signal use the normal tone-mapping path.
++    float hlg_reference_peak;
++
+     // Private brightness metrics are valid only if a matching pixel detector
+     // result is present. They are intentionally ignored for authored metadata.
+     enum pl_tone_map_metric tone_mapping_metric;
+diff --git a/src/renderer.c b/src/renderer.c
+index 56ccaab0..f5e78ea2 100644
+--- a/src/renderer.c
++++ b/src/renderer.c
+@@ -1248,10 +1248,12 @@ hook_error:
+ static bool causal_scene_eligible(const struct pass_state *pass)
+ {
+     const struct pl_render_params *params = pass->params;
++    const bool direct_hlg = pass->image.color.transfer == PL_COLOR_TRC_HLG &&
++        pl_color_space_is_hdr(&pass->target.color) &&
++        pass->image.color.hdr.max_luma <= pass->target.color.hdr.max_luma + 1e-6;
+     return (params->causal_scene_detection || params->causal_scene_acceleration) &&
+            pl_color_space_is_hdr(&pass->image.color) &&
+-           !(pass->image.color.transfer == PL_COLOR_TRC_HLG &&
+-             pl_color_space_is_hdr(&pass->target.color)) &&
++           !direct_hlg &&
+            !pl_color_space_equal(&pass->image.color, &pass->target.color);
+ }
+ 
+@@ -4078,6 +4080,12 @@ static void pass_fix_frames(struct pass_state *pass)
+     if (image) {
+         fix_frame(image);
+         pl_color_space_infer_map(&image->color, &target->color);
++        const struct pl_color_map_params *cparams = pass->params
++            ? pass->params->color_map_params : NULL;
++        if (cparams && cparams->hlg_reference_peak > 0.0f &&
++            image->color.transfer == PL_COLOR_TRC_HLG &&
++            pl_color_space_is_hdr(&target->color))
++            image->color.hdr.max_luma = cparams->hlg_reference_peak;
+         fix_frame(target); // do this only after infer_map
+     } else {
+         fix_frame(target);
+diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
+index 5d16a132..9cfb63f7 100644
+--- a/src/shaders/colorspace.c
++++ b/src/shaders/colorspace.c
+@@ -2824,6 +2824,9 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+ 
+     params = PL_DEF(params, &pl_color_map_default_params);
+     pl_color_space_infer_map(&src, &dst);
++    if (params->hlg_reference_peak > 0.0f &&
++        src.transfer == PL_COLOR_TRC_HLG && pl_color_space_is_hdr(&dst))
++        src.hdr.max_luma = params->hlg_reference_peak;
+     if (pl_color_space_equal(&src, &dst)) {
+ #ifdef PL_BLACK_LEVEL_DIAGNOSTICS
+         blkdiag_identity(sh, obj, &src, &dst);
+-- 
+2.54.0.windows.1

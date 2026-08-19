@@ -1,0 +1,67 @@
+From 4f54b04701055636d8683a3dc7f22bb2a8f16994 Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Wed, 19 Aug 2026 00:01:29 -0400
+Subject: [PATCH] vo_gpu_next: add fixed-reference HLG rendering
+
+---
+ DOCS/man/options.rst    | 5 +++++
+ video/out/gpu/video.c   | 2 ++
+ video/out/gpu/video.h   | 1 +
+ video/out/vo_gpu_next.c | 1 +
+ 4 files changed, 9 insertions(+)
+
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index 41e6f4768..c9a8ca4b0 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -7845,6 +7845,11 @@ them.
+     source-provided dynamic CIE Y metadata when present. ``yes`` forces
+     measurement even when such metadata is present.
+ 
++``--hdr-hlg-reference-peak=<auto|10..10000>``
++    Interpret HLG using a fixed reference display peak before applying the
++    normal HDR tone-mapping path. ``auto`` (the default) instead adapts HLG
++    directly to the output display peak. (Only affects ``--vo=gpu-next``.)
++
+ ``--allow-delayed-peak-detect``
+     When using ``--hdr-compute-peak``, allow delaying the detected peak by a
+     frame when beneficial for performance. In particular, this is required to
+diff --git a/video/out/gpu/video.c b/video/out/gpu/video.c
+index 8ed9a6bda..d748805fd 100644
+--- a/video/out/gpu/video.c
++++ b/video/out/gpu/video.c
+@@ -499,6 +499,8 @@ const struct m_sub_options gl_video_conf = {
+             {"auto", 0},
+             {"yes", 1},
+             {"no", -1})},
++        {"hdr-hlg-reference-peak", OPT_CHOICE(tone_map.hlg_reference_peak,
++            {"auto", 0}), M_RANGE(10, 10000)},
+         {"hdr-peak-percentile", OPT_FLOAT(tone_map.peak_percentile),
+             M_RANGE(0.0, 100.0)},
+         {"hdr-peak-decay-rate", OPT_FLOAT(tone_map.decay_rate),
+diff --git a/video/out/gpu/video.h b/video/out/gpu/video.h
+index 2f2fc805c..097611b87 100644
+--- a/video/out/gpu/video.h
++++ b/video/out/gpu/video.h
+@@ -133,6 +133,7 @@ struct gl_tone_map_opts {
+     float max_boost;
+     bool inverse;
+     int compute_peak;
++    int hlg_reference_peak;
+     float decay_rate;
+     float scene_threshold_low;
+     float scene_threshold_high;
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 6f2fd0907..071ec0129 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -3197,6 +3197,7 @@ AV_NOWARN_DEPRECATED(
+     }
+     pars->color_map_params.adaptive_chroma_strength =
+         opts->tone_map.adaptive_chroma_strength / 100.0f;
++    pars->color_map_params.hlg_reference_peak = opts->tone_map.hlg_reference_peak;
+     pars->color_map_params.hard_clip_hdr_target = opts->target_peak > 0;
+     pars->color_map_params.inverse_tone_mapping = opts->tone_map.inverse;
+     pars->color_map_params.contrast_recovery = opts->tone_map.contrast_recovery;
+-- 
+2.54.0.windows.1
