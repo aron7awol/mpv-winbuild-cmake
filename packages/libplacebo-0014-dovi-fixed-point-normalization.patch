@@ -1,44 +1,80 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From c1e1a8e3bb2e2dc38495f43b0bf43a08871c30be Mon Sep 17 00:00:00 2001
 From: mpv-sk <mpv-sk@local>
-Date: Mon, 17 Aug 2026 00:00:00 -0400
-Subject: [PATCH] colorspace: use Dolby Vision fixed-point normalization
+Date: Tue, 18 Aug 2026 20:05:46 -0400
+Subject: [PATCH] colorspace: reproduce Dolby fixed-point reconstruction stages
 
-ETSI GS CCM 001 defines Dolby Vision reshaping samples and pivots in the
-S / 2^bit_depth domain. Converting full-range carriers through the usual
-UNORM MAX_INT domain leaves a positive chroma residue at neutral code values,
-which produces a raised red black floor in Profile 5 content.
-
-Normalize Dolby Vision carrier samples and pivots in the specified
-power-of-two domain, and apply RPU nonlinear offsets in that same domain.
-Add a regression for exact black from a neutral 10-bit Profile 5 carrier.
+Preserve the RPU BL/VDR fixed-point representation, clamp carrier codes before mapping, truncate reshape output to the normative 16-bit intermediate, and round the reconstructed signal into VDR bit depth after optional residual composition. Add a real Profile 5 RPU GPU regression.
 ---
- src/colorspace.c                              |  5 ++++-
- src/include/libplacebo/utils/libav_internal.h |  4 +++-
- src/shaders/colorspace.c                      | 11 +++++++++--
- src/tests/colorspace.c                        | 24 ++++++++++++++++++++++++
- 4 files changed, 40 insertions(+), 4 deletions(-)
+ src/include/libplacebo/colorspace.h           |  15 ++
+ src/include/libplacebo/utils/libav_internal.h |  18 ++-
+ src/shaders.h                                 |  10 ++
+ src/shaders/colorspace.c                      | 130 ++++++++++++++++--
+ src/tests/colorspace.c                        |  24 ++++
+ src/tests/gpu_tests.c                         | 104 ++++++++++++++
+ 6 files changed, 286 insertions(+), 15 deletions(-)
 
-diff --git a/src/colorspace.c b/src/colorspace.c
-index 8074f617..ec9b0a39 100644
---- a/src/colorspace.c
-+++ b/src/colorspace.c
-@@ -1872,7 +1872,10 @@ pl_transform3x3 pl_color_repr_decode(struct pl_color_repr *repr,
-         // case we also have to respect the signalled color offsets
-         for (int i = 0; i < 3; i++) {
-             mul[i] = 1.0;
--            black[i] = repr->dovi->nonlinear_offset[i] * scale;
-+            // Dolby Vision reshape output and RPU offsets share the
-+            // S / 2^bit_depth domain. Applying MAX_INT normalization here
-+            // leaves a chroma residue at neutral code values (notably P5).
-+            black[i] = repr->dovi->nonlinear_offset[i];
-         }
-     } else
- #endif
+diff --git a/src/include/libplacebo/colorspace.h b/src/include/libplacebo/colorspace.h
+index 64c925e9..a954ff23 100644
+--- a/src/include/libplacebo/colorspace.h
++++ b/src/include/libplacebo/colorspace.h
+@@ -130,11 +130,26 @@ PL_API bool pl_bit_encoding_equal(const struct pl_bit_encoding *b1,
+ 
+ // Parsed metadata from the Dolby Vision RPU
+ struct pl_dovi_metadata {
++    // Fixed-point representation declared by the RPU. Dolby Vision reshaping
++    // is evaluated in the BL domain, produces an intermediate 16-bit mapped
++    // signal, and is finally rounded into the VDR domain.
++    uint8_t bl_bit_depth;
++    uint8_t el_bit_depth;
++    uint8_t vdr_bit_depth;
++    uint8_t coefficient_log2_denom;
++
+     // Colorspace transformation metadata
+     float nonlinear_offset[3];  // input offset ("ycc_to_rgb_offset")
+     pl_matrix3x3 nonlinear;     // before PQ, also called "ycc_to_rgb"
+     pl_matrix3x3 linear;        // after PQ, also called "rgb_to_lms"
+ 
++    // Exact coded representation of the first Dolby color conversion stage.
++    // The reconstructed VDR samples are left-aligned in a 16-bit container,
++    // these Q28 offsets are truncated to that container, and the signed Q13
++    // matrix result is arithmetically shifted and clipped back to 16 bits.
++    int16_t nonlinear_coeffs[9];
++    uint32_t nonlinear_offsets[3];
++
+     // Reshape data, grouped by component
+     struct pl_reshape_data {
+         uint8_t num_pivots;
 diff --git a/src/include/libplacebo/utils/libav_internal.h b/src/include/libplacebo/utils/libav_internal.h
-index 94d6203c..841a0a4f 100644
+index 94d6203c..9b93e9cf 100644
 --- a/src/include/libplacebo/utils/libav_internal.h
 +++ b/src/include/libplacebo/utils/libav_internal.h
-@@ -937,7 +937,9 @@ PL_LIBAV_API void pl_map_dovi_metadata(struct pl_dovi_metadata *out,
+@@ -924,20 +924,34 @@ PL_LIBAV_API void pl_map_dovi_metadata(struct pl_dovi_metadata *out,
+     mapping = av_dovi_get_mapping(data);
+     color = av_dovi_get_color(data);
+ 
+-    for (int i = 0; i < 3; i++)
++    out->bl_bit_depth = header->bl_bit_depth;
++    out->el_bit_depth = header->el_bit_depth;
++    out->vdr_bit_depth = header->vdr_bit_depth;
++    out->coefficient_log2_denom = header->coef_log2_denom;
++
++    for (int i = 0; i < 3; i++) {
+         out->nonlinear_offset[i] = av_q2d(color->ycc_to_rgb_offset[i]);
++        out->nonlinear_offsets[i] = (uint32_t) (((int64_t)
++            color->ycc_to_rgb_offset[i].num << 28) /
++            color->ycc_to_rgb_offset[i].den);
++    }
+     for (int i = 0; i < 9; i++) {
+         float *nonlinear = &out->nonlinear.m[0][0];
+         float *linear = &out->linear.m[0][0];
+         nonlinear[i] = av_q2d(color->ycc_to_rgb_matrix[i]);
+         linear[i] = av_q2d(color->rgb_to_lms_matrix[i]);
++        out->nonlinear_coeffs[i] = (int16_t) (((int64_t)
++            color->ycc_to_rgb_matrix[i].num << 13) /
++            color->ycc_to_rgb_matrix[i].den);
+     }
+     for (int c = 0; c < 3; c++) {
+         const AVDOVIReshapingCurve *csrc = &mapping->curves[c];
          struct pl_reshape_data *cdst = &out->comp[c];
          cdst->num_pivots = csrc->num_pivots;
          for (int i = 0; i < csrc->num_pivots; i++) {
@@ -49,17 +85,159 @@ index 94d6203c..841a0a4f 100644
              cdst->pivots[i] = scale * csrc->pivots[i];
          }
          for (int i = 0; i < csrc->num_pivots - 1; i++) {
+diff --git a/src/shaders.h b/src/shaders.h
+index b8e1de62..e92f10e3 100644
+--- a/src/shaders.h
++++ b/src/shaders.h
+@@ -250,6 +250,16 @@ struct pl_dovi_metadata;
+ void sh_dovi_compose_nlq(pl_shader sh, const struct pl_dovi_metadata *data,
+                          ident_t el_signal);
+ 
++// Round the 16-bit mapped signal (plus any decoded residual) into the VDR
++// output code domain. Kept internal so GPU regressions can exercise the exact
++// reconstruction boundary without also applying the Dolby color matrices.
++void sh_dovi_signal_reconstruct(pl_shader sh,
++                                const struct pl_dovi_metadata *data);
++
++// Apply the Dolby Q13 Y'C'C' -> R'G'B' conversion at its normative 16-bit
++// fixed-point boundary. The result is PQ-encoded RGB in S/65536 form.
++void sh_dovi_ycc_to_rgb(pl_shader sh, const struct pl_dovi_metadata *data);
++
+ // Shader resources
+ 
+ enum pl_shader_obj_type {
 diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
-index 68cab59b..acadd790 100644
+index 68cab59b..5d16a132 100644
 --- a/src/shaders/colorspace.c
 +++ b/src/shaders/colorspace.c
-@@ -332,8 +332,15 @@ void pl_shader_decode_color_ex(pl_shader sh,
+@@ -171,7 +171,18 @@ void pl_shader_dovi_reshape(pl_shader sh, const struct pl_dovi_metadata *data)
+             continue;
+ 
+         pl_assert(comp->num_pivots >= 2 && comp->num_pivots <= 9);
+-        GLSL("s = sig[%d]; \n", c);
++        ident_t lo = sh_var(sh, (struct pl_shader_var) {
++            .var = pl_var_float("lo"),
++            .data = &comp->pivots[0],
++        });
++        ident_t hi = sh_var(sh, (struct pl_shader_var) {
++            .var = pl_var_float("hi"),
++            .data = &comp->pivots[comp->num_pivots - 1],
++        });
++        // ETSI GS CCM 001 clamps the BL code before evaluating its selected
++        // polynomial/MMR piece. In particular, the reshape output is not
++        // clamped back to the BL pivot range.
++        GLSL("s = clamp(sig[%d], "$", "$"); \n", c, lo, hi);
+ 
+         // Prepare coefficients for GPU
+         bool has_poly = false, has_mmr = false, mmr_single = true;
+@@ -300,15 +311,11 @@ void pl_shader_dovi_reshape(pl_shader sh, const struct pl_dovi_metadata *data)
+             GLSL("} \n");
+         }
+ 
+-        ident_t lo = sh_var(sh, (struct pl_shader_var) {
+-            .var = pl_var_float("lo"),
+-            .data = &comp->pivots[0],
+-        });
+-        ident_t hi = sh_var(sh, (struct pl_shader_var) {
+-            .var = pl_var_float("hi"),
+-            .data = &comp->pivots[comp->num_pivots - 1],
+-        });
+-        GLSL("color[%d] = clamp(s, "$", "$"); \n", c, lo, hi);
++        // Reference reshaping first truncates the mapped result into an
++        // unsigned 16-bit intermediate. Keep it in the specified S/65536
++        // domain for optional residual composition and final reconstruction.
++        GLSL("color[%d] = min(floor(max(s, 0.0) * 65536.0), 65535.0)"
++             " / 65536.0; \n", c);
+     }
+ 
+     GLSL("} \n");
+@@ -317,6 +324,73 @@ void pl_shader_dovi_reshape(pl_shader sh, const struct pl_dovi_metadata *data)
+ #endif
+ }
+ 
++void sh_dovi_signal_reconstruct(pl_shader sh,
++                                const struct pl_dovi_metadata *data)
++{
++#ifdef PL_HAVE_DOVI
++    int bits = data ? data->vdr_bit_depth : 0;
++    if (!bits)
++        bits = 12;
++    bits = PL_CLAMP(bits, 8, 16);
++
++    int shift = 16 - bits;
++    float rounding = shift ? (float) (1u << (shift - 1)) : 0.0f;
++    float divisor = (float) (1u << shift);
++    float max_code = (float) ((1u << bits) - 1u);
++    float domain = (float) (1u << bits);
++
++    ident_t round_var = SH_FLOAT(rounding);
++    ident_t div_var = SH_FLOAT(divisor);
++    ident_t max_var = SH_FLOAT(max_code);
++    ident_t domain_var = SH_FLOAT(domain);
++
++    // signalReconstruction() in ETSI GS CCM 001: add the quantized residual
++    // in the 16-bit mapped domain, round to VDR bit depth, then clip to the
++    // legal unsigned VDR code range. The result remains power-of-two
++    // normalized for the following RPU matrices and offsets.
++    GLSL("color.rgb = clamp(floor((color.rgb * 65536.0 + vec3("$"))"
++         " / vec3("$")), vec3(0.0), vec3("$")) / vec3("$"); \n",
++         round_var, div_var, max_var, domain_var);
++#endif
++}
++
++void sh_dovi_ycc_to_rgb(pl_shader sh, const struct pl_dovi_metadata *data)
++{
++#ifdef PL_HAVE_DOVI
++    float coeffs[9];
++    float offsets[3];
++    bool have_coded_matrix = false;
++    for (int i = 0; i < 9; i++)
++        have_coded_matrix |= data->nonlinear_coeffs[i] != 0;
++    for (int i = 0; i < 9; i++) {
++        const float *matrix = &data->nonlinear.m[0][0];
++        coeffs[i] = have_coded_matrix ? data->nonlinear_coeffs[i]
++                                      : roundf(matrix[i] * 8192.0f);
++    }
++    for (int i = 0; i < 3; i++) {
++        offsets[i] = have_coded_matrix
++            ? data->nonlinear_offsets[i] >> 12
++            : floorf(data->nonlinear_offset[i] * 65536.0f);
++    }
++
++    ident_t mat = sh_var(sh, (struct pl_shader_var) {
++        .var = pl_var_mat3("dovi_ycc_to_rgb_q13"),
++        .data = PL_TRANSPOSE_3X3(coeffs),
++    });
++    ident_t off = sh_var(sh, (struct pl_shader_var) {
++        .var = pl_var_vec3("dovi_ycc_offset_u16"),
++        .data = offsets,
++    });
++
++    // The VDR code is represented as S/2^vdr_bit_depth. Converting it to the
++    // 16-bit container therefore is exactly S << (16-vdr_bit_depth). Dolby's
++    // signed right shift is floor division, including for negative values.
++    GLSL("color.rgb = clamp(floor(("$" * (floor(color.rgb * 65536.0) - "$"))"
++         " / 8192.0), vec3(0.0), vec3(65535.0)) / 65536.0; \n",
++         mat, off);
++#endif
++}
++
+ void pl_shader_decode_color_ex(pl_shader sh,
+                                const struct pl_color_decode_args *args)
+ {
+@@ -332,8 +406,21 @@ void pl_shader_decode_color_ex(pl_shader sh,
  
      if (repr->sys == PL_COLOR_SYSTEM_DOLBYVISION)
      {
 -        ident_t scale = SH_FLOAT(pl_color_repr_normalize(repr));
 -        GLSL("color.rgb *= vec3("$"); \n", scale);
-+        int bits = PL_DEF(repr->bits.color_depth, repr->bits.sample_depth);
++        // The reshape input domain is declared by the RPU, independently of
++        // how the decoder happens to expose the carrier texture. Prefer that
++        // exact BL bit depth, retaining the representation fields only as a
++        // compatibility fallback for manually constructed metadata.
++        int bits = repr->dovi ? repr->dovi->bl_bit_depth : 0;
++        bits = PL_DEF(bits, PL_DEF(repr->bits.color_depth,
++                                   repr->bits.sample_depth));
 +        if (!bits)
 +            bits = 8;
 +        float scale = pl_color_repr_normalize(repr);
@@ -71,6 +249,33 @@ index 68cab59b..acadd790 100644
      }
  
      if (repr->sys == PL_COLOR_SYSTEM_DOLBYVISION)
+@@ -348,8 +435,25 @@ void pl_shader_decode_color_ex(pl_shader sh,
+             sh_dovi_compose_nlq(sh, repr->dovi, el);
+     }
+ 
++    if (repr->sys == PL_COLOR_SYSTEM_DOLBYVISION)
++        sh_dovi_signal_reconstruct(sh, repr->dovi);
++
++    if (repr->sys == PL_COLOR_SYSTEM_DOLBYVISION)
++        sh_dovi_ycc_to_rgb(sh, repr->dovi);
++
+     enum pl_color_system orig_sys = repr->sys;
+-    pl_transform3x3 tr = pl_color_repr_decode(repr, params);
++    pl_transform3x3 tr;
++    if (repr->sys == PL_COLOR_SYSTEM_DOLBYVISION) {
++        // The Dolby Q13 stage above has already produced full-range RGB. Keep
++        // generic user color adjustments, but do not apply the RPU matrix or
++        // texture normalization for a second time.
++        struct pl_color_repr rgb = pl_color_repr_rgb;
++        tr = pl_color_repr_decode(&rgb, params);
++        repr->sys = PL_COLOR_SYSTEM_RGB;
++        repr->levels = PL_COLOR_LEVELS_FULL;
++    } else {
++        tr = pl_color_repr_decode(repr, params);
++    }
+ 
+     if (memcmp(&tr, &pl_transform3x3_identity, sizeof(tr))) {
+         ident_t cmat = sh_var(sh, (struct pl_shader_var) {
 diff --git a/src/tests/colorspace.c b/src/tests/colorspace.c
 index 7112ffba..1eb402b9 100644
 --- a/src/tests/colorspace.c
@@ -106,5 +311,120 @@ index 7112ffba..1eb402b9 100644
      const struct pl_raw_primaries *bt709, *bt2020, *dcip3;
      bt709 = pl_raw_primaries_get(PL_COLOR_PRIM_BT_709);
      bt2020 = pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020);
+diff --git a/src/tests/gpu_tests.c b/src/tests/gpu_tests.c
+index fd4a12c6..a43c0a9d 100644
+--- a/src/tests/gpu_tests.c
++++ b/src/tests/gpu_tests.c
+@@ -888,6 +888,110 @@ static void pl_shader_tests(pl_gpu gpu)
+         .target = fbo,
+     }));
+ 
++    // Real frame-0 RPU data from "Black levels pattern P5 Rasciola.mp4".
++    // The neutral 10-bit carrier [0, 512, 512] is deliberately not forced to
++    // neutral by the RPU: the normative mapped VDR12 codes are [4,2051,2046].
++    // This catches both missing 16-bit mapping truncation and missing VDR
++    // rounding, which an identity-reshape black test cannot exercise.
++    const float dovi_denom = 8388608.0f; // 2^23
++    const float dovi_bl_domain = 1024.0f;
++    const struct pl_dovi_metadata rasciola = {
++        .bl_bit_depth = 10,
++        .el_bit_depth = 10,
++        .vdr_bit_depth = 12,
++        .coefficient_log2_denom = 23,
++        .nonlinear_coeffs = {
++            8192, 799, 1681,
++            8192, -933, 1091,
++            8192, 267, -5545,
++        },
++        .nonlinear_offsets = {0, 134217728, 134217728},
++        .comp = {
++            {
++                .num_pivots = 8,
++                .pivots = {0.0f / dovi_bl_domain,
++                           2.0f / dovi_bl_domain,
++                           37.0f / dovi_bl_domain,
++                           147.0f / dovi_bl_domain,
++                           403.0f / dovi_bl_domain,
++                           659.0f / dovi_bl_domain,
++                           915.0f / dovi_bl_domain,
++                           1023.0f / dovi_bl_domain},
++                .method = {0, 0, 0, 0, 0, 0, 0},
++                .poly_coeffs = {
++                    {7616.0f / dovi_denom, 0.0f, 0.0f},
++                    {4960.0f / dovi_denom, 6444825.0f / dovi_denom,
++                     (-7.0f * dovi_denom + 7099652.0f) / dovi_denom},
++                    {63948.0f / dovi_denom, 3236975.0f / dovi_denom,
++                     (-1.0f * dovi_denom + 3746339.0f) / dovi_denom},
++                    {138499.0f / dovi_denom, 2163094.0f / dovi_denom,
++                     (-1.0f * dovi_denom + 7761868.0f) / dovi_denom},
++                    {216387.0f / dovi_denom, 1736493.0f / dovi_denom,
++                     (-1.0f * dovi_denom + 8351663.0f) / dovi_denom},
++                    {221464.0f / dovi_denom, 1728731.0f / dovi_denom,
++                     (-1.0f * dovi_denom + 8352641.0f) / dovi_denom},
++                    {4005802.0f / dovi_denom,
++                     (-1.0f * dovi_denom + 1715418.0f) / dovi_denom,
++                     4631168.0f / dovi_denom},
++                },
++            }, {
++                .num_pivots = 2,
++                .pivots = {0.0f, 1023.0f / dovi_bl_domain},
++                .method = {0},
++                .poly_coeffs = {{2217340.0f / dovi_denom,
++                                 3966855.0f / dovi_denom, 0.0f}},
++            }, {
++                .num_pivots = 2,
++                .pivots = {0.0f, 1023.0f / dovi_bl_domain},
++                .method = {0},
++                .poly_coeffs = {{2161688.0f / dovi_denom,
++                                 4058190.0f / dovi_denom, 0.0f}},
++            },
++        },
++    };
++    const struct pl_custom_shader rasciola_carrier = {
++        .body = "color = vec4(0.0, 0.5, 0.5, 1.0);\n",
++        .input = PL_SHADER_SIG_NONE,
++        .output = PL_SHADER_SIG_COLOR,
++    };
++    sh = pl_dispatch_begin(dp);
++    REQUIRE(pl_shader_custom(sh, &rasciola_carrier));
++    pl_shader_dovi_reshape(sh, &rasciola);
++    sh_dovi_signal_reconstruct(sh, &rasciola);
++    REQUIRE(pl_dispatch_finish(dp, &(struct pl_dispatch_params) {
++        .shader = &sh,
++        .target = fbo,
++    }));
++
++    float rasciola_out[FBO_W * FBO_H * 4];
++    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(
++        .tex = fbo,
++        .ptr = rasciola_out,
++    )));
++    REQUIRE_FEQ(rasciola_out[0], 4.0f / 4096.0f, 1e-7);
++    REQUIRE_FEQ(rasciola_out[1], 2051.0f / 4096.0f, 1e-7);
++    REQUIRE_FEQ(rasciola_out[2], 2046.0f / 4096.0f, 1e-7);
++
++    // Dolby next left-aligns the VDR12 codes in a 16-bit container, applies
++    // the signed Q13 Y'C'C' matrix, arithmetic-shifts, and clips. For this
++    // real RPU, [4,2051,2046] must become PQ RGB16 [62,54,87].
++    sh = pl_dispatch_begin(dp);
++    REQUIRE(pl_shader_custom(sh, &rasciola_carrier));
++    pl_shader_dovi_reshape(sh, &rasciola);
++    sh_dovi_signal_reconstruct(sh, &rasciola);
++    sh_dovi_ycc_to_rgb(sh, &rasciola);
++    REQUIRE(pl_dispatch_finish(dp, &(struct pl_dispatch_params) {
++        .shader = &sh,
++        .target = fbo,
++    }));
++    REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(
++        .tex = fbo,
++        .ptr = rasciola_out,
++    )));
++    REQUIRE_FEQ(rasciola_out[0], 62.0f / 65536.0f, 1e-7);
++    REQUIRE_FEQ(rasciola_out[1], 54.0f / 65536.0f, 1e-7);
++    REQUIRE_FEQ(rasciola_out[2], 87.0f / 65536.0f, 1e-7);
++
+     // Test deinterlacing
+     sh = pl_dispatch_begin(dp);
+     pl_shader_deinterlace(sh, pl_deinterlace_source( .cur = pl_field_pair(src) ), NULL);
 -- 
-2.51.0
+2.54.0.windows.1
