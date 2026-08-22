@@ -1,0 +1,243 @@
+From 5bcf6f356de39d6c2738fa43498bb6b11d918261 Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Sat, 22 Aug 2026 16:30:00 -0400
+Subject: [PATCH] sub: add fitted rounded background boxes
+
+---
+ DOCS/man/options.rst |  12 +++++
+ options/options.c    |   5 ++
+ options/options.h    |   2 +
+ sub/sd_ass.c         | 137 ++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 156 insertions(+)
+
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index c83c979f7..1e7b19a31 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -2664,6 +2664,18 @@ Subtitles
+ ``--sub-line-spacing=<value>``
+     Set line spacing value for SSA/ASS renderer.
+ 
++``--sub-background-box-padding=<-1..1000>``
++    Replace a text subtitle's ``background-box`` with a box fitted to its
++    rendered glyph bounds and add this many 720p-scaled pixels of padding.
++    ``-1`` (the default) preserves libass' native font-metric box exactly.
++    Authored ASS subtitles are affected only when the user's background-box
++    style is being applied; bitmap subtitles are unaffected.
++
++``--sub-background-box-radius=<0..1000>``
++    Round fitted background-box corners by this many 720p-scaled pixels.
++    This option has an effect only when ``--sub-background-box-padding`` is
++    non-negative. The default is ``0`` (square corners).
++
+ ``--sub-shaper=<simple|complex>``
+     Set the text layout engine used by libass.
+ 
+diff --git a/options/options.c b/options/options.c
+index 2a5373d44..ff01972ec 100644
+--- a/options/options.c
++++ b/options/options.c
+@@ -318,6 +318,10 @@ const struct m_sub_options mp_subtitle_sub_opts = {
+         {"sub-ass", OPT_BOOL(ass_enabled), .flags = UPDATE_SUB_HARD},
+         {"sub-scale-signs", OPT_BOOL(sub_scale_signs)},
+         {"sub-line-spacing", OPT_FLOAT(sub_line_spacing), M_RANGE(-1000, 1000)},
++        {"sub-background-box-padding", OPT_FLOAT(sub_background_box_padding),
++            M_RANGE(-1, 1000)},
++        {"sub-background-box-radius", OPT_FLOAT(sub_background_box_radius),
++            M_RANGE(0, 1000)},
+         {"sub-ass-line-spacing", OPT_REPLACED("sub-line-spacing")},
+         {"sub-use-margins", OPT_BOOL(sub_use_margins)},
+         {"sub-ass-force-margins", OPT_BOOL(ass_use_margins)},
+@@ -363,6 +367,7 @@ const struct m_sub_options mp_subtitle_sub_opts = {
+         .sub_scale_by_window = true,
+         .sub_use_margins = true,
+         .sub_scale_with_window = true,
++        .sub_background_box_padding = -1,
+         .ass_prune_delay = -1.0,
+         .teletext_page = 0,
+         .ass_vsfilter_color_compat = 1,
+diff --git a/options/options.h b/options/options.h
+index 152426237..fe0c5eee1 100644
+--- a/options/options.h
++++ b/options/options.h
+@@ -115,6 +115,8 @@ struct mp_subtitle_opts {
+     bool sub_gray;
+     bool ass_enabled;
+     float sub_line_spacing;
++    float sub_background_box_padding;
++    float sub_background_box_radius;
+     bool ass_use_margins;
+     bool sub_use_margins;
+     int ass_vsfilter_color_compat;
+diff --git a/sub/sd_ass.c b/sub/sd_ass.c
+index db4d67dac..a1885c081 100644
+--- a/sub/sd_ass.c
++++ b/sub/sd_ass.c
+@@ -20,6 +20,7 @@
+ #include <string.h>
+ #include <math.h>
+ #include <limits.h>
++#include <stdint.h>
+ 
+ #include <libavutil/common.h>
+ #include <ass/ass.h>
+@@ -61,6 +62,9 @@ struct sd_ass_priv {
+     struct seen_packet *seen_packets;
+     int num_seen_packets;
+     bool check_animated;
++    bool background_style_valid;
++    float background_box_padding;
++    float background_box_radius;
+ };
+ 
+ struct seen_packet {
+@@ -100,6 +104,115 @@ const struct m_sub_options mp_sub_filter_opts = {
+ static void mangle_colors(struct sd *sd, struct sub_bitmaps *parts);
+ static void fill_plaintext(struct sd *sd, double pts);
+ 
++static bool ass_image_is_solid(const ASS_Image *img)
++{
++    if (!img || img->w < 1 || img->h < 1 || !img->bitmap)
++        return false;
++    for (int y = 0; y < img->h; y++) {
++        const uint8_t *row = img->bitmap + y * img->stride;
++        for (int x = 0; x < img->w; x++) {
++            if (row[x] != 0xFF)
++                return false;
++        }
++    }
++    return true;
++}
++
++static bool ass_image_visible_bounds(const ASS_Image *img,
++                                     int *x0, int *y0, int *x1, int *y1)
++{
++    int bx0 = img->w, by0 = img->h, bx1 = 0, by1 = 0;
++    for (int y = 0; y < img->h; y++) {
++        const uint8_t *row = img->bitmap + y * img->stride;
++        for (int x = 0; x < img->w; x++) {
++            if (!row[x])
++                continue;
++            bx0 = MPMIN(bx0, x);
++            by0 = MPMIN(by0, y);
++            bx1 = MPMAX(bx1, x + 1);
++            by1 = MPMAX(by1, y + 1);
++        }
++    }
++    if (bx0 >= bx1 || by0 >= by1)
++        return false;
++    *x0 = img->dst_x + bx0;
++    *y0 = img->dst_y + by0;
++    *x1 = img->dst_x + bx1;
++    *y1 = img->dst_y + by1;
++    return true;
++}
++
++static uint8_t rounded_rect_coverage(int x, int y, int w, int h, double radius)
++{
++    radius = MPMIN(radius, MPMIN(w, h) / 2.0);
++    if (radius <= 0)
++        return 0xFF;
++
++    double px = x + 0.5;
++    double py = y + 0.5;
++    double cx = MPMIN(MPMAX(px, radius), w - radius);
++    double cy = MPMIN(MPMAX(py, radius), h - radius);
++    double distance = hypot(px - cx, py - cy);
++    double coverage = MPMIN(MPMAX(radius + 0.5 - distance, 0.0), 1.0);
++    return lrint(coverage * 255.0);
++}
++
++// libass BorderStyle=4 uses font line metrics, which can leave visibly
++// asymmetric space above text.  Replace only libass' solid background layer
++// with a glyph-bounds box; authored ASS and other border styles stay native.
++static ASS_Image *style_background_boxes(void *tmp, ASS_Image *imgs,
++                                         double padding, double radius)
++{
++    ASS_Image *head = NULL;
++    ASS_Image **tail = &head;
++
++    for (ASS_Image *src = imgs; src; src = src->next) {
++        ASS_Image *dst = talloc(tmp, ASS_Image);
++        *dst = *src;
++        dst->next = NULL;
++
++        if (ass_image_is_solid(src)) {
++            int x0 = INT_MAX, y0 = INT_MAX, x1 = INT_MIN, y1 = INT_MIN;
++            for (ASS_Image *glyph = imgs; glyph; glyph = glyph->next) {
++                int gx0, gy0, gx1, gy1;
++                if (glyph == src || ass_image_is_solid(glyph) ||
++                    !ass_image_visible_bounds(glyph, &gx0, &gy0, &gx1, &gy1) ||
++                    src->dst_x >= gx1 || src->dst_x + src->w <= gx0 ||
++                    src->dst_y >= gy1 || src->dst_y + src->h <= gy0)
++                    continue;
++                x0 = MPMIN(x0, gx0);
++                y0 = MPMIN(y0, gy0);
++                x1 = MPMAX(x1, gx1);
++                y1 = MPMAX(y1, gy1);
++            }
++
++            if (x0 < x1 && y0 < y1) {
++                int pad = lrint(padding);
++                x0 -= pad;
++                y0 -= pad;
++                x1 += pad;
++                y1 += pad;
++                int w = x1 - x0;
++                int h = y1 - y0;
++                uint8_t *bitmap = talloc_array(tmp, uint8_t, (size_t)w * h);
++                for (int y = 0; y < h; y++) {
++                    for (int x = 0; x < w; x++)
++                        bitmap[y * w + x] = rounded_rect_coverage(x, y, w, h, radius);
++                }
++                dst->bitmap = bitmap;
++                dst->stride = dst->w = w;
++                dst->h = h;
++                dst->dst_x = x0;
++                dst->dst_y = y0;
++            }
++        }
++
++        *tail = dst;
++        tail = &dst->next;
++    }
++    return head;
++}
++
+ static const struct sd_filter_functions *const filters[] = {
+     // Note: list order defines filter order.
+     &sd_filter_sdh,
+@@ -779,7 +892,31 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
+ 
+     int changed;
+     ASS_Image *imgs = ass_render_frame(renderer, track, ts, &changed);
++    void *styled = NULL;
++    bool styled_background = imgs && opts->sub_style->border_style == 4 &&
++                             opts->sub_background_box_padding >= 0;
++    if (styled_background)
++    {
++        if (!ctx->background_style_valid ||
++            ctx->background_box_padding != opts->sub_background_box_padding ||
++            ctx->background_box_radius != opts->sub_background_box_radius)
++        {
++            changed = 1;
++        }
++        ctx->background_style_valid = true;
++        ctx->background_box_padding = opts->sub_background_box_padding;
++        ctx->background_box_radius = opts->sub_background_box_radius;
++        styled = talloc_new(NULL);
++        double box_scale = get_libass_scale_height(&dim, opts->sub_use_margins) / 720.0;
++        imgs = style_background_boxes(styled, imgs,
++            opts->sub_background_box_padding * box_scale,
++            opts->sub_background_box_radius * box_scale);
++    } else if (ctx->background_style_valid) {
++        changed = 1;
++        ctx->background_style_valid = false;
++    }
+     mp_sub_packer_pack_ass(ctx->packer, &imgs, 1, changed, !converted, format, res);
++    talloc_free(styled);
+ 
+ done:
+     // mangle_colors() modifies the color field, so copy the thing _before_.
+-- 
+2.51.0.windows.1

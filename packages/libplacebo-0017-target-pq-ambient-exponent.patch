@@ -1,0 +1,109 @@
+From a176ecd4b45e5250585f191bbcad2609f34ea0d5 Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Sat, 22 Aug 2026 17:48:13 -0400
+Subject: [PATCH] colorspace: add target-PQ ambient exponent
+
+---
+ src/include/libplacebo/shaders/colorspace.h |  7 +++++
+ src/shaders/colorspace.c                    | 33 +++++++++++++++++----
+ 2 files changed, 35 insertions(+), 5 deletions(-)
+
+diff --git a/src/include/libplacebo/shaders/colorspace.h b/src/include/libplacebo/shaders/colorspace.h
+index d948a4ac..2384d712 100644
+--- a/src/include/libplacebo/shaders/colorspace.h
++++ b/src/include/libplacebo/shaders/colorspace.h
+@@ -383,6 +383,12 @@ struct pl_color_map_params {
+     // (normal ITP hull processing) to 1.0 (full adaptive formula).
+     float adaptive_chroma_strength;
+ 
++    // Exponent applied to the mapped target-PQ brightness coordinate,
++    // normalized so that black and the configured output peak remain fixed.
++    // Values below 1.0 lift midtones for brighter ambient viewing; 1.0 is
++    // neutral. This is intentionally composed after the ordinary tone curve.
++    float ambient_gamma;
++
+     // Clamp each destination-linear RGB channel to the inferred output peak
+     // before HDR transfer encoding. Intended for explicit HDR output targets;
+     // leave disabled for metadata passthrough.
+@@ -440,6 +446,7 @@ struct pl_color_map_params {
+     .tone_constants         = { PL_TONE_MAP_CONSTANTS },        \
+     .metadata               = PL_HDR_METADATA_ANY,              \
+     .adaptive_chroma_strength = 0.5f,                           \
++    .ambient_gamma          = 1.0f,                             \
+     .lut3d_size             = {48, 32, 256},                    \
+     .lut_size               = 256,                              \
+     .visualize_rect         = {0, 0, 1, 1},                     \
+diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
+index 9cfb63f7..60233bae 100644
+--- a/src/shaders/colorspace.c
++++ b/src/shaders/colorspace.c
+@@ -3013,7 +3013,11 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+         can_fast = true;
+     }
+ 
+-    bool need_tone_map = !pl_tone_map_params_noop(&tone);
++    const float ambient_gamma = isfinite(params->ambient_gamma) &&
++        params->ambient_gamma > 0.0f ? params->ambient_gamma : 1.0f;
++    const bool ambient_active = fabsf(ambient_gamma - 1.0f) > 1e-6f;
++    const bool base_need_tone_map = !pl_tone_map_params_noop(&tone);
++    bool need_tone_map = base_need_tone_map || ambient_active;
+     bool need_gamut_map = !pl_gamut_map_params_noop(&gamut);
+ 
+     if (!args->prelinearized)
+@@ -3136,7 +3140,20 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+ 
+         }
+ 
+-        bool need_recovery = tone.input_max >= tone.output_max;
++        if (ambient_active) {
++            ident_t ambient_map = sh_fresh(sh, "ambient_map");
++            GLSLH("float "$"(float x) {                            \n"
++                  "    float peak = "$";                           \n"
++                  "    float norm = clamp(x / peak, 0.0, 1.0);    \n"
++                  "    return peak * pow(norm, "$");              \n"
++                  "}                                              \n",
++                  ambient_map, SH_FLOAT_DYN(tone.output_max),
++                  SH_FLOAT(ambient_gamma));
++            GLSL("#define ambient_map(x) ("$"(x)) \n", ambient_map);
++        }
++
++        bool need_recovery = base_need_tone_map &&
++            tone.input_max >= tone.output_max;
+         if (!metric_active && need_recovery && params->contrast_recovery && args->feature_map) {
+             ident_t pos, pt;
+             ident_t lowres = sh_bind(sh, args->feature_map, PL_TEX_ADDRESS_CLAMP,
+@@ -3184,6 +3201,9 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+             GLSL("ipt.x = tone_map(ipt.x); \n");
+         }
+ 
++        if (!metric_active && ambient_active)
++            GLSL("ipt.x = ambient_map(ipt.x); \n");
++
+         if (metric_active) {
+             bool maxrgb_metric =
+                 params->tone_mapping_metric == PL_TONE_MAP_METRIC_MAXRGB_ITP ||
+@@ -3193,7 +3213,11 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+                 ? emit_maxrgb_metric(sh)
+                 : emit_bt2020_metric(sh, src.primaries);
+             GLSL("float metric_in = "$"(color.rgb);                       \n"
+-                 "float metric_out = tone_map(metric_in);                 \n"
++                 "float metric_out = tone_map(metric_in);                 \n",
++                 pixel_metric);
++            if (ambient_active)
++                GLSL("metric_out = ambient_map(metric_out);                \n");
++            GLSL(
+                  "float metric_in_v = pow(clamp(metric_in, 0.0, 1.0),    \n"
+                  "                          1.0/78.84375);                 \n"
+                  "float metric_out_v = pow(clamp(metric_out, 0.0, 1.0),  \n"
+@@ -3205,8 +3229,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+                  "    / max(18.8515625-18.6875*metric_out_v,1e-6),       \n"
+                  "      1.0/.1593017578125);                             \n"
+                  "float metric_scale = metric_in_lin > 1e-12            \n"
+-                 "    ? metric_out_lin / metric_in_lin : 1.0;           \n",
+-                 pixel_metric);
++                 "    ? metric_out_lin / metric_in_lin : 1.0;           \n");
+ 
+             if (params->tone_mapping_metric == PL_TONE_MAP_METRIC_BT2020_RGB ||
+                 params->tone_mapping_metric == PL_TONE_MAP_METRIC_MAXRGB_RGB) {
+-- 
+2.54.0.windows.1

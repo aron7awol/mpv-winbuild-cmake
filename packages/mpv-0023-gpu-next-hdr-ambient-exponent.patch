@@ -1,0 +1,77 @@
+From 8d5d1b62c3ffe1cb8b1ea4c6927d6dd22b792076 Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Sat, 22 Aug 2026 17:48:13 -0400
+Subject: [PATCH] gpu-next: expose HDR ambient exponent
+
+---
+ DOCS/man/options.rst    | 7 +++++++
+ video/out/gpu/video.c   | 3 +++
+ video/out/gpu/video.h   | 1 +
+ video/out/vo_gpu_next.c | 1 +
+ 4 files changed, 12 insertions(+)
+
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index c9a8ca4b0..f4562a3a2 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -7765,6 +7765,13 @@ them.
+     does not alter the selected brightness metric, peak measurements, temporal
+     smoothing, tone curve, or final gamut mapping. (``--vo=gpu-next`` only)
+ 
++``--tone-mapping-ambient-gamma=<0.5..1.5>``
++    Applies an exponent to the mapped target-PQ brightness coordinate after
++    normal tone mapping. The coordinate is normalized to the configured output
++    peak, so black and peak white remain fixed. Values below ``1.0`` lift HDR
++    midtones for brighter ambient viewing; ``1.0`` disables the adjustment.
++    (``--vo=gpu-next`` only)
++
+ ``--inverse-tone-mapping``
+     If set, allows inverse tone mapping (expanding dynamic range). Can be used
+     for upscaling SDR content to HDR, or for making HDR content brighter.
+diff --git a/video/out/gpu/video.c b/video/out/gpu/video.c
+index d748805fd..1bd3bcf5c 100644
+--- a/video/out/gpu/video.c
++++ b/video/out/gpu/video.c
+@@ -400,6 +400,7 @@ static const struct gl_video_opts gl_video_opts_def = {
+     .tone_map = {
+         .curve = TONE_MAPPING_AUTO,
+         .adaptive_chroma_strength = 50.0,
++        .ambient_gamma = 1.0,
+         .curve_param = NAN,
+         .max_boost = 1.0,
+         .decay_rate = 20.0,
+@@ -479,6 +480,8 @@ const struct m_sub_options gl_video_conf = {
+             {"maxrgb-rgb", TONE_MAPPING_METRIC_MAXRGB_RGB})},
+         {"tone-mapping-adaptive-chroma-strength",
+             OPT_FLOAT(tone_map.adaptive_chroma_strength), M_RANGE(0.0, 100.0)},
++        {"tone-mapping-ambient-gamma",
++            OPT_FLOAT(tone_map.ambient_gamma), M_RANGE(0.5, 1.5)},
+         {"inverse-tone-mapping", OPT_BOOL(tone_map.inverse)},
+         {"tone-mapping-max-boost", OPT_FLOAT(tone_map.max_boost),
+             M_RANGE(1.0, 10.0)},
+diff --git a/video/out/gpu/video.h b/video/out/gpu/video.h
+index 097611b87..3ee712576 100644
+--- a/video/out/gpu/video.h
++++ b/video/out/gpu/video.h
+@@ -129,6 +129,7 @@ struct gl_tone_map_opts {
+     int curve;
+     int metric;
+     float adaptive_chroma_strength;
++    float ambient_gamma;
+     float curve_param;
+     float max_boost;
+     bool inverse;
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 071ec0129..793275e73 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -3197,6 +3197,7 @@ AV_NOWARN_DEPRECATED(
+     }
+     pars->color_map_params.adaptive_chroma_strength =
+         opts->tone_map.adaptive_chroma_strength / 100.0f;
++    pars->color_map_params.ambient_gamma = opts->tone_map.ambient_gamma;
+     pars->color_map_params.hlg_reference_peak = opts->tone_map.hlg_reference_peak;
+     pars->color_map_params.hard_clip_hdr_target = opts->target_peak > 0;
+     pars->color_map_params.inverse_tone_mapping = opts->tone_map.inverse;
+-- 
+2.54.0.windows.1
