@@ -216,10 +216,10 @@ index 27567827e..f84d73d74 100644
 +                    ? &p->hdrdiag_last_hint : NULL);
 +            p->hdrdiag_swapchain_rearm_frames = 3;
 +            vo->want_redraw = true;
-+            MP_INFO(p, "MPV-SK swapchain recovery complete sequence=%d\n",
++            MP_INFO(p, "mpv-sk swapchain recovery complete sequence=%d\n",
 +                    recreate_sequence);
 +        } else {
-+            MP_ERR(p, "MPV-SK swapchain recovery failed sequence=%d\n",
++            MP_ERR(p, "mpv-sk swapchain recovery failed sequence=%d\n",
 +                   recreate_sequence);
 +        }
 +    }

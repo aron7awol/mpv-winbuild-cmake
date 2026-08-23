@@ -1,5 +1,5 @@
 From b2dfbe050e84f393d1e787c2070f931e52ed8c2b Mon Sep 17 00:00:00 2001
-From: MPV-SK <mpv-sk@local>
+From: mpv-sk <mpv-sk@local>
 Date: Sat, 1 Aug 2026 23:54:21 -0400
 Subject: [PATCH] vo_gpu_next: gate gamut mapping on signal primaries
 

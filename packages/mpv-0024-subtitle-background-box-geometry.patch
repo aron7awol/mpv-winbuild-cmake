@@ -1,17 +1,17 @@
-From 5bcf6f356de39d6c2738fa43498bb6b11d918261 Mon Sep 17 00:00:00 2001
+From 45a7565d413d0c9ea88183948a773fa793b52fc2 Mon Sep 17 00:00:00 2001
 From: Aaron <aaronmedeiros@gmail.com>
 Date: Sat, 22 Aug 2026 16:30:00 -0400
 Subject: [PATCH] sub: add fitted rounded background boxes
 
 ---
- DOCS/man/options.rst |  12 +++++
- options/options.c    |   5 ++
+ DOCS/man/options.rst |  12 ++
+ options/options.c    |   5 +
  options/options.h    |   2 +
- sub/sd_ass.c         | 137 ++++++++++++++++++++++++++++++++++++++++++++
- 4 files changed, 156 insertions(+)
+ sub/sd_ass.c         | 346 +++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 365 insertions(+)
 
 diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
-index c83c979f7..1e7b19a31 100644
+index f4562a3a2..3b256c0f4 100644
 --- a/DOCS/man/options.rst
 +++ b/DOCS/man/options.rst
 @@ -2664,6 +2664,18 @@ Subtitles
@@ -70,7 +70,7 @@ index 152426237..fe0c5eee1 100644
      bool sub_use_margins;
      int ass_vsfilter_color_compat;
 diff --git a/sub/sd_ass.c b/sub/sd_ass.c
-index db4d67dac..a1885c081 100644
+index db4d67dac..5a42e5157 100644
 --- a/sub/sd_ass.c
 +++ b/sub/sd_ass.c
 @@ -20,6 +20,7 @@
@@ -91,7 +91,7 @@ index db4d67dac..a1885c081 100644
  };
  
  struct seen_packet {
-@@ -100,6 +104,115 @@ const struct m_sub_options mp_sub_filter_opts = {
+@@ -100,6 +104,324 @@ const struct m_sub_options mp_sub_filter_opts = {
  static void mangle_colors(struct sd *sd, struct sub_bitmaps *parts);
  static void fill_plaintext(struct sd *sd, double pts);
  
@@ -133,19 +133,260 @@ index db4d67dac..a1885c081 100644
 +    return true;
 +}
 +
-+static uint8_t rounded_rect_coverage(int x, int y, int w, int h, double radius)
-+{
-+    radius = MPMIN(radius, MPMIN(w, h) / 2.0);
-+    if (radius <= 0)
-+        return 0xFF;
++struct box_bounds {
++    int x0, y0, x1, y1;
++};
 +
-+    double px = x + 0.5;
-+    double py = y + 0.5;
-+    double cx = MPMIN(MPMAX(px, radius), w - radius);
-+    double cy = MPMIN(MPMAX(py, radius), h - radius);
-+    double distance = hypot(px - cx, py - cy);
-+    double coverage = MPMIN(MPMAX(radius + 0.5 - distance, 0.0), 1.0);
-+    return lrint(coverage * 255.0);
++struct box_point {
++    double x, y;
++};
++
++static int compare_double(const void *pa, const void *pb)
++{
++    double a = *(const double *)pa;
++    double b = *(const double *)pb;
++    return (a > b) - (a < b);
++}
++
++static void append_box_point(void *tmp, struct box_point **points, int *num,
++                             double x, double y)
++{
++    if (*num && (*points)[*num - 1].x == x && (*points)[*num - 1].y == y)
++        return;
++    MP_TARRAY_APPEND(tmp, *points, *num, ((struct box_point){x, y}));
++}
++
++static void remove_collinear_box_points(struct box_point *points, int *num)
++{
++    bool changed;
++    do {
++        changed = false;
++        for (int i = 0; i < *num && *num > 2; i++) {
++            int prev = (i + *num - 1) % *num;
++            int next = (i + 1) % *num;
++            bool vertical = points[prev].x == points[i].x &&
++                            points[i].x == points[next].x;
++            bool horizontal = points[prev].y == points[i].y &&
++                              points[i].y == points[next].y;
++            if (!vertical && !horizontal)
++                continue;
++            memmove(&points[i], &points[i + 1],
++                    (*num - i - 1) * sizeof(points[0]));
++            (*num)--;
++            changed = true;
++            break;
++        }
++    } while (changed);
++}
++
++static struct box_point *round_box_polygon(void *tmp,
++                                            const struct box_point *corners,
++                                            int num_corners, double radius,
++                                            int *num_points)
++{
++    struct box_point *points = NULL;
++    *num_points = 0;
++    for (int i = 0; i < num_corners; i++) {
++        struct box_point prev = corners[(i + num_corners - 1) % num_corners];
++        struct box_point cur = corners[i];
++        struct box_point next = corners[(i + 1) % num_corners];
++        double in_x = cur.x - prev.x, in_y = cur.y - prev.y;
++        double out_x = next.x - cur.x, out_y = next.y - cur.y;
++        double in_len = hypot(in_x, in_y), out_len = hypot(out_x, out_y);
++        if (in_len <= 0 || out_len <= 0)
++            continue;
++        in_x /= in_len; in_y /= in_len;
++        out_x /= out_len; out_y /= out_len;
++        double r = MPMIN(radius, MPMIN(in_len, out_len) / 2.0);
++        if (r <= 0) {
++            append_box_point(tmp, &points, num_points, cur.x, cur.y);
++            continue;
++        }
++
++        struct box_point entry = {cur.x - in_x * r, cur.y - in_y * r};
++        struct box_point center = {entry.x + out_x * r, entry.y + out_y * r};
++        double start = atan2(entry.y - center.y, entry.x - center.x);
++        double cross = in_x * out_y - in_y * out_x;
++        double sweep = cross > 0 ? M_PI_2 : -M_PI_2;
++        int steps = MPMAX(2, lrint(r / 2.0));
++        append_box_point(tmp, &points, num_points, entry.x, entry.y);
++        for (int n = 1; n <= steps; n++) {
++            double angle = start + sweep * n / steps;
++            append_box_point(tmp, &points, num_points,
++                             center.x + cos(angle) * r,
++                             center.y + sin(angle) * r);
++        }
++    }
++    return points;
++}
++
++static uint8_t *rasterize_box_polygon(void *tmp,
++                                      const struct box_point *points,
++                                      int num_points, int w, int h)
++{
++    enum { SUBSAMPLES = 4 };
++    uint8_t *bitmap = talloc_zero_array(tmp, uint8_t, (size_t)w * h);
++    uint8_t *samples = talloc_zero_array(tmp, uint8_t, (size_t)w * h);
++    double *hits = talloc_array(tmp, double, num_points);
++
++    for (int sy = 0; sy < h * SUBSAMPLES; sy++) {
++        double py = (sy + 0.5) / SUBSAMPLES;
++        int num_hits = 0;
++        for (int i = 0; i < num_points; i++) {
++            struct box_point a = points[i];
++            struct box_point b = points[(i + 1) % num_points];
++            if ((a.y <= py && b.y > py) || (b.y <= py && a.y > py))
++                hits[num_hits++] = a.x + (py - a.y) * (b.x - a.x) / (b.y - a.y);
++        }
++        qsort(hits, num_hits, sizeof(hits[0]), compare_double);
++        for (int i = 0; i + 1 < num_hits; i += 2) {
++            int px0 = MPMAX(0, floor(hits[i]));
++            int px1 = MPMIN(w - 1, floor(hits[i + 1]));
++            for (int x = px0; x <= px1; x++) {
++                for (int sx = 0; sx < SUBSAMPLES; sx++) {
++                    double px = x + (sx + 0.5) / SUBSAMPLES;
++                    if (px >= hits[i] && px < hits[i + 1])
++                        samples[(sy / SUBSAMPLES) * w + x]++;
++                }
++            }
++        }
++    }
++    for (int i = 0; i < w * h; i++)
++        bitmap[i] = lrint(samples[i] * 255.0 / (SUBSAMPLES * SUBSAMPLES));
++    return bitmap;
++}
++
++static void snap_box_line_edges(struct box_bounds *lines, int num_lines,
++                                int distance, bool right)
++{
++    for (int first = 0; first < num_lines;) {
++        int last = first;
++        while (last + 1 < num_lines) {
++            int current = right ? lines[last].x1 : lines[last].x0;
++            int next = right ? lines[last + 1].x1 : lines[last + 1].x0;
++            if (abs(next - current) > distance)
++                break;
++            last++;
++        }
++        if (last > first) {
++            int edge = right ? INT_MIN : INT_MAX;
++            for (int i = first; i <= last; i++)
++                edge = right ? MPMAX(edge, lines[i].x1)
++                             : MPMIN(edge, lines[i].x0);
++            for (int i = first; i <= last; i++) {
++                if (right)
++                    lines[i].x1 = edge;
++                else
++                    lines[i].x0 = edge;
++            }
++        }
++        first = last + 1;
++    }
++}
++
++static bool make_background_box(void *tmp, ASS_Image *imgs, ASS_Image *src,
++                                int pad, double radius, ASS_Image *dst)
++{
++    int *row_x0 = talloc_array(tmp, int, src->h);
++    int *row_x1 = talloc_array(tmp, int, src->h);
++    for (int y = 0; y < src->h; y++) {
++        row_x0[y] = INT_MAX;
++        row_x1[y] = INT_MIN;
++    }
++
++    for (ASS_Image *glyph = imgs; glyph; glyph = glyph->next) {
++        struct box_bounds b;
++        if (glyph == src || glyph->color == src->color ||
++            ass_image_is_solid(glyph) ||
++            !ass_image_visible_bounds(glyph, &b.x0, &b.y0, &b.x1, &b.y1) ||
++            src->dst_x >= b.x1 || src->dst_x + src->w <= b.x0 ||
++            src->dst_y >= b.y1 || src->dst_y + src->h <= b.y0)
++            continue;
++        for (int y = 0; y < glyph->h; y++) {
++            int dst_y = glyph->dst_y + y - src->dst_y;
++            if (dst_y < 0 || dst_y >= src->h)
++                continue;
++            const uint8_t *row = glyph->bitmap + y * glyph->stride;
++            for (int x = 0; x < glyph->w; x++) {
++                int dst_x = glyph->dst_x + x;
++                if (row[x] && dst_x >= src->dst_x &&
++                    dst_x < src->dst_x + src->w)
++                {
++                    row_x0[dst_y] = MPMIN(row_x0[dst_y], dst_x);
++                    row_x1[dst_y] = MPMAX(row_x1[dst_y], dst_x + 1);
++                }
++            }
++        }
++    }
++
++    struct box_bounds *lines = NULL;
++    int num_lines = 0;
++    int last_row = INT_MIN;
++    for (int y = 0; y < src->h; y++) {
++        if (row_x0[y] >= row_x1[y])
++            continue;
++        int screen_y = src->dst_y + y;
++        if (!num_lines || screen_y - last_row > 1) {
++            MP_TARRAY_APPEND(tmp, lines, num_lines,
++                ((struct box_bounds){row_x0[y], screen_y,
++                                     row_x1[y], screen_y + 1}));
++        } else {
++            struct box_bounds *line = &lines[num_lines - 1];
++            line->x0 = MPMIN(line->x0, row_x0[y]);
++            line->x1 = MPMAX(line->x1, row_x1[y]);
++            line->y1 = screen_y + 1;
++        }
++        last_row = screen_y;
++    }
++    if (!num_lines)
++        return false;
++
++    for (int i = 0; i < num_lines; i++) {
++        lines[i].x0 -= pad;
++        lines[i].x1 += pad;
++    }
++    int snap = lrint(radius);
++    snap_box_line_edges(lines, num_lines, snap, false);
++    snap_box_line_edges(lines, num_lines, snap, true);
++
++    int x0 = INT_MAX, x1 = INT_MIN;
++    for (int i = 0; i < num_lines; i++) {
++        x0 = MPMIN(x0, lines[i].x0);
++        x1 = MPMAX(x1, lines[i].x1);
++    }
++    int y0 = lines[0].y0 - pad;
++    int y1 = lines[num_lines - 1].y1 + pad;
++    int w = x1 - x0, h = y1 - y0;
++    if (w <= 0 || h <= 0)
++        return false;
++
++    struct box_point *corners = NULL;
++    int num_corners = 0;
++    append_box_point(tmp, &corners, &num_corners, lines[0].x0 - x0, 0);
++    append_box_point(tmp, &corners, &num_corners, lines[0].x1 - x0, 0);
++    for (int i = 0; i + 1 < num_lines; i++) {
++        double y = ((lines[i].y1 + lines[i + 1].y0) / 2.0) - y0;
++        append_box_point(tmp, &corners, &num_corners, lines[i].x1 - x0, y);
++        append_box_point(tmp, &corners, &num_corners, lines[i + 1].x1 - x0, y);
++    }
++    append_box_point(tmp, &corners, &num_corners, lines[num_lines - 1].x1 - x0, h);
++    append_box_point(tmp, &corners, &num_corners, lines[num_lines - 1].x0 - x0, h);
++    for (int i = num_lines - 2; i >= 0; i--) {
++        double y = ((lines[i].y1 + lines[i + 1].y0) / 2.0) - y0;
++        append_box_point(tmp, &corners, &num_corners, lines[i + 1].x0 - x0, y);
++        append_box_point(tmp, &corners, &num_corners, lines[i].x0 - x0, y);
++    }
++    remove_collinear_box_points(corners, &num_corners);
++
++    int num_points;
++    struct box_point *points = round_box_polygon(tmp, corners, num_corners,
++                                                  radius, &num_points);
++    dst->bitmap = rasterize_box_polygon(tmp, points, num_points, w, h);
++    dst->stride = dst->w = w;
++    dst->h = h;
++    dst->dst_x = x0;
++    dst->dst_y = y0;
++    return true;
 +}
 +
 +// libass BorderStyle=4 uses font line metrics, which can leave visibly
@@ -163,39 +404,7 @@ index db4d67dac..a1885c081 100644
 +        dst->next = NULL;
 +
 +        if (ass_image_is_solid(src)) {
-+            int x0 = INT_MAX, y0 = INT_MAX, x1 = INT_MIN, y1 = INT_MIN;
-+            for (ASS_Image *glyph = imgs; glyph; glyph = glyph->next) {
-+                int gx0, gy0, gx1, gy1;
-+                if (glyph == src || ass_image_is_solid(glyph) ||
-+                    !ass_image_visible_bounds(glyph, &gx0, &gy0, &gx1, &gy1) ||
-+                    src->dst_x >= gx1 || src->dst_x + src->w <= gx0 ||
-+                    src->dst_y >= gy1 || src->dst_y + src->h <= gy0)
-+                    continue;
-+                x0 = MPMIN(x0, gx0);
-+                y0 = MPMIN(y0, gy0);
-+                x1 = MPMAX(x1, gx1);
-+                y1 = MPMAX(y1, gy1);
-+            }
-+
-+            if (x0 < x1 && y0 < y1) {
-+                int pad = lrint(padding);
-+                x0 -= pad;
-+                y0 -= pad;
-+                x1 += pad;
-+                y1 += pad;
-+                int w = x1 - x0;
-+                int h = y1 - y0;
-+                uint8_t *bitmap = talloc_array(tmp, uint8_t, (size_t)w * h);
-+                for (int y = 0; y < h; y++) {
-+                    for (int x = 0; x < w; x++)
-+                        bitmap[y * w + x] = rounded_rect_coverage(x, y, w, h, radius);
-+                }
-+                dst->bitmap = bitmap;
-+                dst->stride = dst->w = w;
-+                dst->h = h;
-+                dst->dst_x = x0;
-+                dst->dst_y = y0;
-+            }
++            make_background_box(tmp, imgs, src, lrint(padding), radius, dst);
 +        }
 +
 +        *tail = dst;
@@ -207,7 +416,7 @@ index db4d67dac..a1885c081 100644
  static const struct sd_filter_functions *const filters[] = {
      // Note: list order defines filter order.
      &sd_filter_sdh,
-@@ -779,7 +892,31 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
+@@ -779,7 +1101,31 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
  
      int changed;
      ASS_Image *imgs = ass_render_frame(renderer, track, ts, &changed);
@@ -240,4 +449,4 @@ index db4d67dac..a1885c081 100644
  done:
      // mangle_colors() modifies the color field, so copy the thing _before_.
 -- 
-2.51.0.windows.1
+2.54.0.windows.1

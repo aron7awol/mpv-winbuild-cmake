@@ -1,5 +1,5 @@
 From 271f9ddd3af6dd8de1b890259644974034c8d11c Mon Sep 17 00:00:00 2001
-From: MPV-SK <local@mpv-sk>
+From: mpv-sk <local@mpv-sk>
 Date: Mon, 3 Aug 2026 20:45:00 -0400
 Subject: [PATCH] vo_gpu_next: add private DTM metric modes
 
@@ -56,7 +56,7 @@ index 3fed8f062..edd9e734d 100644
 +``--tone-mapping-metric=<standard|bt2020-itp|bt2020-adaptive|bt2020-rgb|maxrgb-itp|maxrgb-adaptive|maxrgb-rgb>``
 +    Selects the brightness metric for renderer-generated dynamic tone mapping.
 +    ``standard`` uses libplacebo's normal brightness metric.
-+    The three ``bt2020`` modes use MPV-SK's smooth, homogeneous approximation of
++    The three ``bt2020`` modes use mpv-sk's smooth, homogeneous approximation of
 +    the selected literal p=1 BT.2020 perceptual coordinate. ``bt2020-itp``
 +    applies the metric-derived compression to I while retaining libplacebo's
 +    normal conservative ITP chroma processing. ``bt2020-adaptive`` retains
