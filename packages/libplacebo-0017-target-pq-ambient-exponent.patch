@@ -1,31 +1,34 @@
-From a176ecd4b45e5250585f191bbcad2609f34ea0d5 Mon Sep 17 00:00:00 2001
+From 258f857d816e6fee7a8d6c81c7b4a3b39c97e8e4 Mon Sep 17 00:00:00 2001
 From: Aaron <aaronmedeiros@gmail.com>
 Date: Sat, 22 Aug 2026 17:48:13 -0400
 Subject: [PATCH] colorspace: add target-PQ ambient exponent
 
 ---
- src/include/libplacebo/shaders/colorspace.h |  7 +++++
- src/shaders/colorspace.c                    | 33 +++++++++++++++++----
- 2 files changed, 35 insertions(+), 5 deletions(-)
+ src/include/libplacebo/shaders/colorspace.h |  9 +++
+ src/shaders/colorspace.c                    | 89 +++++++++++++++++++--
+ src/tests/gpu_tests.c                       | 78 ++++++++++++++++++
+ 3 files changed, 170 insertions(+), 6 deletions(-)
 
 diff --git a/src/include/libplacebo/shaders/colorspace.h b/src/include/libplacebo/shaders/colorspace.h
-index d948a4ac..2384d712 100644
+index d948a4ac..160570ba 100644
 --- a/src/include/libplacebo/shaders/colorspace.h
 +++ b/src/include/libplacebo/shaders/colorspace.h
-@@ -383,6 +383,12 @@ struct pl_color_map_params {
+@@ -383,6 +383,14 @@ struct pl_color_map_params {
      // (normal ITP hull processing) to 1.0 (full adaptive formula).
      float adaptive_chroma_strength;
  
-+    // Exponent applied to the mapped target-PQ brightness coordinate,
-+    // normalized so that black and the configured output peak remain fixed.
-+    // Values below 1.0 lift midtones for brighter ambient viewing; 1.0 is
-+    // neutral. This is intentionally composed after the ordinary tone curve.
++    // Exponent applied to the mapped target-PQ I coordinate, normalized so
++    // that black and the configured output peak remain fixed. Values below
++    // 1.0 lift midtones for brighter ambient viewing; 1.0 is neutral. The
++    // ordinary tone/gamut reconstruction runs first. Ambient adjustment then
++    // preserves the resulting ITP hue/chroma wherever target RGB can represent
++    // it, reducing chroma along constant ITP hue only at the actual boundary.
 +    float ambient_gamma;
 +
      // Clamp each destination-linear RGB channel to the inferred output peak
      // before HDR transfer encoding. Intended for explicit HDR output targets;
      // leave disabled for metadata passthrough.
-@@ -440,6 +446,7 @@ struct pl_color_map_params {
+@@ -440,6 +448,7 @@ struct pl_color_map_params {
      .tone_constants         = { PL_TONE_MAP_CONSTANTS },        \
      .metadata               = PL_HDR_METADATA_ANY,              \
      .adaptive_chroma_strength = 0.5f,                           \
@@ -34,10 +37,22 @@ index d948a4ac..2384d712 100644
      .lut_size               = 256,                              \
      .visualize_rect         = {0, 0, 1, 1},                     \
 diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
-index 9cfb63f7..60233bae 100644
+index 9cfb63f7..bfc92844 100644
 --- a/src/shaders/colorspace.c
 +++ b/src/shaders/colorspace.c
-@@ -3013,7 +3013,11 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+@@ -2827,7 +2827,10 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+     if (params->hlg_reference_peak > 0.0f &&
+         src.transfer == PL_COLOR_TRC_HLG && pl_color_space_is_hdr(&dst))
+         src.hdr.max_luma = params->hlg_reference_peak;
+-    if (pl_color_space_equal(&src, &dst)) {
++    const bool ambient_requested = isfinite(params->ambient_gamma) &&
++        params->ambient_gamma > 0.0f &&
++        fabsf(params->ambient_gamma - 1.0f) > 1e-6f;
++    if (pl_color_space_equal(&src, &dst) && !ambient_requested) {
+ #ifdef PL_BLACK_LEVEL_DIAGNOSTICS
+         blkdiag_identity(sh, obj, &src, &dst);
+ #endif
+@@ -3013,7 +3016,11 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
          can_fast = true;
      }
  
@@ -50,13 +65,14 @@ index 9cfb63f7..60233bae 100644
      bool need_gamut_map = !pl_gamut_map_params_noop(&gamut);
  
      if (!args->prelinearized)
-@@ -3136,7 +3140,20 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+@@ -3136,7 +3143,37 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
  
          }
  
 -        bool need_recovery = tone.input_max >= tone.output_max;
 +        if (ambient_active) {
 +            ident_t ambient_map = sh_fresh(sh, "ambient_map");
++            ident_t ambient_ipt_to_rgb = sh_fresh(sh, "ambient_ipt_to_rgb");
 +            GLSLH("float "$"(float x) {                            \n"
 +                  "    float peak = "$";                           \n"
 +                  "    float norm = clamp(x / peak, 0.0, 1.0);    \n"
@@ -65,6 +81,22 @@ index 9cfb63f7..60233bae 100644
 +                  ambient_map, SH_FLOAT_DYN(tone.output_max),
 +                  SH_FLOAT(ambient_gamma));
 +            GLSL("#define ambient_map(x) ("$"(x)) \n", ambient_map);
++            GLSLH("vec3 "$"(vec3 ambient_ipt) {                    \n"
++                  "    vec3 ambient_lmspq = "$" * ambient_ipt;     \n"
++                  "    vec3 ambient_lms = pow(max(ambient_lmspq,   \n"
++                  "        0.0), vec3(1.0/%f));                   \n"
++                  "    ambient_lms = max(ambient_lms-vec3(%f),0.0)\n"
++                  "        / (vec3(%f)-%f*ambient_lms);           \n"
++                  "    ambient_lms = pow(ambient_lms,              \n"
++                  "        vec3(1.0/%f));                         \n"
++                  "    ambient_lms *= %f;                          \n"
++                  "    return "$" * ambient_lms;                  \n"
++                  "}                                              \n",
++                  ambient_ipt_to_rgb, ipt2lms,
++                  PQ_M2, PQ_C1, PQ_C2, PQ_C3, PQ_M1,
++                  10000 / PL_COLOR_SDR_WHITE, SH_MAT3(lms2rgb));
++            GLSL("#define ambient_ipt_to_rgb(x) ("$"(x)) \n",
++                 ambient_ipt_to_rgb);
 +        }
 +
 +        bool need_recovery = base_need_tone_map &&
@@ -72,30 +104,18 @@ index 9cfb63f7..60233bae 100644
          if (!metric_active && need_recovery && params->contrast_recovery && args->feature_map) {
              ident_t pos, pt;
              ident_t lowres = sh_bind(sh, args->feature_map, PL_TEX_ADDRESS_CLAMP,
-@@ -3184,6 +3201,9 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
-             GLSL("ipt.x = tone_map(ipt.x); \n");
-         }
- 
-+        if (!metric_active && ambient_active)
-+            GLSL("ipt.x = ambient_map(ipt.x); \n");
-+
-         if (metric_active) {
-             bool maxrgb_metric =
-                 params->tone_mapping_metric == PL_TONE_MAP_METRIC_MAXRGB_ITP ||
-@@ -3193,7 +3213,11 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+@@ -3193,7 +3230,9 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
                  ? emit_maxrgb_metric(sh)
                  : emit_bt2020_metric(sh, src.primaries);
              GLSL("float metric_in = "$"(color.rgb);                       \n"
 -                 "float metric_out = tone_map(metric_in);                 \n"
 +                 "float metric_out = tone_map(metric_in);                 \n",
 +                 pixel_metric);
-+            if (ambient_active)
-+                GLSL("metric_out = ambient_map(metric_out);                \n");
 +            GLSL(
                   "float metric_in_v = pow(clamp(metric_in, 0.0, 1.0),    \n"
                   "                          1.0/78.84375);                 \n"
                   "float metric_out_v = pow(clamp(metric_out, 0.0, 1.0),  \n"
-@@ -3205,8 +3229,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+@@ -3205,8 +3244,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
                   "    / max(18.8515625-18.6875*metric_out_v,1e-6),       \n"
                   "      1.0/.1593017578125);                             \n"
                   "float metric_scale = metric_in_lin > 1e-12            \n"
@@ -105,5 +125,154 @@ index 9cfb63f7..60233bae 100644
  
              if (params->tone_mapping_metric == PL_TONE_MAP_METRIC_BT2020_RGB ||
                  params->tone_mapping_metric == PL_TONE_MAP_METRIC_MAXRGB_RGB) {
+@@ -3332,6 +3370,41 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+         }
+     }
+ 
++    if (ambient_active) {
++        // Apply ambient compensation after the ordinary tone/chroma and gamut
++        // reconstruction. Preserve the resulting P/T exactly when the lifted
++        // ITP value is representable in target RGB. Only boundary pixels move
++        // toward neutral, along their constant ITP hue direction.
++        const float ambient_rgb_max = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NORM,
++                                                      tone.output_max);
++        GLSL("float ambient_i = ambient_map(ipt.x);                    \n"
++             "vec2 ambient_pt = ipt.yz;                               \n"
++             "vec3 ambient_rgb = ambient_ipt_to_rgb(                  \n"
++             "    vec3(ambient_i, ambient_pt));                       \n"
++             "bool ambient_fits = all(greaterThanEqual(ambient_rgb,   \n"
++             "    vec3(0.0))) && all(lessThanEqual(ambient_rgb,       \n"
++             "    vec3("$")));                                      \n"
++             "if (!ambient_fits) {                                    \n"
++             "    float ambient_lo = 0.0;                             \n"
++             "    float ambient_hi = 1.0;                             \n"
++             "    for (int ambient_j = 0; ambient_j < 10; ambient_j++) {\n"
++             "        float ambient_mid = 0.5*(ambient_lo+ambient_hi);\n"
++             "        vec3 ambient_trial = ambient_ipt_to_rgb(        \n"
++             "            vec3(ambient_i, ambient_pt*ambient_mid));   \n"
++             "        bool ambient_trial_fits = all(greaterThanEqual( \n"
++             "            ambient_trial, vec3(0.0))) && all(          \n"
++             "            lessThanEqual(ambient_trial, vec3("$")));  \n"
++             "        if (ambient_trial_fits)                         \n"
++             "            ambient_lo = ambient_mid;                   \n"
++             "        else                                            \n"
++             "            ambient_hi = ambient_mid;                   \n"
++             "    }                                                   \n"
++             "    ambient_pt *= ambient_lo;                           \n"
++             "}                                                       \n"
++             "ipt = vec3(ambient_i, ambient_pt);                      \n",
++             SH_FLOAT_DYN(ambient_rgb_max), SH_FLOAT_DYN(ambient_rgb_max));
++    }
++
+     // Convert IPT back to linear RGB
+     GLSL("lmspq = "$" * ipt;                        \n"
+          "lms = pow(max(lmspq, 0.0), vec3(1.0/%f)); \n"
+@@ -3367,6 +3440,10 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+             visualize_tone_map(sh, params->visualize_rect, alpha, &tone);
+         }
+         GLSL("#undef tone_map \n");
++        if (ambient_active) {
++            GLSL("#undef ambient_map \n"
++                 "#undef ambient_ipt_to_rgb \n");
++        }
+     }
+ 
+ done:
+diff --git a/src/tests/gpu_tests.c b/src/tests/gpu_tests.c
+index a43c0a9d..5d1d8db8 100644
+--- a/src/tests/gpu_tests.c
++++ b/src/tests/gpu_tests.c
+@@ -2594,6 +2594,83 @@ static void pl_hdr_target_clip_test(pl_gpu gpu)
+     pl_tex_destroy(gpu, &dst);
+ }
+ 
++static void pq_bt2020_to_ipt(float color[3])
++{
++    for (int i = 0; i < 3; i++)
++        color[i] = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NORM, color[i]);
++    const pl_matrix3x3 rgb2lms =
++        pl_ipt_rgb2lms(pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020));
++    pl_matrix3x3_apply(&rgb2lms, color);
++    for (int i = 0; i < 3; i++)
++        color[i] = pl_hdr_rescale(PL_HDR_NORM, PL_HDR_PQ, color[i]);
++    pl_matrix3x3_apply(&pl_ipt_lms2ipt, color);
++}
++
++static void pl_ambient_ipt_boundary_test(pl_gpu gpu)
++{
++    if (gpu->glsl.version < 410)
++        return;
++
++    printf("pl_ambient_ipt_boundary_test:\n");
++    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 16, 32,
++                             PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_LINEAR);
++    if (!fmt)
++        return;
++
++    const float input[4] = {
++        pl_hdr_rescale(PL_HDR_NITS, PL_HDR_PQ, 120.0f),
++        pl_hdr_rescale(PL_HDR_NITS, PL_HDR_PQ, 55.0f),
++        pl_hdr_rescale(PL_HDR_NITS, PL_HDR_PQ, 25.0f),
++        1.0f,
++    };
++    float output[2][4] = {{0}};
++    pl_tex src = pl_tex_create(gpu, pl_tex_params(
++        .format = fmt, .w = 1, .h = 1, .sampleable = true,
++        .initial_data = input,
++    ));
++    pl_tex dst = pl_tex_create(gpu, pl_tex_params(
++        .format = fmt, .w = 1, .h = 1, .renderable = true,
++        .host_readable = true,
++    ));
++    REQUIRE(src && dst);
++
++    pl_dispatch dp = pl_dispatch_create(gpu->log, gpu);
++    REQUIRE(dp);
++    pl_shader_obj state = NULL;
++    struct pl_color_space src_csp = pl_color_space_hdr10;
++    struct pl_color_space dst_csp = pl_color_space_hdr10;
++    src_csp.hdr.max_luma = 1000.0f;
++    dst_csp.hdr.max_luma = 1000.0f;
++    struct pl_color_map_params params = pl_color_map_default_params;
++
++    for (int lifted = 0; lifted <= 1; lifted++) {
++        params.ambient_gamma = lifted ? 0.9f : 1.0f;
++        pl_shader sh = pl_dispatch_begin(dp);
++        pl_shader_sample_nearest(sh, pl_sample_src(.tex = src));
++        pl_shader_color_map(sh, &params, src_csp, dst_csp, &state, false);
++        REQUIRE(pl_dispatch_finish(dp, pl_dispatch_params(
++            .shader = &sh, .target = dst,
++        )));
++        REQUIRE(pl_tex_download(gpu, pl_tex_transfer_params(
++            .tex = dst, .ptr = output[lifted],
++        )));
++    }
++
++    float base_ipt[3], lifted_ipt[3];
++    memcpy(base_ipt, output[0], sizeof(base_ipt));
++    memcpy(lifted_ipt, output[1], sizeof(lifted_ipt));
++    pq_bt2020_to_ipt(base_ipt);
++    pq_bt2020_to_ipt(lifted_ipt);
++    REQUIRE(lifted_ipt[0] > base_ipt[0]);
++    REQUIRE_FEQ(lifted_ipt[1], base_ipt[1], 3e-4f);
++    REQUIRE_FEQ(lifted_ipt[2], base_ipt[2], 3e-4f);
++
++    pl_shader_obj_destroy(&state);
++    pl_dispatch_destroy(&dp);
++    pl_tex_destroy(gpu, &src);
++    pl_tex_destroy(gpu, &dst);
++}
++
+ void gpu_shader_tests(pl_gpu gpu)
+ {
+     pl_buffer_tests(gpu);
+@@ -2610,6 +2687,7 @@ void gpu_shader_tests(pl_gpu gpu)
+     pl_causal_temporal_fixture_test(gpu);
+     pl_causal_translation_fixture_test(gpu);
+     pl_hdr_target_clip_test(gpu);
++    pl_ambient_ipt_boundary_test(gpu);
+ 
+     REQUIRE(!pl_gpu_is_failed(gpu));
+ }
 -- 
 2.54.0.windows.1

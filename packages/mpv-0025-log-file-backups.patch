@@ -1,0 +1,89 @@
+From 8b19f91f62e7b20b7e27473678cb20ea450f6880 Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Sun, 23 Aug 2026 14:00:00 -0400
+Subject: [PATCH] msg: optionally retain previous log files
+
+---
+ DOCS/man/options.rst |  7 +++++++
+ common/msg.c         | 19 +++++++++++++++++++
+ options/options.c    |  2 ++
+ options/options.h    |  1 +
+ 4 files changed, 29 insertions(+)
+
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -828,6 +828,13 @@ Program Behavior
+     A special case is the macOS bundle, it will create a log file at
+     ``~/Library/Logs/mpv.log`` by default.
+ 
++``--log-file-backups=<0..100>``
++    Keep this many previous ``--log-file`` files when opening a new log.
++    The immediately previous log uses the ``.1`` suffix, with older logs
++    shifted upward through the configured limit. The default is ``0``, which
++    preserves the normal behavior of replacing the existing log without a
++    backup.
++
+ ``--config-dir=<path>``
+     Force a different configuration directory. If this is set, the given
+     directory is used to load configuration files, and all other configuration
+diff --git a/common/msg.c b/common/msg.c
+--- a/common/msg.c
++++ b/common/msg.c
+@@ -843,6 +843,24 @@ static bool check_new_path(struct mpv_global *global, char *opt,
+     return res;
+ }
+ 
++static void rotate_log_files(const char *path, int backups)
++{
++    if (backups <= 0)
++        return;
++
++    void *tmp = talloc_new(NULL);
++    for (int n = backups; n > 0; n--) {
++        char *dst = talloc_asprintf(tmp, "%s.%d", path, n);
++        char *src = n == 1
++            ? (char *)path
++            : talloc_asprintf(tmp, "%s.%d", path, n - 1);
++        if (n == backups)
++            unlink(dst);
++        rename(src, dst);
++    }
++    talloc_free(tmp);
++}
++
+ void mp_msg_update_msglevels(struct mpv_global *global, struct MPOpts *opts)
+ {
+     struct mp_log_root *root = global->log->root;
+@@ -877,6 +895,7 @@ void mp_msg_update_msglevels(struct mpv_global *global, struct MPOpts *opts)
+     if (check_new_path(global, opts->log_file, &root->log_path)) {
+         terminate_log_file_thread(root);
+         if (root->log_path) {
++            rotate_log_files(root->log_path, opts->log_file_backups);
+             root->log_file = fopen(root->log_path, "wb");
+             if (root->log_file) {
+ 
+diff --git a/options/options.c b/options/options.c
+--- a/options/options.c
++++ b/options/options.c
+@@ -541,5 +541,7 @@ static const m_option_t mp_opts[] = {
+     {"log-file", OPT_STRING(log_file),
+         .flags = M_OPT_PRE_PARSE | M_OPT_FILE | UPDATE_TERM},
++    {"log-file-backups", OPT_INT(log_file_backups), M_RANGE(0, 100),
++        .flags = M_OPT_PRE_PARSE | UPDATE_TERM},
+ #endif
+     {"msg-module", OPT_BOOL(msg_module), .flags = UPDATE_TERM},
+     {"msg-time", OPT_BOOL(msg_time), .flags = UPDATE_TERM},
+diff --git a/options/options.h b/options/options.h
+--- a/options/options.h
++++ b/options/options.h
+@@ -179,6 +179,7 @@ typedef struct MPOpts {
+     bool msg_module;
+     bool msg_time;
+     char *log_file;
++    int log_file_backups;
+ 
+     int operation_mode;
+ 
+-- 
+2.51.0.windows.1
