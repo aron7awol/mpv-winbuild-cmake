@@ -35,11 +35,11 @@ ExternalProject_Add(mpv
         subrandr
         libsixel
     GIT_REPOSITORY https://github.com/mpv-player/mpv.git
-    GIT_TAG 74356c0fc669d21af9daac5a11f296123efd0684
+    GIT_TAG 654e9382c0bbccb09ccac348f792e9d378e9c7a9
     SOURCE_DIR ${SOURCE_LOCATION}
     GIT_CLONE_FLAGS "--filter=tree:0"
     PATCH_COMMAND bash -c "git am --abort 2>/dev/null || true"
-    COMMAND ${EXEC} git reset --hard 74356c0fc669d21af9daac5a11f296123efd0684
+    COMMAND ${EXEC} git reset --hard 654e9382c0bbccb09ccac348f792e9d378e9c7a9
     COMMAND ${EXEC} git am --3way ${CMAKE_CURRENT_SOURCE_DIR}/mpv-*.patch
     # Make ExternalProject invalidate a restored patch-step stamp whenever the
     # ordered patch stack changes, instead of building a stale cached source.

@@ -20,13 +20,13 @@ ExternalProject_Add(libplacebo
         fast_float
         xxhash
     GIT_REPOSITORY https://github.com/haasn/libplacebo.git
-    GIT_TAG 4c426e466814536def653cb23f1d1c287ea7a7f5
+    GIT_TAG 22ee762e8e0890fc54068beb670310f0edce7263
     SOURCE_DIR ${SOURCE_LOCATION}
     GIT_CLONE_FLAGS "--filter=tree:0"
     GIT_SUBMODULES ""
     UPDATE_COMMAND ""
     PATCH_COMMAND bash -c "git am --abort 2>/dev/null || true"
-    COMMAND ${EXEC} git reset --hard 4c426e466814536def653cb23f1d1c287ea7a7f5
+    COMMAND ${EXEC} git reset --hard 22ee762e8e0890fc54068beb670310f0edce7263
     COMMAND ${EXEC} git am --3way ${libplacebo_patches}
     # Include the patch contents in the generated step command so restored
     # ExternalProject stamps cannot preserve a stale source checkout.
