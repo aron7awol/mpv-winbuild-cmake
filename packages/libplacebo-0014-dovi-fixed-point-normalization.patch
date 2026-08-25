@@ -1,5 +1,5 @@
 From c1e1a8e3bb2e2dc38495f43b0bf43a08871c30be Mon Sep 17 00:00:00 2001
-From: mpv-sk <mpv-sk@local>
+From: mpv-ht <mpv-ht@local>
 Date: Tue, 18 Aug 2026 20:05:46 -0400
 Subject: [PATCH] colorspace: reproduce Dolby fixed-point reconstruction stages
 

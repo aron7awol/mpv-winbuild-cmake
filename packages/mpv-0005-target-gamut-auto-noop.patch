@@ -1,5 +1,5 @@
 From 4b1f7c9d0e2a3b5c6d7e8f9a0b1c2d3e4f5a6b70 Mon Sep 17 00:00:00 2001
-From: mpv-sk <mpv-sk@local>
+From: mpv-ht <mpv-ht@local>
 Date: Thu, 30 Jul 2026 00:00:00 -0400
 Subject: [PATCH] vo_gpu_next: ignore unparsable --target-gamut values
 

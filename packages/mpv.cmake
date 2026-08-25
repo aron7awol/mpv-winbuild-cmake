@@ -54,7 +54,7 @@ ExternalProject_Add(mpv
         -Ddebug=true
         -Db_ndebug=true
         -Doptimization=3
-        # The current mpv-sk engine stack exceeds the GitHub runner's linker
+        # The current mpv-ht engine stack exceeds the GitHub runner's linker
         # memory even for a single-job, no-PDB ThinLTO link of libmpv.
         -Db_lto=false
         -Dlibmpv=true

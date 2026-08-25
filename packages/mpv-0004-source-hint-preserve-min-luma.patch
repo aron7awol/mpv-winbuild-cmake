@@ -1,5 +1,5 @@
 From 8c0ff53d4295fa05901404a85d769b1380aef00d Mon Sep 17 00:00:00 2001
-From: mpv-sk <mpv-sk@local>
+From: mpv-ht <mpv-ht@local>
 Date: Thu, 30 Jul 2026 00:00:00 -0400
 Subject: [PATCH] vo_gpu_next: preserve source hint minimum luminance
 

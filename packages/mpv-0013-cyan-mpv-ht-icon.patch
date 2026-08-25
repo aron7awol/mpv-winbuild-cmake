@@ -1,7 +1,7 @@
 From 4dc7b2c6aa30013bf24eb31c0f700208de1d2c29 Mon Sep 17 00:00:00 2001
-From: mpv-sk <mpv-sk@local>
+From: mpv-ht <mpv-ht@local>
 Date: Wed, 5 Aug 2026 14:50:44 -0400
-Subject: [PATCH] windows: use cyan mpv-sk application icon
+Subject: [PATCH] windows: use cyan mpv-ht application icon
 
 ---
  etc/mpv-icon-8bit-128x128.png | Bin 22984 -> 24353 bytes

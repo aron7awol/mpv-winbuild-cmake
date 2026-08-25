@@ -55,7 +55,7 @@ index 7821c84d..8fc3363b 100644
  }
  
 +#ifdef PL_BLACK_LEVEL_DIAGNOSTICS
-+// Private mpv-sk diagnostic. These are synthetic neutral PQ signals injected
++// Private mpv-ht diagnostic. These are synthetic neutral PQ signals injected
 +// after decoding/range reconstruction; they are not source YUV or DV codes.
 +struct blkdiag_probe {
 +    float tone;

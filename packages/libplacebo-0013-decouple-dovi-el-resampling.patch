@@ -1,5 +1,5 @@
 From 0c701ace59ba2306ff880296c73e69e1f1085c43 Mon Sep 17 00:00:00 2001
-From: mpv-sk <mpv-sk@localhost>
+From: mpv-ht <mpv-ht@localhost>
 Date: Sun, 16 Aug 2026 21:27:38 -0400
 Subject: [PATCH] renderer: use staged Dolby Vision EL reference resampling
 
