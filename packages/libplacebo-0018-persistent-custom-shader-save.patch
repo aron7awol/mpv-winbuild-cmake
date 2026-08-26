@@ -1,0 +1,236 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <development@mpv-ht.local>
+Date: Wed, 26 Aug 2026 19:30:00 -0400
+Subject: [PATCH] custom shader: allow persistent named SAVE textures
+
+OUTPUT hooks are rerun when mpv redraws a paused cached frame, but earlier
+stages used to lose their named SAVE textures at the start of every renderer
+call. Add an opt-in PERSIST directive backed by a caller-owned renderer-format
+texture. This lets a later output hook reuse source-stage analysis data without
+reprocessing the frame or advancing tone-mapping state.
+---
+ docs/custom-shaders.md                  | 10 ++++++++
+ src/include/libplacebo/shaders/custom.h |  8 ++++++
+ src/renderer.c                          | 21 ++++++++++++++++
+ src/shaders/custom_mpv.c                | 45 ++++++++++++++++++++++++++++++---
+ src/tests/gpu_tests.c                   | 11 ++++++++
+ 5 files changed, 91 insertions(+), 4 deletions(-)
+
+diff --git a/docs/custom-shaders.md b/docs/custom-shaders.md
+index c6dc1073..76654b29 100644
+--- a/docs/custom-shaders.md
++++ b/docs/custom-shaders.md
+@@ -186,6 +186,16 @@ vec4 hook()
+ }
+ ```
+ 
++### `PERSIST`
++
++Keep the texture named by a `SAVE` directive available across renderer calls.
++This is intended for a later hook stage that must reuse an earlier stage's
++result when the renderer redraws a cached frame without executing that earlier
++stage again. The persistent texture is overwritten whenever its saving pass
++runs, and is released when the user shader is destroyed. `PERSIST` requires a
++named `SAVE` texture and may increase GPU memory use by the size of that saved
++image.
++
+ This shader binds both luma and chroma and resizes the luma plane down to the
+ size of the chroma plane, saving the result as a new texture `LUMA_LOWRES`. In
+ general, you can pick any name you want, here.
+diff --git a/src/include/libplacebo/shaders/custom.h b/src/include/libplacebo/shaders/custom.h
+index a4eec695..c3df8b9b 100644
+--- a/src/include/libplacebo/shaders/custom.h
++++ b/src/include/libplacebo/shaders/custom.h
+@@ -223,6 +223,14 @@ struct pl_hook_params {
+     // a result of previous hooks being executed. (e.g. prescalers)
+     pl_rect2df src_rect;
+     pl_rect2d dst_rect;
++
++    // Helper function to create or resize a caller-owned texture using the
++    // renderer's intermediate format. Unlike `get_tex`, this texture is not
++    // part of the renderer's temporary pool and remains valid across render
++    // calls. The caller must eventually destroy it with `pl_tex_destroy`.
++    // May be NULL when persistent textures are unsupported.
++    bool (*recreate_persistent_tex)(void *priv, pl_tex *tex,
++                                    int width, int height);
+ };
+ 
+ struct pl_hook_res {
+diff --git a/src/renderer.c b/src/renderer.c
+index f5e78ea2..09936222 100644
+--- a/src/renderer.c
++++ b/src/renderer.c
+@@ -1095,6 +1095,26 @@ static pl_tex get_hook_tex(void *priv, int width, int height)
+     return get_fbo(pass, width, height, NULL, 4, PL_DEBUG_TAG);
+ }
+ 
++static bool recreate_persistent_hook_tex(void *priv, pl_tex *tex,
++                                         int width, int height)
++{
++    struct pass_state *pass = priv;
++    pl_fmt fmt = pass->fbofmt[4];
++    if (!fmt)
++        return false;
++
++    return pl_tex_recreate(pass->rr->gpu, tex, pl_tex_params(
++        .w = width,
++        .h = height,
++        .format = fmt,
++        .sampleable = true,
++        .renderable = true,
++        .blit_src = fmt->caps & PL_FMT_CAP_BLITTABLE,
++        .storable = fmt->caps & PL_FMT_CAP_STORABLE,
++        .debug_tag = "persistent custom shader texture",
++    ));
++}
++
+ // Returns if any hook was applied (even if there were errors)
+ static bool pass_hook(struct pass_state *pass, struct img *img,
+                       enum pl_hook_stage stage)
+@@ -1126,6 +1146,7 @@ static bool pass_hook(struct pass_state *pass, struct img *img,
+             .gpu = rr->gpu,
+             .dispatch = rr->dp,
+             .get_tex = get_hook_tex,
++            .recreate_persistent_tex = recreate_persistent_hook_tex,
+             .priv = pass,
+             .stage = stage,
+             .rect = img->rect,
+diff --git a/src/shaders/custom_mpv.c b/src/shaders/custom_mpv.c
+index 1c93da50..bdac4fc3 100644
+--- a/src/shaders/custom_mpv.c
++++ b/src/shaders/custom_mpv.c
+@@ -66,6 +66,8 @@ struct custom_shader_hook {
+     pl_str hook_tex[SHADER_MAX_HOOKS];
+     pl_str bind_tex[SHADER_MAX_BINDS];
+     pl_str save_tex;
++    bool persist;
++    pl_tex persistent_fbo;
+ 
+     // Shader body itself + metadata
+     pl_str pass_body;
+@@ -209,6 +211,15 @@ static bool parse_hook(pl_log log, pl_str *body, struct custom_shader_hook *out)
+             continue;
+         }
+ 
++        if (pl_str_eatstart0(&line, "PERSIST")) {
++            if (pl_str_strip(line).len) {
++                pl_err(log, "PERSIST does not accept arguments!");
++                return false;
++            }
++            out->persist = true;
++            continue;
++        }
++
+         if (pl_str_eatstart0(&line, "DESC")) {
+             out->pass_desc = pl_str_strip(line);
+             continue;
+@@ -299,6 +310,11 @@ static bool parse_hook(pl_log log, pl_str *body, struct custom_shader_hook *out)
+     if (hook_idx == 0)
+         pl_warn(log, "Pass has no hooked textures (will be ignored)!");
+ 
++    if (out->persist && !out->save_tex.len) {
++        pl_err(log, "PERSIST requires a named SAVE texture!");
++        return false;
++    }
++
+     return true;
+ }
+ 
+@@ -909,6 +925,7 @@ struct hook_pass {
+ struct pass_tex {
+     pl_str name;
+     pl_tex tex;
++    bool persistent;
+ 
+     // Metadata
+     pl_rect2df rect;
+@@ -941,7 +958,12 @@ struct hook_priv {
+ static void hook_reset(void *priv)
+ {
+     struct hook_priv *p = priv;
+-    p->pass_textures.num = 0;
++    int keep = 0;
++    for (int i = 0; i < p->pass_textures.num; i++) {
++        if (p->pass_textures.elem[i].persistent)
++            p->pass_textures.elem[keep++] = p->pass_textures.elem[i];
++    }
++    p->pass_textures.num = keep;
+ }
+ 
+ // Context during execution of a hook
+@@ -1258,11 +1280,11 @@ static struct pl_hook_res hook_hook(void *priv, const struct pl_hook_params *par
+     }
+ 
+     for (int n = 0; n < p->hook_passes.num; n++) {
+-        const struct hook_pass *pass = &p->hook_passes.elem[n];
++        struct hook_pass *pass = &p->hook_passes.elem[n];
+         if (!(pass->exec_stages & params->stage))
+             continue;
+ 
+-        const struct custom_shader_hook *hook = &pass->hook;
++        struct custom_shader_hook *hook = &pass->hook;
+         PL_TRACE(p, "Executing hook pass %d on stage '%.*s': %.*s",
+                  n, PL_STR_FMT(stage), PL_STR_FMT(hook->pass_desc));
+ 
+@@ -1472,7 +1494,19 @@ static struct pl_hook_res hook_hook(void *priv, const struct pl_hook_params *par
+ 
+         // Generate a new texture to store the render result
+         pl_tex fbo;
+-        fbo = params->get_tex(params->priv, out_w, out_h);
++        if (hook->persist) {
++            if (!params->recreate_persistent_tex ||
++                !params->recreate_persistent_tex(params->priv,
++                                                  &hook->persistent_fbo,
++                                                  out_w, out_h))
++            {
++                PL_ERR(p, "Failed creating persistent hook texture");
++                goto error;
++            }
++            fbo = hook->persistent_fbo;
++        } else {
++            fbo = params->get_tex(params->priv, out_w, out_h);
++        }
+         if (!fbo) {
+             PL_ERR(p, "Failed dispatching hook: `get_tex` callback failed?");
+             goto error;
+@@ -1554,6 +1588,7 @@ static struct pl_hook_res hook_hook(void *priv, const struct pl_hook_params *par
+         struct pass_tex ptex = {
+             .name  = hook->save_tex.len ? hook->save_tex : stage,
+             .tex   = fbo,
++            .persistent = hook->persist,
+             .repr  = ctx.hooked.repr,
+             .color = ctx.hooked.color,
+             .comps = PL_DEF(hook->comps, ctx.hooked.comps),
+@@ -1738,6 +1773,8 @@ void pl_mpv_user_shader_destroy(const struct pl_hook **hookp)
+         return;
+ 
+     struct hook_priv *p = PL_PRIV(hook);
++    for (int i = 0; i < p->hook_passes.num; i++)
++        pl_tex_destroy(p->gpu, &p->hook_passes.elem[i].hook.persistent_fbo);
+     for (int i = 0; i < p->descriptors.num; i++) {
+         switch (p->descriptors.elem[i].desc.type) {
+             case PL_DESC_BUF_UNIFORM:
+diff --git a/src/tests/gpu_tests.c b/src/tests/gpu_tests.c
+index 5d1d8db8..13858548 100644
+--- a/src/tests/gpu_tests.c
++++ b/src/tests/gpu_tests.c
+@@ -1144,6 +1144,17 @@ static const char *user_shader_tests[] = {
+     "    return NATIVEBIG_texOff(0);                                        \n"
+     "}                                                                      \n",
+ 
++    // Test persistent saved textures
++    "//!HOOK SCALED                                                         \n"
++    "//!BIND HOOKED                                                         \n"
++    "//!SAVE SAVED_SCALED                                                   \n"
++    "//!PERSIST                                                             \n"
++    "vec4 hook() { return HOOKED_texOff(0); }                              \n"
++    "//!HOOK OUTPUT                                                         \n"
++    "//!BIND HOOKED                                                         \n"
++    "//!BIND SAVED_SCALED                                                   \n"
++    "vec4 hook() { return HOOKED_texOff(0); }                              \n",
++
+     // Test use of textures
+     "//!HOOK MAIN                                                           \n"
+     "//!DESC turn everything into colorful pixels                           \n"
+-- 
+2.50.1

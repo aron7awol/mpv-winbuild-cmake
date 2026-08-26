@@ -1,0 +1,357 @@
+From edc7e042f431fb5683036ca1537578741260e7d0 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <development@mpv-ht.local>
+Date: Wed, 26 Aug 2026 11:32:25 -0400
+Subject: [PATCH] video: add persistent gpu-next thumbnail renderer
+
+Keep a Vulkan/libplacebo offscreen renderer alive across thumbnail seeks, accept explicit SDR or BT.2020/PQ targets, and preserve Dolby metadata through the normal gpu-next reconstruction path. Use a static Spline curve driven by maxRGB and apply it along a linear RGB ray for the thumbnail color map.
+---
+ filters/user_filters.c           |   1 +
+ filters/user_filters.h           |   1 +
+ meson.build                      |   1 +
+ video/filter/vf_gpu_next_thumb.c | 302 +++++++++++++++++++++++++++++++
+ 4 files changed, 305 insertions(+)
+ create mode 100644 video/filter/vf_gpu_next_thumb.c
+
+diff --git a/filters/user_filters.c b/filters/user_filters.c
+index ea7b69c99..0f73f3308 100644
+--- a/filters/user_filters.c
++++ b/filters/user_filters.c
+@@ -83,6 +83,7 @@ const struct m_obj_list af_obj_list = {
+ 
+ const struct mp_user_filter_entry *vf_list[] = {
+     &vf_format,
++    &vf_gpu_next_thumb,
+     &vf_lavfi,
+     &vf_lavfi_bridge,
+     &vf_sub,
+diff --git a/filters/user_filters.h b/filters/user_filters.h
+index f2c31ef66..efadc400b 100644
+--- a/filters/user_filters.h
++++ b/filters/user_filters.h
+@@ -39,3 +39,4 @@ extern const struct mp_user_filter_entry vf_d3d11vpp;
+ extern const struct mp_user_filter_entry vf_amf_frc;
+ extern const struct mp_user_filter_entry vf_fingerprint;
+ extern const struct mp_user_filter_entry vf_gpu;
++extern const struct mp_user_filter_entry vf_gpu_next_thumb;
+diff --git a/meson.build b/meson.build
+index 80bd39d7e..a91498396 100644
+--- a/meson.build
++++ b/meson.build
+@@ -221,6 +221,7 @@ sources = files(
+     'video/decode/vd_lavc.c',
+     'video/filter/refqueue.c',
+     'video/filter/vf_format.c',
++    'video/filter/vf_gpu_next_thumb.c',
+     'video/filter/vf_sub.c',
+     'video/fmt-conversion.c',
+     'video/hwdec.c',
+diff --git a/video/filter/vf_gpu_next_thumb.c b/video/filter/vf_gpu_next_thumb.c
+new file mode 100644
+index 000000000..a55c498a6
+--- /dev/null
++++ b/video/filter/vf_gpu_next_thumb.c
+@@ -0,0 +1,302 @@
++/* Persistent gpu-next/libplacebo thumbnail renderer. */
++
++#include <libavutil/buffer.h>
++
++#include "common/common.h"
++#include "filters/filter.h"
++#include "filters/filter_internal.h"
++#include "filters/user_filters.h"
++#include "options/m_option.h"
++#include "video/filter/vf_gpu.h"
++#include "video/img_format.h"
++#include "video/mp_image.h"
++#include "video/out/placebo/ra_pl.h"
++#include "video/out/placebo/utils.h"
++
++extern const struct offscreen_context offscreen_vk;
++
++enum target_mode {
++    TARGET_SRGB,
++    TARGET_HDR,
++};
++
++struct opts {
++    int target;
++    float peak;
++};
++
++struct priv {
++    struct opts *opts;
++    struct offscreen_ctx *ctx;
++    pl_log pllog;
++    pl_gpu gpu;
++    pl_renderer rr;
++    pl_tex src_tex[4];
++    pl_tex target;
++    int target_w, target_h;
++    struct pl_color_map_params cmap;
++    struct pl_render_params params;
++};
++
++static int plane_data_from_imgfmt(struct pl_plane_data out[4],
++                                  struct pl_bit_encoding *bits,
++                                  enum mp_imgfmt imgfmt)
++{
++    struct mp_imgfmt_desc desc = mp_imgfmt_get_desc(imgfmt);
++    if (!desc.num_planes || !(desc.flags & MP_IMGFLAG_HAS_COMPS) ||
++        (desc.flags & MP_IMGFLAG_HWACCEL) || !(desc.flags & MP_IMGFLAG_NE) ||
++        (desc.flags & MP_IMGFLAG_PAL))
++        return 0;
++
++    bool have_bits = false;
++    for (int p = 0; p < desc.num_planes; p++) {
++        struct mp_imgfmt_comp_desc sorted[MP_NUM_COMPONENTS];
++        int num = 0;
++        if (desc.bpp[p] % 8)
++            return 0;
++        for (int c = 0; c < mp_imgfmt_desc_get_num_comps(&desc); c++) {
++            if (desc.comps[c].plane != p)
++                continue;
++            out[p].component_map[num] = c;
++            sorted[num++] = desc.comps[c];
++            for (int i = num - 1; i > 0; i--) {
++                if (sorted[i].offset >= sorted[i - 1].offset)
++                    break;
++                MPSWAP(struct mp_imgfmt_comp_desc, sorted[i], sorted[i - 1]);
++                MPSWAP(int, out[p].component_map[i], out[p].component_map[i - 1]);
++            }
++        }
++        uint64_t total = 0;
++        for (int c = 0; c < num; c++) {
++            out[p].component_size[c] = sorted[c].size;
++            out[p].component_pad[c] = sorted[c].offset - total;
++            total += out[p].component_pad[c] + out[p].component_size[c];
++            if (out[p].component_map[c] == PL_CHANNEL_A)
++                continue;
++            struct pl_bit_encoding b = {
++                .sample_depth = out[p].component_size[c],
++                .color_depth = sorted[c].size - abs(sorted[c].pad),
++                .bit_shift = MPMAX(sorted[c].pad, 0),
++            };
++            if (!have_bits) {
++                *bits = b;
++                have_bits = true;
++            } else if (!pl_bit_encoding_equal(bits, &b)) {
++                *bits = (struct pl_bit_encoding) {0};
++            }
++        }
++        out[p].pixel_stride = desc.bpp[p] / 8;
++        out[p].type = desc.flags & MP_IMGFLAG_TYPE_FLOAT ? PL_FMT_FLOAT
++                                                        : PL_FMT_UNORM;
++    }
++    return desc.num_planes;
++}
++
++static bool upload(struct priv *p, struct mp_image *mpi, struct pl_frame *frame)
++{
++    struct pl_plane_data data[4] = {0};
++    int planes = plane_data_from_imgfmt(data, &frame->repr.bits, mpi->imgfmt);
++    if (!planes)
++        return false;
++    frame->num_planes = planes;
++    for (int n = 0; n < planes; n++) {
++        data[n].width = mp_image_plane_w(mpi, n);
++        data[n].height = mp_image_plane_h(mpi, n);
++        data[n].row_stride = mpi->stride[n];
++        data[n].pixels = mpi->planes[n];
++        if (data[n].row_stride < 0) {
++            data[n].pixels = (uint8_t *) data[n].pixels +
++                             (data[n].height - 1) * data[n].row_stride;
++            data[n].row_stride = -data[n].row_stride;
++            frame->planes[n].flipped = true;
++        }
++        if (!pl_upload_plane(p->gpu, &frame->planes[n], &p->src_tex[n], &data[n]))
++            return false;
++    }
++    return true;
++}
++
++static bool ensure_target(struct priv *p, int w, int h)
++{
++    if (p->target && p->target_w == w && p->target_h == h)
++        return true;
++    pl_tex_destroy(p->gpu, &p->target);
++    pl_fmt fmt = pl_find_fmt(p->gpu, PL_FMT_UNORM, 4, 8, 8,
++                             PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_HOST_READABLE);
++    if (!fmt)
++        return false;
++    p->target = pl_tex_create(p->gpu, pl_tex_params(
++        .w = w, .h = h, .format = fmt, .renderable = true,
++        .host_readable = true));
++    p->target_w = w;
++    p->target_h = h;
++    return p->target != NULL;
++}
++
++static struct mp_image *render(struct mp_filter *f, struct mp_image *in)
++{
++    struct priv *p = f->priv;
++    struct mp_image_params par = in->params;
++    mp_image_params_guess_csp(&par);
++    if (!ensure_target(p, in->w, in->h))
++        return NULL;
++
++    struct pl_frame image = {
++        .color = par.color,
++        .repr = par.repr,
++        .crop = {0, 0, in->w, in->h},
++    };
++    if (!upload(p, in, &image))
++        return NULL;
++
++    struct pl_frame target = {
++        .repr = pl_color_repr_rgb,
++        .num_planes = 1,
++        .planes[0] = {
++            .texture = p->target,
++            .components = 4,
++            .component_mapping = {0, 1, 2, 3},
++        },
++        .crop = {0, 0, in->w, in->h},
++    };
++    if (p->opts->target == TARGET_HDR) {
++        target.color = (struct pl_color_space) {
++            .primaries = PL_COLOR_PRIM_BT_2020,
++            .transfer = PL_COLOR_TRC_PQ,
++            .hdr = {.max_luma = p->opts->peak},
++        };
++    } else {
++        target.color = pl_color_space_srgb;
++        target.color.hdr.max_luma = 100;
++    }
++
++    if (!pl_render_image(p->rr, &image, &target, &p->params))
++        return NULL;
++
++    struct mp_image *out = mp_image_alloc(IMGFMT_RGBA, in->w, in->h);
++    if (!out)
++        return NULL;
++    bool ok = pl_tex_download(p->gpu, pl_tex_transfer_params(
++        .tex = p->target,
++        .ptr = out->planes[0],
++        .row_pitch = out->stride[0]));
++    if (!ok) {
++        talloc_free(out);
++        return NULL;
++    }
++
++    mp_image_copy_attributes(out, in);
++    av_buffer_unref(&out->dovi);
++    mp_image_unrefp(&out->enhancement_layer);
++    out->params.repr = pl_color_repr_rgb;
++    out->params.repr.levels = PL_COLOR_LEVELS_FULL;
++    out->params.color = target.color;
++    out->params.primaries_orig = target.color.primaries;
++    out->params.transfer_orig = target.color.transfer;
++    out->params.sys_orig = PL_COLOR_SYSTEM_RGB;
++    out->params.no_dovi = true;
++    out->params.no_enhancement_layer = true;
++    out->params.imgfmt = out->imgfmt;
++    out->params.w = out->w;
++    out->params.h = out->h;
++    return out;
++}
++
++static void process(struct mp_filter *f)
++{
++    if (!mp_pin_can_transfer_data(f->ppins[1], f->ppins[0]))
++        return;
++    struct mp_frame frame = mp_pin_out_read(f->ppins[0]);
++    if (mp_frame_is_signaling(frame)) {
++        mp_pin_in_write(f->ppins[1], frame);
++        return;
++    }
++    if (frame.type != MP_FRAME_VIDEO)
++        goto fail;
++    struct mp_image *in = frame.data;
++    struct mp_image *out = render(f, in);
++    if (!out) {
++        MP_ERR(f, "gpu-next thumbnail render failed.\n");
++        goto fail;
++    }
++    talloc_free(in);
++    mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, out));
++    return;
++fail:
++    mp_frame_unref(&frame);
++    mp_filter_internal_mark_failed(f);
++}
++
++static void destroy(struct mp_filter *f)
++{
++    struct priv *p = f->priv;
++    if (p->gpu) {
++        pl_gpu_finish(p->gpu);
++        for (int i = 0; i < 4; i++)
++            pl_tex_destroy(p->gpu, &p->src_tex[i]);
++        pl_tex_destroy(p->gpu, &p->target);
++        pl_renderer_destroy(&p->rr);
++    }
++    talloc_free(p->ctx);
++}
++
++static const struct mp_filter_info filter = {
++    .name = "gpu-next-thumb",
++    .process = process,
++    .destroy = destroy,
++    .priv_size = sizeof(struct priv),
++};
++
++static struct mp_filter *create(struct mp_filter *parent, void *options)
++{
++    struct mp_filter *f = mp_filter_create(parent, &filter);
++    if (!f) {
++        talloc_free(options);
++        return NULL;
++    }
++    mp_filter_add_pin(f, MP_PIN_IN, "in");
++    mp_filter_add_pin(f, MP_PIN_OUT, "out");
++    struct priv *p = f->priv;
++    p->opts = talloc_steal(p, options);
++    p->ctx = offscreen_vk.offscreen_ctx_create(f->global, f->log);
++    if (!p->ctx || !(p->gpu = ra_pl_get(p->ctx->ra)))
++        goto fail;
++    p->pllog = mppl_log_create(p, f->log);
++    p->rr = pl_renderer_create(p->pllog, p->gpu);
++    if (!p->rr)
++        goto fail;
++    p->cmap = pl_color_map_default_params;
++    p->cmap.tone_mapping_function = &pl_tone_map_spline;
++    p->cmap.tone_mapping_metric = PL_TONE_MAP_METRIC_MAXRGB_RGB;
++    p->params = pl_render_fast_params;
++    p->params.peak_detect_params = NULL;
++    p->params.color_map_params = &p->cmap;
++    p->params.upscaler = &pl_filter_bilinear;
++    p->params.downscaler = &pl_filter_bilinear;
++    p->params.skip_anti_aliasing = true;
++    p->params.skip_caching_single_frame = false;
++    return f;
++fail:
++    talloc_free(f);
++    return NULL;
++}
++
++#define OPT_BASE_STRUCT struct opts
++const struct mp_user_filter_entry vf_gpu_next_thumb = {
++    .desc = {
++        .description = "persistent gpu-next thumbnail renderer",
++        .name = "gpu-next-thumb",
++        .priv_size = sizeof(OPT_BASE_STRUCT),
++        .options = (const struct m_option[]) {
++            {"target", OPT_CHOICE(target, {"srgb", TARGET_SRGB},
++                                            {"hdr", TARGET_HDR})},
++            {"peak", OPT_FLOAT(peak), M_RANGE(1, 10000)},
++            {0}
++        },
++        .priv_defaults = &(const OPT_BASE_STRUCT) {
++            .target = TARGET_SRGB,
++            .peak = 1000,
++        },
++    },
++    .create = create,
++};
+-- 
+2.54.0.windows.1

@@ -1,5 +1,5 @@
 From 88f7f89161a8e3efca20b304778ea3b05549bd38 Mon Sep 17 00:00:00 2001
-From: SK_Player <noreply@example.com>
+From: HT_Player <noreply@example.com>
 Date: Wed, 29 Jul 2026 13:26:20 -0400
 Subject: [PATCH] renderer: quantize padded output consistently
 

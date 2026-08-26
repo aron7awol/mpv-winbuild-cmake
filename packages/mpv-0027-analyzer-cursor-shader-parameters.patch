@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <development@mpv-ht.local>
+Date: Wed, 26 Aug 2026 13:30:00 -0400
+Subject: [PATCH] gpu-next: expose video-relative mouse position to dynamic shaders
+
+The Analyzer needs a per-frame cursor signal without rewriting
+glsl-shader-opts on every mouse move.  Keep this deliberately narrow: three
+dynamic shader parameter names receive the cursor position normalized to the
+displayed video rectangle and whether the cursor is actually over that
+rectangle.  All other automatic parameters retain the existing image-metadata
+path.
+
+---
+ video/out/vo_gpu_next.c | 38 ++++++++++++++++++++++++++++++++++----
+ 1 file changed, 34 insertions(+), 4 deletions(-)
+
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -35,6 +35,7 @@
+ #include "options/m_config.h"
+ #include "options/options.h"
+ #include "options/path.h"
++#include "input/input.h"
+ #include "osdep/io.h"
+ #include "osdep/threads.h"
+ #include "stream/stream.h"
+@@ -1333,7 +1334,8 @@ static void update_tm_viz(struct pl_color_map_params *params,
+     params->visualize_hue = M_PI / 4.0;
+ }
+ 
+-static void update_hook_opts_dynamic(struct priv *p, const struct pl_hook *hook,
++static void update_hook_opts_dynamic(struct vo *vo, struct priv *p,
++                                     const struct pl_hook *hook,
+                                      const struct mp_image *mpi);
+ 
+ static bool use_auto_softclip(const struct gl_video_opts *opts,
+@@ -1808,7 +1810,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+ 
+         // Update dynamic hook parameters
+         for (int i = 0; i < pars->params.num_hooks; i++)
+-            update_hook_opts_dynamic(p, p->hooks[i], frame->current);
++            update_hook_opts_dynamic(vo, p, p->hooks[i], frame->current);
+     }
+ 
+     // Render frame
+@@ -2980,13 +2982,42 @@ static void update_lut(struct priv *p, struct user_lut *lut)
+     talloc_free(lutdata.start);
+ }
+ 
+-static void update_hook_opts_dynamic(struct priv *p, const struct pl_hook *hook,
++static bool get_analyzer_auto_param(struct vo *vo, struct priv *p,
++                                    struct bstr name, double *out)
++{
++    int x, y, hover;
++    mp_input_get_mouse_pos(vo->input_ctx, &x, &y, &hover);
++
++    const int w = mp_rect_w(p->dst);
++    const int h = mp_rect_h(p->dst);
++    const bool inside = hover && w > 0 && h > 0 &&
++                        x >= p->dst.x0 && x < p->dst.x1 &&
++                        y >= p->dst.y0 && y < p->dst.y1;
++
++    if (bstrcmp0(name, "analyzer_cursor_x") == 0) {
++        *out = w > 0 ? MPCLAMP((x - p->dst.x0 + 0.5) / w, 0.0, 1.0) : 0.5;
++        return true;
++    }
++    if (bstrcmp0(name, "analyzer_cursor_y") == 0) {
++        *out = h > 0 ? MPCLAMP((y - p->dst.y0 + 0.5) / h, 0.0, 1.0) : 0.5;
++        return true;
++    }
++    if (bstrcmp0(name, "analyzer_cursor_valid") == 0) {
++        *out = inside;
++        return true;
++    }
++    return false;
++}
++
++static void update_hook_opts_dynamic(struct vo *vo, struct priv *p,
++                                     const struct pl_hook *hook,
+                                      const struct mp_image *mpi)
+ {
+     for (int i = 0; i < hook->num_parameters; i++) {
+         double val;
+         const struct pl_hook_par *hp = &hook->parameters[i];
+-        if (!gpu_get_auto_param(mpi, bstr0(hp->name), &val))
++        if (!get_analyzer_auto_param(vo, p, bstr0(hp->name), &val) &&
++            !gpu_get_auto_param(mpi, bstr0(hp->name), &val))
+             continue;
+ 
+         switch (hp->type) {
