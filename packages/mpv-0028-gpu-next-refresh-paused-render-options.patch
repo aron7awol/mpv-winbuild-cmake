@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <development@mpv-ht.local>
+Date: Thu, 27 Aug 2026 17:05:00 -0400
+Subject: [PATCH] gpu-next: refresh paused frames after render option changes
+
+VOCTRL_UPDATE_RENDER_OPTS already requests a redraw, but gpu-next can reuse
+libplacebo intermediates cached before the new options were applied.  A paused
+frame therefore keeps stale pixels until playback supplies another frame.
+
+Invalidate the renderer cache when options change while paused.  The existing
+draw-frame flush path then rebuilds the cached frame with the new options,
+without seeking or briefly resuming playback.
+---
+ video/out/vo_gpu_next.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -1227,8 +1227,13 @@ static void update_options(struct vo *vo)
+     bool old_dovi_enhancement_layer = p->next_opts->dovi_enhancement_layer;
+     bool changed = m_config_cache_update(p->opts_cache);
+     changed = m_config_cache_update(p->next_opts_cache) || changed;
+-    if (changed)
++    if (changed) {
+         update_render_options(vo);
++        // A paused redraw has no new frame to invalidate intermediates that
++        // were produced with the previous render options.
++        if (p->paused)
++            p->flush_cache = true;
++    }
+     if (old_dovi_enhancement_layer != p->next_opts->dovi_enhancement_layer)
+         p->flush_cache = true;
+ 
+-- 
+2.51.0.windows.1
+
