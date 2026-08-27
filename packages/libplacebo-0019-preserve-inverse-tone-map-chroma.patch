@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Thu, 27 Aug 2026 12:00:00 -0400
+Subject: [PATCH] colorspace: preserve chroma during inverse tone mapping
+
+The ordinary conservative ITP hull correction contains I_in / I_out.  That
+is useful while compressing brightness, but necessarily desaturates every
+inverse expansion even when the expanded color remains representable.
+
+Keep source ITP P/T during a genuine inverse expansion and leave the existing
+output-gamut mapper responsible for colors that actually cross the target
+boundary.  Normal tone mapping and non-expanding inverse requests are
+unchanged.
+---
+ src/shaders/colorspace.c | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
+index bfc92844..00000000 100644
+--- a/src/shaders/colorspace.c
++++ b/src/shaders/colorspace.c
+@@ -3020,6 +3020,8 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+         params->ambient_gamma > 0.0f ? params->ambient_gamma : 1.0f;
+     const bool ambient_active = fabsf(ambient_gamma - 1.0f) > 1e-6f;
+     const bool base_need_tone_map = !pl_tone_map_params_noop(&tone);
++    const bool inverse_expansion = params->inverse_tone_mapping &&
++        tone.output_max > tone.input_max + 1e-6f;
+     bool need_tone_map = base_need_tone_map || ambient_active;
+     bool need_gamut_map = !pl_gamut_map_params_noop(&gamut);
+ 
+@@ -3291,11 +3294,15 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+         // Avoid raising saturation excessively when raising brightness, and
+         // also desaturate when reducing brightness greatly to account for the
+         // reduction in gamut volume.
+-        if (!metric_active ||
++        // A genuine inverse expansion is different: reducing P/T by I_in/I_out
++        // visibly desaturates colors that remain inside the larger target
++        // gamut. Preserve P/T there and let the output-gamut stage constrain
++        // only colors that actually cross its boundary.
++        if (!inverse_expansion && (!metric_active ||
+             params->tone_mapping_metric == PL_TONE_MAP_METRIC_BT2020_ITP ||
+             params->tone_mapping_metric == PL_TONE_MAP_METRIC_BT2020_ADAPTIVE ||
+             params->tone_mapping_metric == PL_TONE_MAP_METRIC_MAXRGB_ITP ||
+-            params->tone_mapping_metric == PL_TONE_MAP_METRIC_MAXRGB_ADAPTIVE) {
++            params->tone_mapping_metric == PL_TONE_MAP_METRIC_MAXRGB_ADAPTIVE)) {
+             GLSL("vec2 hull = vec2(i_orig, ipt.x);                       \n"
+                  "hull = ((hull - 6.0) * hull + 9.0) * hull;             \n"
+                  "float chroma_scale = min(i_orig / max(ipt.x, 1e-6),   \n"
+ 
+-- 
+2.54.0.windows.1
