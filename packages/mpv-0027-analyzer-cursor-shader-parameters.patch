@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: mpv-ht development <development@mpv-ht.local>
 Date: Wed, 26 Aug 2026 13:30:00 -0400
-Subject: [PATCH] gpu-next: expose video-relative mouse position to dynamic shaders
+Subject: [PATCH] gpu-next: support resize-safe Analyzer cursor sampling
 
 The Analyzer needs a per-frame cursor signal without rewriting
 glsl-shader-opts on every mouse move.  Keep this deliberately narrow: three
@@ -10,9 +10,14 @@ displayed video rectangle and whether the cursor is actually over that
 rectangle.  All other automatic parameters retain the existing image-metadata
 path.
 
+Paused redraws may reuse libplacebo's cached intermediate passes.  Flush that
+cache when the video geometry changes while paused, otherwise an OUTPUT hook
+can receive the new cursor geometry while sampling a persistent SCALED texture
+from the old window size.
+
 ---
- video/out/vo_gpu_next.c | 38 ++++++++++++++++++++++++++++++++++----
- 1 file changed, 34 insertions(+), 4 deletions(-)
+ video/out/vo_gpu_next.c | 43 +++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 39 insertions(+), 4 deletions(-)
 
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
 --- a/video/out/vo_gpu_next.c
@@ -44,7 +49,20 @@ diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
      }
  
      // Render frame
-@@ -2980,13 +2982,42 @@ static void update_lut(struct priv *p, struct user_lut *lut)
+@@ -1993,6 +1995,12 @@ static void resize(struct vo *vo)
+         return;
+ 
++    // Cached paused redraws must not retain pre-resize hook textures.
++    if (p->paused) {
++        MP_DBG(p, "Paused resize: flushing cached hook textures.\n");
++        p->flush_cache = true;
++    }
++
+     p->osd_sync++;
+     p->osd_res = osd;
+     p->src = src;
+     p->dst = dst;
+@@ -2980,13 +2988,42 @@ static void update_lut(struct priv *p, struct user_lut *lut)
      talloc_free(lutdata.start);
  }
  
