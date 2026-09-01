@@ -1,0 +1,168 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <development@mpv-ht.local>
+Date: Mon, 31 Aug 2026 21:30:00 -0400
+Subject: [PATCH] gpu-next: hold sparse black frames
+
+Treat titles, credits, logos, and fade remnants on black as indeterminate
+unless picture content reaches the outer image. Normalize 4:2:0 boundaries to
+even rows and add verbose transition and coverage diagnostics.
+---
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index a44cd05213e039969c3df6f10d3d4ec6668d3440..4f806e1 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -110,6 +110,9 @@ struct bar_gpu_data {
+     // Pixels materially above nominal black, used to distinguish sparse codec
+     // residue from an established row of picture content.
+     uint32_t bright[BAR_ANALYSIS_MAX_ROWS];
++    // Bright pixels in the outer horizontal eighths. Real picture content
++    // normally reaches these regions; centered titles and credits do not.
++    uint32_t edge_bright[BAR_ANALYSIS_MAX_ROWS];
+ };
+ 
+ struct bar_analysis_slot {
+@@ -167,6 +170,8 @@ struct priv {
+     struct bar_gpu_data bar_readback;
+     uint64_t bar_timings[BAR_TIMING_SAMPLES];
+     int bar_timing_count, bar_timing_next;
++    uint64_t bar_first_commit_tag, bar_last_commit_tag, bar_commit_count;
++    uint64_t bar_indeterminate_count;
+     pl_swapchain sw;
+     pl_fmt osd_fmt[SUBBITMAP_COUNT];
+     pl_tex *sub_tex;
+@@ -1114,12 +1119,21 @@ static void store_bar_result(struct priv *p, uint64_t tag, int width, int height
+         // explicitly indeterminate so the presentation side can hold the last
+         // confident geometry instead of manufacturing a new aspect ratio.
+         int near_black = 0;
++        uint64_t bright_pixels = 0, edge_bright_pixels = 0;
+         for (int y = 0; y < height; y++) {
+             const uint32_t *row = data->rows[y];
+             uint32_t mean = row[3] ? row[2] / row[3] : UINT32_MAX;
+             near_black += mean <= black + 512;
++            bright_pixels += data->bright[y];
++            edge_bright_pixels += data->edge_bright[y];
+         }
+-        if (near_black >= height * 95 / 100) {
++        // Sparse credits, logos, and fade remnants on black do not reveal an
++        // authored aperture. Treat them like a fully black frame and retain
++        // the last geometry that was established by an observable picture.
++        uint64_t pixels = (uint64_t) width * height;
++        bool sparse = bright_pixels <= pixels / 10 ||
++                      edge_bright_pixels <= pixels / 200;
++        if (near_black >= height * 95 / 100 || sparse) {
+             result.valid = false;
+             result.indeterminate = true;
+         } else if (exact_top >= 2 && exact_bottom >= 2) {
+@@ -1146,6 +1160,10 @@ static void store_bar_result(struct priv *p, uint64_t tag, int width, int height
+                     break;
+                 centered = y + 1;
+             }
++            // 4:2:0 encodes vertical chroma on an even-row grid. Snap a
++            // one-row inward ambiguity to that grid so codec residue cannot
++            // toggle a stable authored boundary between adjacent rows.
++            centered = (centered + 1) & ~1;
+             int active_h = height - 2 * centered;
+             if (active_h > 0 && (double) width / active_h <= 3.0) {
+                 result.top = result.bottom = centered;
+@@ -1197,7 +1215,24 @@ static void commit_active_image(struct priv *p, uint64_t tag,
+                                 int source_w, int source_h)
+ {
+     const struct bar_result *result = find_bar_result(p, tag);
++    if (result && tag != p->bar_last_commit_tag) {
++        if (!p->bar_first_commit_tag)
++            p->bar_first_commit_tag = tag;
++        p->bar_last_commit_tag = tag;
++        p->bar_commit_count++;
++        p->bar_indeterminate_count += result->indeterminate;
++    }
+     if (result && result->valid) {
++        if (!p->active_image_available ||
++            p->active_image.top != result->top ||
++            p->active_image.bottom != result->bottom)
++        {
++            MP_VERBOSE(p, "Active image frame=%" PRIu64 " source=%dx%d "
++                       "top=%d bottom=%d active=%dx%d.\n", tag - 1,
++                       result->source_w, result->source_h, result->top,
++                       result->bottom, result->source_w,
++                       result->source_h - result->top - result->bottom);
++        }
+         p->active_image = *result;
+         p->active_image_available = true;
+     } else if (!p->active_image_available && source_w > 0 && source_h > 0) {
+@@ -1272,6 +1307,19 @@ static const struct pl_buffer_var bar_buffer_vars[] = {{
+         .stride = sizeof(uint32_t),
+         .size = sizeof(((struct bar_gpu_data *) 0)->bright),
+     },
++}, {
++    .var = {
++        .name = "edge_bright",
++        .type = PL_VAR_UINT,
++        .dim_v = 1,
++        .dim_m = 1,
++        .dim_a = BAR_ANALYSIS_MAX_ROWS,
++    },
++    .layout = {
++        .offset = offsetof(struct bar_gpu_data, edge_bright),
++        .stride = sizeof(uint32_t),
++        .size = sizeof(((struct bar_gpu_data *) 0)->edge_bright),
++    },
+ }};
+ 
+ static bool submit_bar_analysis(struct priv *p, struct pl_frame *frame,
+@@ -1343,20 +1391,24 @@ static bool submit_bar_analysis(struct priv *p, struct pl_frame *frame,
+         "shared uint row_max[64];\n"
+         "shared uint row_sum[64];\n"
+         "shared uint row_count[64];\n"
+-        "shared uint row_bright[64];\n";
++        "shared uint row_bright[64];\n"
++        "shared uint row_edge_bright[64];\n";
+     char *body = talloc_asprintf(NULL,
+         "uint lane = gl_LocalInvocationID.x;\n"
+         "uint y = gl_WorkGroupID.y;\n"
+         "uvec2 size = uvec2(textureSize(luma_tex, 0));\n"
+-        "uint mn = 65535u, mx = 0u, sum = 0u, count = 0u, hi = 0u;\n"
++        "uint mn = 65535u, mx = 0u, sum = 0u, count = 0u, hi = 0u, edge_hi = 0u;\n"
+         "for (uint x = lane; x < size.x; x += 64u) {\n"
+         "    float v = texelFetch(luma_tex, ivec2(x, y), 0)[%d];\n"
+         "    uint q = uint(clamp(v, 0.0, 1.0) * 65535.0 + 0.5);\n"
+         "    mn = min(mn, q); mx = max(mx, q); sum += q; count++;\n"
+-        "    hi += q > 6000u ? 1u : 0u;\n"
++        "    bool bright_pixel = q > 6000u;\n"
++        "    hi += bright_pixel ? 1u : 0u;\n"
++        "    edge_hi += bright_pixel && (x < size.x / 8u || x >= 7u * size.x / 8u) ? 1u : 0u;\n"
+         "}\n"
+         "row_min[lane] = mn; row_max[lane] = mx;\n"
+         "row_sum[lane] = sum; row_count[lane] = count; row_bright[lane] = hi;\n"
++        "row_edge_bright[lane] = edge_hi;\n"
+         "barrier();\n"
+         "for (uint step = 32u; step > 0u; step >>= 1u) {\n"
+         "    if (lane < step) {\n"
+@@ -1365,12 +1417,14 @@ static bool submit_bar_analysis(struct priv *p, struct pl_frame *frame,
+         "        row_sum[lane] += row_sum[lane + step];\n"
+         "        row_count[lane] += row_count[lane + step];\n"
+         "        row_bright[lane] += row_bright[lane + step];\n"
++        "        row_edge_bright[lane] += row_edge_bright[lane + step];\n"
+         "    }\n"
+         "    barrier();\n"
+         "}\n"
+         "if (lane == 0u) {\n"
+         "    rows[y] = uvec4(row_min[0], row_max[0], row_sum[0], row_count[0]);\n"
+         "    bright[y] = row_bright[0];\n"
++        "    edge_bright[y] = row_edge_bright[0];\n"
+         "}\n",
+         component);
+ 
+@@ -3252,6 +3306,13 @@ static void uninit(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
+ 
++    if (p->bar_commit_count) {
++        MP_VERBOSE(p, "Active image coverage first=%" PRIu64 " last=%" PRIu64
++                   " frames=%" PRIu64 " indeterminate=%" PRIu64 ".\n",
++                   p->bar_first_commit_tag - 1, p->bar_last_commit_tag - 1,
++                   p->bar_commit_count, p->bar_indeterminate_count);
++    }
++
+     // Drain any in-flight uploads.
+     if (p->gpu)
+         pl_gpu_finish(p->gpu);

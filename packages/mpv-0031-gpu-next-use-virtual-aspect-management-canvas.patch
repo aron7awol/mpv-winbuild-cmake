@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <development@mpv-ht.local>
+Date: Mon, 31 Aug 2026 15:00:00 -0400
+Subject: [PATCH] gpu-next: use virtual aspect management canvas
+
+Allow a centered fullscreen UI aperture to act as the wide presentation
+canvas even when the underlying desktop framebuffer remains 16:9.
+---
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index bc050410f7e6349ba1cb02c3d4999d72b88a1dcb..aaaa5c7725a5a5bbacf4e797e27d8aa59b10524f 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -230,6 +230,7 @@ struct gl_next_opts {
+     bool causal_scene_acceleration;
+     bool authored_scene_reset;
+     bool automatic_aspect_ratio;
++    float automatic_aspect_ratio_canvas;
+     int sub_hdr_peak;
+     int image_subs_hdr_peak;
+     int border_background;
+@@ -269,6 +270,8 @@ const struct m_sub_options gl_next_conf = {
+         {"hdr-causal-scene-acceleration", OPT_BOOL(causal_scene_acceleration), M_OPT_NOCFG},
+         {"hdr-authored-scene-reset", OPT_BOOL(authored_scene_reset)},
+         {"automatic-aspect-ratio", OPT_BOOL(automatic_aspect_ratio)},
++        {"automatic-aspect-ratio-canvas",
++            OPT_FLOAT(automatic_aspect_ratio_canvas), M_RANGE(0, 10)},
+         {"border-background", OPT_CHOICE(border_background,
+             {"none",  BACKGROUND_NONE},
+             {"color", BACKGROUND_COLOR},
+@@ -2215,18 +2218,28 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+         consume_bar_analysis(p);
+         commit_active_image(p, frame->frame_id + 1,
+                             vo->params->w, vo->params->h);
++        int canvas_w = swframe.fbo->params.w;
++        int canvas_h = swframe.fbo->params.h;
++        struct mp_rect aspect_canvas = {0, 0, canvas_w, canvas_h};
++        double requested_canvas_ar =
++            p->next_opts->automatic_aspect_ratio_canvas;
++        if (requested_canvas_ar > 0) {
++            int visible_h = lrint(canvas_w / requested_canvas_ar);
++            if (visible_h > 0 && visible_h < canvas_h) {
++                int inset = (canvas_h - visible_h) / 2;
++                aspect_canvas.y0 = inset;
++                aspect_canvas.y1 = inset + visible_h;
++            }
++        }
+         p->automatic_aspect_effective =
+             p->next_opts->automatic_aspect_ratio && vo->opts->fullscreen &&
+-            (int64_t) swframe.fbo->params.w * 9 >
+-            (int64_t) swframe.fbo->params.h * 16;
++            (int64_t) mp_rect_w(aspect_canvas) * 9 >
++            (int64_t) mp_rect_h(aspect_canvas) * 16;
+         if (p->automatic_aspect_effective && p->active_image_available) {
+             int active_h = p->active_image.source_h - p->active_image.top -
+                            p->active_image.bottom;
+-            struct mp_rect canvas = {
+-                0, 0, swframe.fbo->params.w, swframe.fbo->params.h,
+-            };
+             struct mp_rect auto_dst = fit_active_destination(
+-                canvas, p->active_image.source_w, active_h);
++                aspect_canvas, p->active_image.source_w, active_h);
+             apply_crop(&target, auto_dst, swframe.fbo->params.w,
+                        swframe.fbo->params.h);
+         }
+-- 
+2.51.0.windows.1

@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <development@mpv-ht.local>
+Date: Mon, 31 Aug 2026 12:00:00 -0400
+Subject: [PATCH] frame queue: support analysis-only frame prefetch
+
+Allow callers to map a bounded number of future frames without changing the
+rendered mix or target timestamp, so asynchronous analysis can reuse the
+queue-owned textures.
+---
+diff --git a/src/include/libplacebo/utils/frame_queue.h b/src/include/libplacebo/utils/frame_queue.h
+index 390beaadc852bd777d9e49fef7688ae2bfc98d50..4afede6e36c864ebe5929583601f3355a2f03478 100644
+--- a/src/include/libplacebo/utils/frame_queue.h
++++ b/src/include/libplacebo/utils/frame_queue.h
+@@ -168,6 +168,12 @@ struct pl_queue_params {
+     // smeared image)
+     float interpolation_threshold;
+ 
++    // Minimum number of queued source frames to map eagerly, starting at the
++    // oldest retained frame. This does not change the output mix or target
++    // timestamp; it only makes future GPU-backed frames available early for
++    // asynchronous analysis. Zero preserves the normal queue behavior.
++    int prefetch_frames;
++
+     // Specifies how long `pl_queue_update` will wait for frames to become
+     // available, in nanoseconds, before giving up and returning with
+     // QUEUE_MORE.
+diff --git a/src/utils/frame_queue.c b/src/utils/frame_queue.c
+index c1b0173276e2d6972785e0b681da0ccb488cd474..d1276f437fb031377d2c29bddfe929fcf9ed2b24 100644
+--- a/src/utils/frame_queue.c
++++ b/src/utils/frame_queue.c
+@@ -937,6 +937,7 @@ static bool prefill(pl_queue p, const struct pl_queue_params *params)
+     if (p->fps.estimate && p->vps.estimate && p->vps.estimate <= 1.0f / MIN_FPS)
+         min_frames *= ceilf(p->vps.estimate / p->fps.estimate);
+     min_frames = PL_MAX(min_frames, PREFETCH_FRAMES);
++    min_frames = PL_MAX(min_frames, params->prefetch_frames);
+ 
+     while (p->queue.num < min_frames) {
+         switch (get_frame(p, params)) {
+@@ -1046,6 +1047,21 @@ enum pl_queue_status pl_queue_update(pl_queue p, struct pl_frame_mix *out_mix,
+     if (ret == PL_QUEUE_ERR)
+         PL_ERR(p, "Failed updating frame queue for target PTS %f!", params->pts);
+ 
++    // Analysis prefetch is deliberately separate from mix construction: it
++    // maps future frames without making them contributors to the rendered
++    // timestamp. Mapping is idempotent, so normal rendering reuses the same
++    // textures instead of uploading or importing them a second time.
++    if (ret != PL_QUEUE_ERR) {
++        int prefetch = PL_MIN(params->prefetch_frames, p->queue.num);
++        for (int i = 0; i < prefetch; i++) {
++            if (!map_entry(p, p->queue.elem[i])) {
++                ret = PL_QUEUE_ERR;
++                PL_ERR(p, "Failed prefetch-mapping queued frame %d", i);
++                break;
++            }
++        }
++    }
++
+     pl_cond_signal(&p->wakeup);
+     pl_mutex_unlock(&p->lock_weak);
+     pl_mutex_unlock(&p->lock_strong);

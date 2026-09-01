@@ -1,0 +1,622 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <development@mpv-ht.local>
+Date: Mon, 31 Aug 2026 12:00:00 -0400
+Subject: [PATCH] gpu-next: detect and manage active image aspect ratio
+
+Measure native luma rows asynchronously on prefetched frames, publish the
+active image bounds, and optionally fit the detected image on wide fullscreen
+canvases without adding a presentation wait.
+---
+diff --git a/player/command.c b/player/command.c
+index 178ff54296c9eb4debcf1f43953a6ce15d12d617..2695babbde34467d85f8096e4352bb192b4fd86f 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -2755,6 +2755,35 @@ static int mp_property_gpu_render_formats(void *ctx, struct m_property *prop,
+     return m_property_read_sub(props, action, arg);
+ }
+ 
++static int mp_property_video_active_image(void *ctx, struct m_property *prop,
++                                          int action, void *arg)
++{
++    MPContext *mpctx = ctx;
++    struct voctrl_active_image image = {0};
++    if (!mpctx->video_out ||
++        vo_control(mpctx->video_out, VOCTRL_GET_ACTIVE_IMAGE, &image) <= 0 ||
++        !image.available || image.active_w < 1 || image.active_h < 1)
++        return M_PROPERTY_UNAVAILABLE;
++
++    double ratio = (double) image.active_w / image.active_h;
++    char *summary = mp_tprintf(128, "%dx%d (%.3f:1)",
++                               image.active_w, image.active_h, ratio);
++    struct m_sub_property props[] = {
++        {"width",               SUB_PROP_INT(image.active_w)},
++        {"height",              SUB_PROP_INT(image.active_h)},
++        {"ratio",               SUB_PROP_DOUBLE(ratio)},
++        {"source-width",        SUB_PROP_INT(image.source_w)},
++        {"source-height",       SUB_PROP_INT(image.source_h)},
++        {"top",                 SUB_PROP_INT(image.top)},
++        {"bottom",              SUB_PROP_INT(image.bottom)},
++        {"frame-id",            SUB_PROP_INT64(image.frame_id)},
++        {"automatic-effective", SUB_PROP_BOOL(image.automatic_effective)},
++        {"summary",             SUB_PROP_STR(summary)},
++        {0}
++    };
++    return m_property_read_sub(props, action, arg);
++}
++
+ static int mp_property_tgt_imgparams(void *ctx, struct m_property *prop,
+                                      int action, void *arg)
+ {
+@@ -4834,6 +4863,7 @@ static const struct m_property mp_properties_base[] = {
+     {"video-target-params", mp_property_tgt_imgparams},
+     {"video-out-params", mp_property_vo_imgparams},
+     {"gpu-render-formats", mp_property_gpu_render_formats},
++    {"video-active-image", mp_property_video_active_image},
+     {"video-dec-params", mp_property_dec_imgparams},
+     {"video-params", mp_property_vd_imgparams},
+     {"video-frame-info", mp_property_video_frame_info},
+diff --git a/video/out/vo.h b/video/out/vo.h
+index f9c0365a29cd11cff0f92e2cc5be12841d5d5906..a822c2326473ed46d26683dfc5035f9c4d9f6af7 100644
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -88,6 +88,9 @@ enum mp_voctrl {
+     // Effective gpu-next intermediate and output texture formats.
+     VOCTRL_GET_RENDER_FORMATS,          // struct voctrl_render_formats*
+ 
++    // Active image bounds measured inside an encoded video frame.
++    VOCTRL_GET_ACTIVE_IMAGE,            // struct voctrl_active_image*
++
+     VOCTRL_SET_CURSOR_VISIBILITY,       // bool*
+ 
+     VOCTRL_CONTENT_TYPE,                // enum mp_content_type*
+@@ -146,6 +149,15 @@ struct voctrl_render_formats {
+     char output[VO_RENDER_FORMAT_NAME_MAX];
+ };
+ 
++struct voctrl_active_image {
++    bool available;
++    bool automatic_effective;
++    int source_w, source_h;
++    int active_w, active_h;
++    int top, bottom;
++    uint64_t frame_id;
++};
++
+ // Helper to expose what kind of content is currently playing to the VO.
+ enum mp_content_type {
+     MP_CONTENT_NONE, // used for force-window
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 61bf4c4c1c1f7d6af4245e1e41844cb4f785df73..e7ce166c3088ef04898ef521f89a48e56ee63d20 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -23,6 +23,8 @@
+ #include <libplacebo/colorspace.h>
+ #include <libplacebo/options.h>
+ #include <libplacebo/renderer.h>
++#include <libplacebo/dispatch.h>
++#include <libplacebo/shaders/custom.h>
+ #include <libplacebo/shaders/lut.h>
+ #include <libplacebo/shaders/icc.h>
+ #include <libplacebo/utils/libav.h>
+@@ -97,6 +99,29 @@ struct frame_info {
+     struct pl_dispatch_info info[VO_PASS_PERF_MAX];
+ };
+ 
++#define BAR_ANALYSIS_MAX_ROWS 4320
++#define BAR_ANALYSIS_SLOTS 8
++#define BAR_RESULT_CACHE 16
++
++struct bar_gpu_data {
++    // min, max, sum, sample count in normalized unsigned 16-bit luma.
++    uint32_t rows[BAR_ANALYSIS_MAX_ROWS][4];
++};
++
++struct bar_analysis_slot {
++    pl_buf buf;
++    bool pending;
++    uint64_t tag;
++    int width, height;
++};
++
++struct bar_result {
++    uint64_t tag;
++    int source_w, source_h;
++    int top, bottom;
++    bool valid, indeterminate;
++};
++
+ struct cache {
+     struct mp_log *log;
+     struct mpv_global *global;
+@@ -130,6 +155,11 @@ struct priv {
+     pl_gpu gpu;
+     pl_renderer rr;
+     pl_queue queue;
++    pl_dispatch bar_dispatch;
++    struct bar_analysis_slot bar_slots[BAR_ANALYSIS_SLOTS];
++    struct bar_result bar_results[BAR_RESULT_CACHE];
++    int bar_result_next;
++    struct bar_gpu_data bar_readback;
+     pl_swapchain sw;
+     pl_fmt osd_fmt[SUBBITMAP_COUNT];
+     pl_tex *sub_tex;
+@@ -148,6 +178,9 @@ struct priv {
+     bool frame_pending;
+     bool paused;
+     uint64_t causal_scene_last_logged_tag;
++    struct bar_result active_image;
++    bool active_image_available;
++    bool automatic_aspect_effective;
+ 
+     uint64_t hdr10plus_stable_signature;
+     uint64_t hdr10plus_candidate_signature;
+@@ -192,6 +225,7 @@ struct gl_next_opts {
+     bool causal_scene_diagnostics;
+     bool causal_scene_acceleration;
+     bool authored_scene_reset;
++    bool automatic_aspect_ratio;
+     int sub_hdr_peak;
+     int image_subs_hdr_peak;
+     int border_background;
+@@ -230,6 +264,7 @@ const struct m_sub_options gl_next_conf = {
+         {"hdr-causal-scene-diagnostics", OPT_BOOL(causal_scene_diagnostics), M_OPT_NOCFG},
+         {"hdr-causal-scene-acceleration", OPT_BOOL(causal_scene_acceleration), M_OPT_NOCFG},
+         {"hdr-authored-scene-reset", OPT_BOOL(authored_scene_reset)},
++        {"automatic-aspect-ratio", OPT_BOOL(automatic_aspect_ratio)},
+         {"border-background", OPT_CHOICE(border_background,
+             {"none",  BACKGROUND_NONE},
+             {"color", BACKGROUND_COLOR},
+@@ -1025,6 +1060,322 @@ static bool upload_planes_sw(struct vo *vo, pl_gpu gpu, struct mp_image *mpi,
+     return true;
+ }
+ 
++static void store_bar_result(struct priv *p, uint64_t tag, int width, int height,
++                             const struct bar_gpu_data *data)
++{
++    struct bar_result result = {
++        .tag = tag,
++        .source_w = width,
++        .source_h = height,
++        .valid = true,
++    };
++    if (height < 4 || height > BAR_ANALYSIS_MAX_ROWS)
++        return;
++
++    uint64_t edge_sum = (uint64_t) data->rows[0][2] +
++                        data->rows[height - 1][2];
++    uint64_t edge_n = (uint64_t) data->rows[0][3] +
++                      data->rows[height - 1][3];
++    if (!edge_n)
++        return;
++    uint32_t black = edge_sum / edge_n;
++
++    // Nominal limited-range black is about 6.25% of the normalized texture.
++    // Reject brighter outer rows before considering them an encoded matte.
++    // This is deliberately a gate, not the boundary threshold.
++    if (black <= 6000) {
++        int exact_top = 0, exact_bottom = 0;
++        for (int y = 0; y < height / 2; y++) {
++            const uint32_t *row = data->rows[y];
++            uint32_t mean = row[3] ? row[2] / row[3] : UINT32_MAX;
++            if (row[1] - row[0] > 4 || abs((int) mean - (int) black) > 4)
++                break;
++            exact_top++;
++        }
++        for (int y = height - 1; y >= height / 2; y--) {
++            const uint32_t *row = data->rows[y];
++            uint32_t mean = row[3] ? row[2] / row[3] : UINT32_MAX;
++            if (row[1] - row[0] > 4 || abs((int) mean - (int) black) > 4)
++                break;
++            exact_bottom++;
++        }
++
++        // A fully black/faded frame has no observable image boundary. Keep it
++        // explicitly indeterminate so the presentation side can hold the last
++        // confident geometry instead of manufacturing a new aspect ratio.
++        int near_black = 0;
++        for (int y = 0; y < height; y++) {
++            const uint32_t *row = data->rows[y];
++            uint32_t mean = row[3] ? row[2] / row[3] : UINT32_MAX;
++            near_black += mean <= black + 512;
++        }
++        if (near_black >= height * 95 / 100) {
++            result.valid = false;
++            result.indeterminate = true;
++        } else if (exact_top >= 2 && exact_bottom >= 2) {
++            // Codec blocks can contaminate the last matte rows. Refine only a
++            // short and vertically mirrored neighbourhood beyond the exact
++            // core. Select the strongest paired row transition rather than a
++            // broad per-pixel "black" threshold: this crosses contaminated
++            // HEVC/H.264 block rows and lands on the authored image edge.
++            int core = MPMIN(exact_top, exact_bottom);
++            int best_edge = core;
++            uint32_t best_rise = 0;
++            for (int n = 0; n < 64; n++) {
++                int y0 = core + n, y1 = y0 + 1;
++                if (y1 >= height / 2)
++                    break;
++                const uint32_t *t0 = data->rows[y0];
++                const uint32_t *b0 = data->rows[height - 1 - y0];
++                const uint32_t *t1 = data->rows[y1];
++                const uint32_t *b1 = data->rows[height - 1 - y1];
++                uint32_t tm0 = t0[3] ? t0[2] / t0[3] : UINT32_MAX;
++                uint32_t bm0 = b0[3] ? b0[2] / b0[3] : UINT32_MAX;
++                uint32_t tm1 = t1[3] ? t1[2] / t1[3] : UINT32_MAX;
++                uint32_t bm1 = b1[3] ? b1[2] / b1[3] : UINT32_MAX;
++                if (abs((int) tm1 - (int) bm1) > 2048)
++                    continue;
++                uint32_t pair0 = ((uint64_t) tm0 + bm0) / 2;
++                uint32_t pair1 = ((uint64_t) tm1 + bm1) / 2;
++                uint32_t rise = pair1 > pair0 ? pair1 - pair0 : 0;
++                if (rise > best_rise) {
++                    best_rise = rise;
++                    best_edge = y1;
++                }
++            }
++            int centered = best_rise >= 256 ? best_edge : core;
++            int active_h = height - 2 * centered;
++            if (active_h > 0 && (double) width / active_h <= 3.0) {
++                result.top = result.bottom = centered;
++            } else {
++                // Sparse logos and fades can have a centered internal edge,
++                // but do not establish a credible authored image aperture.
++                result.valid = false;
++                result.indeterminate = true;
++            }
++        }
++    }
++
++    p->bar_results[p->bar_result_next] = result;
++    p->bar_result_next = (p->bar_result_next + 1) % BAR_RESULT_CACHE;
++}
++
++static void consume_bar_analysis(struct priv *p)
++{
++    for (int i = 0; i < BAR_ANALYSIS_SLOTS; i++) {
++        struct bar_analysis_slot *slot = &p->bar_slots[i];
++        if (!slot->pending || pl_buf_poll(p->gpu, slot->buf, 0))
++            continue;
++        if (pl_buf_read(p->gpu, slot->buf, 0, &p->bar_readback,
++                        sizeof(p->bar_readback)))
++        {
++            store_bar_result(p, slot->tag, slot->width, slot->height,
++                             &p->bar_readback);
++        }
++        slot->pending = false;
++    }
++}
++
++static const struct bar_result *find_bar_result(struct priv *p, uint64_t tag)
++{
++    for (int i = 0; i < BAR_RESULT_CACHE; i++) {
++        if (p->bar_results[i].tag == tag)
++            return &p->bar_results[i];
++    }
++    return NULL;
++}
++
++static void commit_active_image(struct priv *p, uint64_t tag,
++                                int source_w, int source_h)
++{
++    const struct bar_result *result = find_bar_result(p, tag);
++    if (result && result->valid) {
++        p->active_image = *result;
++        p->active_image_available = true;
++    } else if (!p->active_image_available && source_w > 0 && source_h > 0) {
++        // Startup fallback until the first asynchronous result is ready.
++        p->active_image = (struct bar_result) {
++            .tag = tag,
++            .source_w = source_w,
++            .source_h = source_h,
++            .valid = true,
++        };
++        p->active_image_available = true;
++    }
++}
++
++static struct mp_rect active_source_rect(struct priv *p, uint64_t tag,
++                                         int width, int height)
++{
++    const struct bar_result *result = find_bar_result(p, tag);
++    if (!result || !result->valid)
++        result = p->active_image_available ? &p->active_image : NULL;
++    int top = result && result->source_w == width && result->source_h == height
++            ? result->top : 0;
++    int bottom = result && result->source_w == width && result->source_h == height
++               ? result->bottom : 0;
++    return (struct mp_rect) {0, top, width, height - bottom};
++}
++
++static struct mp_rect fit_active_destination(struct mp_rect canvas,
++                                             int active_w, int active_h)
++{
++    int cw = mp_rect_w(canvas), ch = mp_rect_h(canvas);
++    if (cw < 1 || ch < 1 || active_w < 1 || active_h < 1)
++        return canvas;
++    double source_ar = (double) active_w / active_h;
++    double canvas_ar = (double) cw / ch;
++    int w, h;
++    if (source_ar >= canvas_ar) {
++        w = cw;
++        h = lrint(cw / source_ar);
++    } else {
++        h = ch;
++        w = lrint(ch * source_ar);
++    }
++    int x = canvas.x0 + (cw - w) / 2;
++    int y = canvas.y0 + (ch - h) / 2;
++    return (struct mp_rect) {x, y, x + w, y + h};
++}
++
++static const struct pl_buffer_var bar_buffer_vars[] = {{
++    .var = {
++        .name = "rows",
++        .type = PL_VAR_UINT,
++        .dim_v = 4,
++        .dim_m = 1,
++        .dim_a = BAR_ANALYSIS_MAX_ROWS,
++    },
++    .layout = {
++        .offset = 0,
++        .stride = sizeof(uint32_t) * 4,
++        .size = sizeof(struct bar_gpu_data),
++    },
++}};
++
++static bool submit_bar_analysis(struct priv *p, struct pl_frame *frame,
++                                uint64_t tag)
++{
++    consume_bar_analysis(p);
++
++    struct pl_plane *luma = NULL;
++    int component = -1;
++    for (int n = 0; n < frame->num_planes && !luma; n++) {
++        for (int c = 0; c < frame->planes[n].components; c++) {
++            if (frame->planes[n].component_mapping[c] == 0) {
++                luma = &frame->planes[n];
++                component = c;
++                break;
++            }
++        }
++    }
++    if (!luma || !luma->texture || component < 0 || component > 3)
++        return false;
++    int width = luma->texture->params.w;
++    int height = luma->texture->params.h;
++    if (width < 1 || height < 1 || height > BAR_ANALYSIS_MAX_ROWS)
++        return false;
++
++    struct bar_analysis_slot *slot = NULL;
++    for (int i = 0; i < BAR_ANALYSIS_SLOTS; i++) {
++        if (!p->bar_slots[i].pending) {
++            slot = &p->bar_slots[i];
++            break;
++        }
++    }
++    if (!slot)
++        return false; // Never turn queue pressure into a presentation wait.
++
++    if (!slot->buf) {
++        slot->buf = pl_buf_create(p->gpu, pl_buf_params(
++            .size = sizeof(struct bar_gpu_data),
++            .memory_type = PL_BUF_MEM_DEVICE,
++            .host_readable = true,
++            .storable = true,
++        ));
++        if (!slot->buf)
++            return false;
++    }
++
++    struct pl_shader_desc descriptors[] = {{
++        .desc = {
++            .name = "luma_tex",
++            .type = PL_DESC_SAMPLED_TEX,
++        },
++        .binding = {
++            .object = luma->texture,
++            .address_mode = PL_TEX_ADDRESS_CLAMP,
++            .sample_mode = PL_TEX_SAMPLE_NEAREST,
++        },
++    }, {
++        .desc = {
++            .name = "BarRows",
++            .type = PL_DESC_BUF_STORAGE,
++            .access = PL_DESC_ACCESS_WRITEONLY,
++        },
++        .binding.object = slot->buf,
++        .buffer_vars = (struct pl_buffer_var *) bar_buffer_vars,
++        .num_buffer_vars = MP_ARRAY_SIZE(bar_buffer_vars),
++    }};
++    static const char header[] =
++        "shared uint row_min[64];\n"
++        "shared uint row_max[64];\n"
++        "shared uint row_sum[64];\n"
++        "shared uint row_count[64];\n";
++    char *body = talloc_asprintf(NULL,
++        "uint lane = gl_LocalInvocationID.x;\n"
++        "uint y = gl_WorkGroupID.y;\n"
++        "uvec2 size = uvec2(textureSize(luma_tex, 0));\n"
++        "uint mn = 65535u, mx = 0u, sum = 0u, count = 0u;\n"
++        "for (uint x = lane; x < size.x; x += 64u) {\n"
++        "    float v = texelFetch(luma_tex, ivec2(x, y), 0)[%d];\n"
++        "    uint q = uint(clamp(v, 0.0, 1.0) * 65535.0 + 0.5);\n"
++        "    mn = min(mn, q); mx = max(mx, q); sum += q; count++;\n"
++        "}\n"
++        "row_min[lane] = mn; row_max[lane] = mx;\n"
++        "row_sum[lane] = sum; row_count[lane] = count;\n"
++        "barrier();\n"
++        "for (uint step = 32u; step > 0u; step >>= 1u) {\n"
++        "    if (lane < step) {\n"
++        "        row_min[lane] = min(row_min[lane], row_min[lane + step]);\n"
++        "        row_max[lane] = max(row_max[lane], row_max[lane + step]);\n"
++        "        row_sum[lane] += row_sum[lane + step];\n"
++        "        row_count[lane] += row_count[lane + step];\n"
++        "    }\n"
++        "    barrier();\n"
++        "}\n"
++        "if (lane == 0u) rows[y] = uvec4(row_min[0], row_max[0], "
++        "                                row_sum[0], row_count[0]);\n",
++        component);
++
++    pl_shader sh = pl_dispatch_begin(p->bar_dispatch);
++    bool ok = pl_shader_custom(sh, &(struct pl_custom_shader) {
++        .description = "active image luma rows",
++        .header = header,
++        .body = body,
++        .input = PL_SHADER_SIG_NONE,
++        .output = PL_SHADER_SIG_NONE,
++        .descriptors = descriptors,
++        .num_descriptors = MP_ARRAY_SIZE(descriptors),
++        .compute = true,
++        .compute_group_size = {64, 1},
++    }) && pl_dispatch_compute(p->bar_dispatch, pl_dispatch_compute_params(
++        .shader = &sh,
++        .dispatch_size = {1, height, 1},
++    ));
++    talloc_free(body);
++    if (!ok) {
++        pl_dispatch_abort(p->bar_dispatch, &sh);
++        return false;
++    }
++
++    slot->pending = true;
++    slot->tag = tag;
++    slot->width = width;
++    slot->height = height;
++    return true;
++}
++
+ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src,
+                       struct pl_frame *frame)
+ {
+@@ -1174,6 +1525,12 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
+     update_lut(p, &p->next_opts->image_lut);
+     frame->lut = p->next_opts->image_lut.lut;
+     frame->lut_type = p->next_opts->image_lut.type;
++
++    bool acquired = !frame->acquire || frame->acquire(gpu, frame);
++    if (acquired)
++        submit_bar_analysis(p, frame, fp->causal_scene_tag);
++    if (frame->release)
++        frame->release(gpu, frame);
+     return true;
+ }
+ 
+@@ -1498,6 +1855,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+             p->last_pts = 0.0;
+             p->last_id = 0;
+             reset_authored_scene_state(p);
++            p->active_image_available = false;
++            p->automatic_aspect_effective = false;
++            memset(p->bar_results, 0, sizeof(p->bar_results));
+             p->want_reset = false;
+             pl_renderer_flush_cache(p->rr);
+         }
+@@ -1797,6 +2157,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+         struct pl_queue_params qparams = *pl_queue_params(
+             .pts = frame->current->pts + pts_offset,
+             .radius = pl_frame_mix_radius(&params),
++            .prefetch_frames = 3,
+             .vsync_duration = can_interpolate ? frame->ideal_frame_vsync_duration : 0,
+             .interpolation_threshold = opts->interpolation_threshold,
+             .drift_compensation = 0,
+@@ -1831,6 +2192,25 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+             break;
+         }
+ 
++        consume_bar_analysis(p);
++        commit_active_image(p, frame->frame_id + 1,
++                            vo->params->w, vo->params->h);
++        p->automatic_aspect_effective =
++            p->next_opts->automatic_aspect_ratio && vo->opts->fullscreen &&
++            (int64_t) swframe.fbo->params.w * 9 >
++            (int64_t) swframe.fbo->params.h * 16;
++        if (p->automatic_aspect_effective && p->active_image_available) {
++            int active_h = p->active_image.source_h - p->active_image.top -
++                           p->active_image.bottom;
++            struct mp_rect canvas = {
++                0, 0, swframe.fbo->params.w, swframe.fbo->params.h,
++            };
++            struct mp_rect auto_dst = fit_active_destination(
++                canvas, p->active_image.source_w, active_h);
++            apply_crop(&target, auto_dst, swframe.fbo->params.w,
++                       swframe.fbo->params.h);
++        }
++
+         // Update source crop and overlays on all existing frames. We
+         // technically own the `pl_frame` struct so this is kosher. This could
+         // be partially avoided by instead flushing the queue on resizes, but
+@@ -1842,7 +2222,13 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+ #if PL_API_VER >= 367
+             apply_dovi_enhancement_layer(p, image, fp);
+ #endif
+-            apply_crop(image, p->src, vo->params->w, vo->params->h);
++            if (p->automatic_aspect_effective) {
++                struct mp_rect auto_src = active_source_rect(
++                    p, fp->causal_scene_tag, vo->params->w, vo->params->h);
++                apply_crop(image, auto_src, vo->params->w, vo->params->h);
++            } else {
++                apply_crop(image, p->src, vo->params->w, vo->params->h);
++            }
+             if (opts->blend_subs) {
+                 if (frame->redraw)
+                     p->osd_sync++;
+@@ -2523,6 +2909,26 @@ static int control(struct vo *vo, uint32_t request, void *data)
+         return VO_TRUE;
+     }
+ 
++    case VOCTRL_GET_ACTIVE_IMAGE: {
++        struct voctrl_active_image *out = data;
++        consume_bar_analysis(p);
++        *out = (struct voctrl_active_image) {
++            .available = p->active_image_available,
++            .automatic_effective = p->automatic_aspect_effective,
++        };
++        if (p->active_image_available) {
++            out->source_w = p->active_image.source_w;
++            out->source_h = p->active_image.source_h;
++            out->active_w = p->active_image.source_w;
++            out->active_h = p->active_image.source_h - p->active_image.top -
++                            p->active_image.bottom;
++            out->top = p->active_image.top;
++            out->bottom = p->active_image.bottom;
++            out->frame_id = p->active_image.tag ? p->active_image.tag - 1 : 0;
++        }
++        return VO_TRUE;
++    }
++
+     case VOCTRL_SCREENSHOT:
+         video_screenshot(vo, data);
+         return true;
+@@ -2767,6 +3173,9 @@ static void uninit(struct vo *vo)
+         pl_gpu_finish(p->gpu);
+ 
+     pl_queue_destroy(&p->queue); // destroy this first
++    for (int i = 0; i < BAR_ANALYSIS_SLOTS; i++)
++        pl_buf_destroy(p->gpu, &p->bar_slots[i].buf);
++    pl_dispatch_destroy(&p->bar_dispatch);
+     for (int i = 0; i < MP_ARRAY_SIZE(p->osd_state.entries); i++)
+         pl_tex_destroy(p->gpu, &p->osd_state.entries[i].tex);
+     for (int i = 0; i < p->num_sub_tex; i++)
+@@ -2862,6 +3271,9 @@ static int preinit(struct vo *vo)
+     pl_gpu_set_cache(p->gpu, p->shader_cache.cache);
+     p->rr = pl_renderer_create(p->pllog, p->gpu);
+     p->queue = pl_queue_create(p->gpu);
++    p->bar_dispatch = pl_dispatch_create(p->pllog, p->gpu);
++    if (!p->rr || !p->queue || !p->bar_dispatch)
++        goto err_out;
+     p->osd_fmt[SUBBITMAP_LIBASS] = pl_find_named_fmt(p->gpu, "r8");
+     p->osd_fmt[SUBBITMAP_BGRA] = pl_find_named_fmt(p->gpu, "bgra8");
+     p->osd_sync = 1;
+@@ -3216,7 +3628,10 @@ static void update_render_options(struct vo *vo)
+     // Request as many frames as required from the decoder, depending on the
+     // speed VPS/FPS ratio libplacebo may need more frames. Request frames up to
+     // ratio of 1/2, but only if anti aliasing is enabled.
+-    int req_frames = 2;
++    // Keep two future source frames available for zero-presentation-latency
++    // asynchronous frame analysis. This is a minimum; temporal interpolation
++    // may already require a wider decoder queue.
++    int req_frames = 3;
+     if (pars->params.frame_mixer) {
+         req_frames += ceilf(pars->params.frame_mixer->kernel->radius) *
+                       (pars->params.skip_anti_aliasing ? 1 : 2);
