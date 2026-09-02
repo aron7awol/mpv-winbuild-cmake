@@ -1,17 +1,20 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: mpv-ht development <development@mpv-ht.local>
-Date: Mon, 31 Aug 2026 12:00:00 -0400
-Subject: [PATCH] gpu-next: detect and manage active image aspect ratio
+From 1848d52b948da3f4e7a87c68afc7b55f9e2320c4 Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Wed, 2 Sep 2026 11:27:27 -0400
+Subject: [PATCH] gpu-next: add active image aspect management
 
-Measure native luma rows asynchronously on prefetched frames, publish the
-active image bounds, and optionally fit the detected image on wide fullscreen
-canvases without adding a presentation wait.
+Measure native luma asynchronously, publish frame-tagged active-image geometry, and support frame-exact wide-canvas framing plus independent detected-bar cropping. Stabilize encoded matte noise, sparse and windowboxed frames, breakouts, micro aperture motion, and faint structured fade-ins with analysis-only lookahead. Preserve user and fullscreen-UI source crops without changing picture scale, and provide a default-on switch that removes analysis and lookahead overhead when disabled.
 ---
+ player/command.c        |   34 ++
+ video/out/vo.h          |   15 +
+ video/out/vo_gpu_next.c | 1175 ++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 1222 insertions(+), 2 deletions(-)
+
 diff --git a/player/command.c b/player/command.c
-index 178ff54296c9eb4debcf1f43953a6ce15d12d617..2695babbde34467d85f8096e4352bb192b4fd86f 100644
+index 178ff5429..e7671b7d6 100644
 --- a/player/command.c
 +++ b/player/command.c
-@@ -2755,6 +2755,35 @@ static int mp_property_gpu_render_formats(void *ctx, struct m_property *prop,
+@@ -2755,6 +2755,39 @@ static int mp_property_gpu_render_formats(void *ctx, struct m_property *prop,
      return m_property_read_sub(props, action, arg);
  }
  
@@ -38,6 +41,10 @@ index 178ff54296c9eb4debcf1f43953a6ce15d12d617..2695babbde34467d85f8096e4352bb19
 +        {"bottom",              SUB_PROP_INT(image.bottom)},
 +        {"frame-id",            SUB_PROP_INT64(image.frame_id)},
 +        {"automatic-effective", SUB_PROP_BOOL(image.automatic_effective)},
++        {"breakout",            SUB_PROP_BOOL(image.breakout)},
++        {"gpu-ms-median",       SUB_PROP_DOUBLE(image.gpu_ns_median / 1e6)},
++        {"gpu-ms-p99",          SUB_PROP_DOUBLE(image.gpu_ns_p99 / 1e6)},
++        {"timing-samples",      SUB_PROP_INT(image.timing_samples)},
 +        {"summary",             SUB_PROP_STR(summary)},
 +        {0}
 +    };
@@ -47,7 +54,7 @@ index 178ff54296c9eb4debcf1f43953a6ce15d12d617..2695babbde34467d85f8096e4352bb19
  static int mp_property_tgt_imgparams(void *ctx, struct m_property *prop,
                                       int action, void *arg)
  {
-@@ -4834,6 +4863,7 @@ static const struct m_property mp_properties_base[] = {
+@@ -4834,6 +4867,7 @@ static const struct m_property mp_properties_base[] = {
      {"video-target-params", mp_property_tgt_imgparams},
      {"video-out-params", mp_property_vo_imgparams},
      {"gpu-render-formats", mp_property_gpu_render_formats},
@@ -56,7 +63,7 @@ index 178ff54296c9eb4debcf1f43953a6ce15d12d617..2695babbde34467d85f8096e4352bb19
      {"video-params", mp_property_vd_imgparams},
      {"video-frame-info", mp_property_video_frame_info},
 diff --git a/video/out/vo.h b/video/out/vo.h
-index f9c0365a29cd11cff0f92e2cc5be12841d5d5906..a822c2326473ed46d26683dfc5035f9c4d9f6af7 100644
+index f9c0365a2..466db79e9 100644
 --- a/video/out/vo.h
 +++ b/video/out/vo.h
 @@ -88,6 +88,9 @@ enum mp_voctrl {
@@ -69,24 +76,27 @@ index f9c0365a29cd11cff0f92e2cc5be12841d5d5906..a822c2326473ed46d26683dfc5035f9c
      VOCTRL_SET_CURSOR_VISIBILITY,       // bool*
  
      VOCTRL_CONTENT_TYPE,                // enum mp_content_type*
-@@ -146,6 +149,15 @@ struct voctrl_render_formats {
+@@ -146,6 +149,18 @@ struct voctrl_render_formats {
      char output[VO_RENDER_FORMAT_NAME_MAX];
  };
  
 +struct voctrl_active_image {
 +    bool available;
 +    bool automatic_effective;
++    bool breakout;
 +    int source_w, source_h;
 +    int active_w, active_h;
 +    int top, bottom;
 +    uint64_t frame_id;
++    uint64_t gpu_ns_median, gpu_ns_p99;
++    int timing_samples;
 +};
 +
  // Helper to expose what kind of content is currently playing to the VO.
  enum mp_content_type {
      MP_CONTENT_NONE, // used for force-window
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index 61bf4c4c1c1f7d6af4245e1e41844cb4f785df73..e7ce166c3088ef04898ef521f89a48e56ee63d20 100644
+index bf5cb1231..3faec75c1 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
 @@ -23,6 +23,8 @@
@@ -98,17 +108,33 @@ index 61bf4c4c1c1f7d6af4245e1e41844cb4f785df73..e7ce166c3088ef04898ef521f89a48e5
  #include <libplacebo/shaders/lut.h>
  #include <libplacebo/shaders/icc.h>
  #include <libplacebo/utils/libav.h>
-@@ -97,6 +99,29 @@ struct frame_info {
+@@ -97,6 +99,48 @@ struct frame_info {
      struct pl_dispatch_info info[VO_PASS_PERF_MAX];
  };
  
 +#define BAR_ANALYSIS_MAX_ROWS 4320
 +#define BAR_ANALYSIS_SLOTS 8
 +#define BAR_RESULT_CACHE 16
++#define BAR_TIMING_SAMPLES 256
++#define BAR_ANALYSIS_TILES 32
 +
 +struct bar_gpu_data {
 +    // min, max, sum, sample count in normalized unsigned 16-bit luma.
 +    uint32_t rows[BAR_ANALYSIS_MAX_ROWS][4];
++    // Pixels materially above nominal black, used to distinguish sparse codec
++    // residue from an established row of picture content.
++    uint32_t bright[BAR_ANALYSIS_MAX_ROWS];
++    // Bright pixels in the outer horizontal eighths. Real picture content
++    // normally reaches these regions; centered titles and credits do not.
++    uint32_t edge_bright[BAR_ANALYSIS_MAX_ROWS];
++    // Min, max, sum, and sample count for narrow strips at the left and right
++    // edges. These establish actual side-matte evidence; they never define a
++    // horizontal crop.
++    uint32_t side[BAR_ANALYSIS_MAX_ROWS][2][4];
++    // Packed normalized 16-bit min/max values for horizontal regions in each
++    // row. These preserve spatial matte structure without reading back a full
++    // per-pixel mask: low 16 bits are min, high 16 bits are max.
++    uint32_t tiles[BAR_ANALYSIS_MAX_ROWS][BAR_ANALYSIS_TILES];
 +};
 +
 +struct bar_analysis_slot {
@@ -122,54 +148,160 @@ index 61bf4c4c1c1f7d6af4245e1e41844cb4f785df73..e7ce166c3088ef04898ef521f89a48e5
 +    uint64_t tag;
 +    int source_w, source_h;
 +    int top, bottom;
-+    bool valid, indeterminate;
++    uint32_t black;
++    uint8_t side_matte_mask;
++    bool valid, indeterminate, width_spanning, breakout, boundary_exact;
++    bool faint_structured;
 +};
 +
  struct cache {
      struct mp_log *log;
      struct mpv_global *global;
-@@ -130,6 +155,11 @@ struct priv {
+@@ -130,6 +174,16 @@ struct priv {
      pl_gpu gpu;
      pl_renderer rr;
      pl_queue queue;
 +    pl_dispatch bar_dispatch;
++    pl_timer bar_timer;
 +    struct bar_analysis_slot bar_slots[BAR_ANALYSIS_SLOTS];
 +    struct bar_result bar_results[BAR_RESULT_CACHE];
 +    int bar_result_next;
 +    struct bar_gpu_data bar_readback;
++    uint64_t bar_timings[BAR_TIMING_SAMPLES];
++    int bar_timing_count, bar_timing_next;
++    uint64_t bar_first_commit_tag, bar_last_commit_tag, bar_commit_count;
++    uint64_t bar_indeterminate_count;
      pl_swapchain sw;
      pl_fmt osd_fmt[SUBBITMAP_COUNT];
      pl_tex *sub_tex;
-@@ -148,6 +178,9 @@ struct priv {
+@@ -148,6 +202,10 @@ struct priv {
      bool frame_pending;
      bool paused;
      uint64_t causal_scene_last_logged_tag;
 +    struct bar_result active_image;
++    int active_motion_top_step, active_motion_bottom_step;
 +    bool active_image_available;
 +    bool automatic_aspect_effective;
  
      uint64_t hdr10plus_stable_signature;
      uint64_t hdr10plus_candidate_signature;
-@@ -192,6 +225,7 @@ struct gl_next_opts {
+@@ -192,6 +250,10 @@ struct gl_next_opts {
      bool causal_scene_diagnostics;
      bool causal_scene_acceleration;
      bool authored_scene_reset;
++    bool active_image_detection;
 +    bool automatic_aspect_ratio;
++    bool automatic_aspect_ratio_crop;
++    float automatic_aspect_ratio_canvas;
      int sub_hdr_peak;
      int image_subs_hdr_peak;
      int border_background;
-@@ -230,6 +264,7 @@ const struct m_sub_options gl_next_conf = {
+@@ -230,6 +292,11 @@ const struct m_sub_options gl_next_conf = {
          {"hdr-causal-scene-diagnostics", OPT_BOOL(causal_scene_diagnostics), M_OPT_NOCFG},
          {"hdr-causal-scene-acceleration", OPT_BOOL(causal_scene_acceleration), M_OPT_NOCFG},
          {"hdr-authored-scene-reset", OPT_BOOL(authored_scene_reset)},
++        {"active-image-detection", OPT_BOOL(active_image_detection)},
 +        {"automatic-aspect-ratio", OPT_BOOL(automatic_aspect_ratio)},
++        {"automatic-aspect-ratio-crop", OPT_BOOL(automatic_aspect_ratio_crop)},
++        {"automatic-aspect-ratio-canvas",
++            OPT_FLOAT(automatic_aspect_ratio_canvas), M_RANGE(0, 10)},
          {"border-background", OPT_CHOICE(border_background,
              {"none",  BACKGROUND_NONE},
              {"color", BACKGROUND_COLOR},
-@@ -1025,6 +1060,322 @@ static bool upload_planes_sw(struct vo *vo, pl_gpu gpu, struct mp_image *mpi,
+@@ -253,6 +320,7 @@ const struct m_sub_options gl_next_conf = {
+         {0},
+     },
+     .defaults = &(struct gl_next_opts) {
++        .active_image_detection = true,
+         .border_background = BACKGROUND_COLOR,
+         .background_blur_radius = 16.0f,
+         .inter_preserve = true,
+@@ -1025,6 +1093,941 @@ static bool upload_planes_sw(struct vo *vo, pl_gpu gpu, struct mp_image *mpi,
      return true;
  }
  
++static bool bar_tile_is_matte(uint32_t packed, uint32_t black)
++{
++    uint32_t mn = packed & 0xffffu;
++    uint32_t mx = packed >> 16;
++    if (mx < mn || mx - mn > 512)
++        return false;
++    uint32_t midpoint = (mn + mx) / 2;
++    return abs((int) midpoint - (int) black) <= 128;
++}
++
++static bool bar_outer_black_baseline(const struct bar_gpu_data *data,
++                                     int height, uint32_t *baseline)
++{
++    uint32_t candidates[BAR_ANALYSIS_TILES * 2];
++    int num = 0;
++    for (int edge = 0; edge < 2; edge++) {
++        int y = edge ? height - 1 : 0;
++        for (int tile = 0; tile < BAR_ANALYSIS_TILES; tile++) {
++            uint32_t packed = data->tiles[y][tile];
++            uint32_t mn = packed & 0xffffu;
++            uint32_t mx = packed >> 16;
++            uint32_t midpoint = (mn + mx) / 2;
++            if (mx >= mn && mx - mn <= 512 && midpoint <= 6000)
++                candidates[num++] = midpoint;
++        }
++    }
++    // Localized overflow may contaminate much of an outer row, but require at
++    // least one quarter of the paired edge regions to agree that a plausible
++    // black population still exists before replacing the whole-row mean.
++    if (num < BAR_ANALYSIS_TILES / 2)
++        return false;
++    for (int i = 1; i < num; i++) {
++        uint32_t value = candidates[i];
++        int j = i;
++        while (j > 0 && candidates[j - 1] > value) {
++            candidates[j] = candidates[j - 1];
++            j--;
++        }
++        candidates[j] = value;
++    }
++    *baseline = candidates[(num - 1) / 2];
++    return true;
++}
++
++static int bar_paired_matte_tiles(const struct bar_gpu_data *data, int y,
++                                  int height, uint32_t black)
++{
++    int matte = 0;
++    for (int tile = 0; tile < BAR_ANALYSIS_TILES; tile++) {
++        matte += bar_tile_is_matte(data->tiles[y][tile], black);
++        matte += bar_tile_is_matte(data->tiles[height - 1 - y][tile], black);
++    }
++    return matte;
++}
++
++static bool find_spatial_bar_boundary(const struct bar_gpu_data *data,
++                                      int height, uint32_t black,
++                                      int *boundary, int *support)
++{
++    // A real horizontal aperture ends across most of the encoded width. A
++    // frame-breaking effect only contaminates a minority of otherwise matte
++    // horizontal regions. Require two adjacent mirrored row pairs with at
++    // least 60% non-matte support before accepting the boundary.
++    const int samples = BAR_ANALYSIS_TILES * 2;
++    int run = 0;
++    for (int y = 0; y < height / 2; y++) {
++        int non_matte = samples -
++            bar_paired_matte_tiles(data, y, height, black);
++        if ((uint64_t) non_matte * 5 >= (uint64_t) samples * 3) {
++            if (++run >= 2) {
++                int first = y - run + 1;
++                *boundary = (first + 1) & ~1;
++                *support = non_matte;
++                return true;
++            }
++        } else {
++            run = 0;
++        }
++    }
++    return false;
++}
++
 +static void store_bar_result(struct priv *p, uint64_t tag, int width, int height,
 +                             const struct bar_gpu_data *data)
 +{
@@ -178,6 +310,7 @@ index 61bf4c4c1c1f7d6af4245e1e41844cb4f785df73..e7ce166c3088ef04898ef521f89a48e5
 +        .source_w = width,
 +        .source_h = height,
 +        .valid = true,
++        .width_spanning = true,
 +    };
 +    if (height < 4 || height > BAR_ANALYSIS_MAX_ROWS)
 +        return;
@@ -189,11 +322,57 @@ index 61bf4c4c1c1f7d6af4245e1e41844cb4f785df73..e7ce166c3088ef04898ef521f89a48e5
 +    if (!edge_n)
 +        return;
 +    uint32_t black = edge_sum / edge_n;
++    uint32_t spatial_black = 0;
++    if (bar_outer_black_baseline(data, height, &spatial_black))
++        black = spatial_black;
++    result.black = black;
++
++    bool outer_breakout_hold = false;
++    if (black > 6000 && p->active_image_available &&
++        p->active_image.source_w == width &&
++        p->active_image.source_h == height &&
++        p->active_image.top > 0 && p->active_image.breakout)
++    {
++        // Once a localized excursion has established that picture is breaking
++        // out of a stable aperture, retain that aperture through frames where
++        // the excursion momentarily covers every outer tile. Otherwise the
++        // middle of one continuous effect would masquerade as a fresh AR cut.
++        result.top = result.bottom = p->active_image.top;
++        result.black = p->active_image.black;
++        result.breakout = true;
++        outer_breakout_hold = true;
++    } else if (black > 6000 && p->active_image_available &&
++        p->active_image.source_w == width &&
++        p->active_image.source_h == height &&
++        p->active_image.top > 0 && p->active_image.black <= 6000)
++    {
++        int previous = p->active_image.top;
++        int first = MPMAX(0, previous - 8);
++        int matte = 0, samples = 0;
++        for (int y = first; y < previous; y++) {
++            matte += bar_paired_matte_tiles(
++                data, y, height, p->active_image.black);
++            samples += BAR_ANALYSIS_TILES * 2;
++        }
++        if (samples && (uint64_t) matte * 20 >=
++                       (uint64_t) samples * 7)
++        {
++            result.top = result.bottom = previous;
++            result.black = p->active_image.black;
++            result.breakout = true;
++            outer_breakout_hold = true;
++            MP_TRACE(p, "Active image outer breakout hold frame=%" PRIu64
++                     " previous=%d matte=%d/%d.\n",
++                     tag - 1, previous, matte, samples);
++        }
++    }
 +
 +    // Nominal limited-range black is about 6.25% of the normalized texture.
 +    // Reject brighter outer rows before considering them an encoded matte.
 +    // This is deliberately a gate, not the boundary threshold.
-+    if (black <= 6000) {
++    if (!outer_breakout_hold && black <= 6000) {
++        uint32_t matte_ceiling = black + 2048;
++        uint32_t noise_pixels = MPMAX(4, width / 200);
 +        int exact_top = 0, exact_bottom = 0;
 +        for (int y = 0; y < height / 2; y++) {
 +            const uint32_t *row = data->rows[y];
@@ -210,56 +389,229 @@ index 61bf4c4c1c1f7d6af4245e1e41844cb4f785df73..e7ce166c3088ef04898ef521f89a48e5
 +            exact_bottom++;
 +        }
 +
++        // The exact seed is preferred, but the final rows of a shrinking
++        // encoded matte can acquire small block residue before the matte
++        // disappears. Recover a seed only while paired outer rows remain
++        // tightly clustered around this frame's measured black baseline and
++        // contain no material population of bright pixels.
++        int seed_top = exact_top, seed_bottom = exact_bottom;
++        if (seed_top < 2) {
++            seed_top = 0;
++            for (int y = 0; y < height / 2; y++) {
++                const uint32_t *row = data->rows[y];
++                uint32_t mean = row[3] ? row[2] / row[3] : UINT32_MAX;
++                if (row[1] - row[0] > 2048 ||
++                    abs((int) mean - (int) black) > 512 ||
++                    data->bright[y] > noise_pixels)
++                    break;
++                seed_top++;
++            }
++        }
++        if (seed_bottom < 2) {
++            seed_bottom = 0;
++            for (int y = height - 1; y >= height / 2; y--) {
++                const uint32_t *row = data->rows[y];
++                uint32_t mean = row[3] ? row[2] / row[3] : UINT32_MAX;
++                if (row[1] - row[0] > 2048 ||
++                    abs((int) mean - (int) black) > 512 ||
++                    data->bright[y] > noise_pixels)
++                    break;
++                seed_bottom++;
++            }
++        }
++
 +        // A fully black/faded frame has no observable image boundary. Keep it
 +        // explicitly indeterminate so the presentation side can hold the last
 +        // confident geometry instead of manufacturing a new aspect ratio.
 +        int near_black = 0;
++        uint64_t bright_pixels = 0, edge_bright_pixels = 0;
 +        for (int y = 0; y < height; y++) {
 +            const uint32_t *row = data->rows[y];
 +            uint32_t mean = row[3] ? row[2] / row[3] : UINT32_MAX;
 +            near_black += mean <= black + 512;
++            bright_pixels += data->bright[y];
++            edge_bright_pixels += data->edge_bright[y];
 +        }
-+        if (near_black >= height * 95 / 100) {
++        // Sparse credits, logos, and fade remnants on black do not reveal an
++        // authored aperture. Treat them like a fully black frame and retain
++        // the last geometry that was established by an observable picture.
++        uint64_t pixels = (uint64_t) width * height;
++        // Whole-frame coverage rejects credits, logos, and tiny fade remnants.
++        // Do not also require bright pixels in the outer eighths: the measured
++        // baseline-relative side strips below are the authoritative test for
++        // whether observable picture actually spans the encoded width.
++        bool sparse = bright_pixels <= pixels / 10;
++        int spatial_boundary = 0, spatial_support = 0;
++        bool spatial_found = find_spatial_bar_boundary(
++            data, height, black, &spatial_boundary, &spatial_support);
++        bool faint_structured = sparse && spatial_found &&
++            bright_pixels * 40 > pixels * 3;
++        if (near_black >= height * 95 / 100 ||
++            (sparse && !faint_structured)) {
++            MP_TRACE(p, "Active image sparse evidence frame=%" PRIu64
++                     " black=%u near=%d/%d bright=%" PRIu64 "/%" PRIu64
++                     " edge=%" PRIu64 "/%" PRIu64 " seed=%d/%d.\n",
++                     tag - 1, black, near_black, height, bright_pixels,
++                     pixels / 10, edge_bright_pixels, pixels / 200,
++                     seed_top, seed_bottom);
 +            result.valid = false;
 +            result.indeterminate = true;
-+        } else if (exact_top >= 2 && exact_bottom >= 2) {
-+            // Codec blocks can contaminate the last matte rows. Refine only a
-+            // short and vertically mirrored neighbourhood beyond the exact
-+            // core. Select the strongest paired row transition rather than a
-+            // broad per-pixel "black" threshold: this crosses contaminated
-+            // HEVC/H.264 block rows and lands on the authored image edge.
-+            int core = MPMIN(exact_top, exact_bottom);
-+            int best_edge = core;
-+            uint32_t best_rise = 0;
-+            for (int n = 0; n < 64; n++) {
-+                int y0 = core + n, y1 = y0 + 1;
-+                if (y1 >= height / 2)
-+                    break;
-+                const uint32_t *t0 = data->rows[y0];
-+                const uint32_t *b0 = data->rows[height - 1 - y0];
-+                const uint32_t *t1 = data->rows[y1];
-+                const uint32_t *b1 = data->rows[height - 1 - y1];
-+                uint32_t tm0 = t0[3] ? t0[2] / t0[3] : UINT32_MAX;
-+                uint32_t bm0 = b0[3] ? b0[2] / b0[3] : UINT32_MAX;
-+                uint32_t tm1 = t1[3] ? t1[2] / t1[3] : UINT32_MAX;
-+                uint32_t bm1 = b1[3] ? b1[2] / b1[3] : UINT32_MAX;
-+                if (abs((int) tm1 - (int) bm1) > 2048)
-+                    continue;
-+                uint32_t pair0 = ((uint64_t) tm0 + bm0) / 2;
-+                uint32_t pair1 = ((uint64_t) tm1 + bm1) / 2;
-+                uint32_t rise = pair1 > pair0 ? pair1 - pair0 : 0;
-+                if (rise > best_rise) {
-+                    best_rise = rise;
-+                    best_edge = y1;
++        } else if (spatial_found || (seed_top >= 2 && seed_bottom >= 2)) {
++            // Codec blocks can perturb otherwise black matte rows by a few
++            // luma code values. Extend the perfectly uniform core only while
++            // every value in both mirrored rows remains near this frame's
++            // measured black baseline. The first genuine non-black value is
++            // content; this tolerance exists solely for encoded matte noise.
++            int core = MPMIN(seed_top, seed_bottom);
++            int centered = core;
++            bool boundary_found = false;
++            int legacy_centered = core;
++            bool legacy_found = false;
++            if (seed_top >= 2 && seed_bottom >= 2) {
++                for (int n = 0; n < 64; n++) {
++                    int y = core + n;
++                    if (y >= height / 2) {
++                        legacy_found = true;
++                        break;
++                    }
++                    const uint32_t *top = data->rows[y];
++                    const uint32_t *bottom = data->rows[height - 1 - y];
++                    bool top_content = top[1] > matte_ceiling &&
++                                       data->bright[y] > noise_pixels;
++                    bool bottom_content = bottom[1] > matte_ceiling &&
++                        data->bright[height - 1 - y] > noise_pixels;
++                    if (top_content || bottom_content) {
++                        legacy_found = true;
++                        break;
++                    }
++                    legacy_centered = y + 1;
 +                }
 +            }
-+            int centered = best_rise >= 256 ? best_edge : core;
++            legacy_centered = (legacy_centered + 1) & ~1;
++            if (spatial_found) {
++                centered = spatial_boundary;
++                boundary_found = true;
++                // Keep the row detector's finer boundary when both methods
++                // describe the same aperture. Spatial consensus exists to
++                // reject localized excursions, not to introduce 2-4 pixel
++                // quantization noise at an otherwise stable matte edge.
++                if (legacy_found && abs(centered - legacy_centered) <= 8)
++                    centered = legacy_centered;
++                result.breakout = centered > 0 &&
++                    (centered > legacy_centered + 2 ||
++                     seed_top < 2 || seed_bottom < 2);
++                MP_TRACE(p, "Active image spatial evidence frame=%" PRIu64
++                         " black=%u boundary=%d support=%d/%d legacy=%d "
++                         "breakout=%d.\n", tag - 1, black, centered,
++                         spatial_support, BAR_ANALYSIS_TILES * 2,
++                         legacy_found ? legacy_centered : -1,
++                         result.breakout);
++            } else {
++                centered = legacy_centered;
++                boundary_found = legacy_found;
++            }
++            result.boundary_exact = legacy_found;
++            if (result.breakout && p->active_image_available &&
++                p->active_image.source_w == width &&
++                p->active_image.source_h == height)
++            {
++                centered = p->active_image.top;
++            }
++            // When a candidate expands outward, test the narrow band directly
++            // outside the established aperture. A centered AR change removes
++            // that matte on both sides across the width. Breakout effects leave
++            // a substantial portion of the old matte line intact, even when
++            // their total envelope reaches the encoded frame edges.
++            if (boundary_found && p->active_image_available &&
++                p->active_image.source_w == width &&
++                p->active_image.source_h == height &&
++                centered < p->active_image.top)
++            {
++                int previous = p->active_image.top;
++                if (result.breakout)
++                    centered = previous;
++                int first = MPMAX(centered, previous - 8);
++                int matte = 0, samples = 0;
++                for (int y = first; y < previous; y++) {
++                    matte += bar_paired_matte_tiles(data, y, height, black);
++                    samples += BAR_ANALYSIS_TILES * 2;
++                }
++                if (samples && (uint64_t) matte * 20 >=
++                               (uint64_t) samples * 7)
++                {
++                    MP_TRACE(p, "Active image breakout hold frame=%" PRIu64
++                             " candidate=%d previous=%d matte=%d/%d.\n",
++                             tag - 1, centered, previous, matte, samples);
++                    centered = previous;
++                    result.breakout = true;
++                }
++            }
++            // 4:2:0 encodes vertical chroma on an even-row grid. Snap a
++            // one-row inward ambiguity to that grid so codec residue cannot
++            // toggle a stable authored boundary between adjacent rows.
++            centered = (centered + 1) & ~1;
 +            int active_h = height - 2 * centered;
-+            if (active_h > 0 && (double) width / active_h <= 3.0) {
++            if (!boundary_found) {
++                // The refinement limit is a safety boundary, not evidence of
++                // picture. Holding avoids publishing the limit itself as a
++                // false aperture when codec noise shortens one exact core.
++                result.valid = false;
++                result.indeterminate = true;
++            } else if (active_h > 0 && (double) width / active_h <= 3.0) {
++                // A vertical aperture only defines an aspect ratio while the
++                // observable picture spans the encoded width. A credible
++                // matte on either horizontal side makes width/active_h
++                // ambiguous (windowboxing, an offset graphic, or a wipe).
++                // Keep this as a confidence veto only: never crop side bars.
++                int content_rows = 0, left_inset_rows = 0;
++                int right_inset_rows = 0;
++                for (int y = centered; y < height - centered; y++) {
++                    if (data->bright[y] <= noise_pixels)
++                        continue;
++                    content_rows++;
++                    const uint32_t *left = data->side[y][0];
++                    const uint32_t *right = data->side[y][1];
++                    uint32_t left_mean = left[3] ? left[2] / left[3] : UINT32_MAX;
++                    uint32_t right_mean = right[3] ? right[2] / right[3] : UINT32_MAX;
++                    left_inset_rows += left[3] && left[1] - left[0] <= 512 &&
++                        abs((int) left_mean - (int) black) <= 128;
++                    right_inset_rows += right[3] && right[1] - right[0] <= 512 &&
++                        abs((int) right_mean - (int) black) <= 128;
++                }
++                bool enough_rows = content_rows >= MPMAX(4, active_h / 4);
++                bool left_matte = enough_rows &&
++                    (uint64_t) left_inset_rows * 20 >=
++                    (uint64_t) content_rows * 19;
++                bool right_matte = enough_rows &&
++                    (uint64_t) right_inset_rows * 20 >=
++                    (uint64_t) content_rows * 19;
++                result.side_matte_mask = left_matte | (right_matte << 1);
++                result.width_spanning = !left_matte && !right_matte;
++                result.faint_structured = faint_structured;
 +                result.top = result.bottom = centered;
++                MP_TRACE(p, "Active image side evidence frame=%" PRIu64
++                         " black=%u active=%dx%d rows=%d left=%d right=%d "
++                         "matte=%d/%d.\n", tag - 1, black, width, active_h,
++                         content_rows, left_inset_rows, right_inset_rows,
++                         left_matte, right_matte);
 +            } else {
 +                // Sparse logos and fades can have a centered internal edge,
 +                // but do not establish a credible authored image aperture.
++                result.valid = false;
++                result.indeterminate = true;
++            }
++        } else {
++            // A few low-level codec values can remove the exact seed from an
++            // otherwise black outer row. Without materially bright pixels at
++            // either edge, this is not evidence that picture became full
++            // frame; retain the preceding confident aperture.
++            const uint32_t *top = data->rows[0];
++            const uint32_t *bottom = data->rows[height - 1];
++            bool top_content = top[1] > matte_ceiling &&
++                               data->bright[0] > noise_pixels;
++            bool bottom_content = bottom[1] > matte_ceiling &&
++                data->bright[height - 1] > noise_pixels;
++            if (!top_content && !bottom_content) {
 +                result.valid = false;
 +                result.indeterminate = true;
 +            }
@@ -272,6 +624,12 @@ index 61bf4c4c1c1f7d6af4245e1e41844cb4f785df73..e7ce166c3088ef04898ef521f89a48e5
 +
 +static void consume_bar_analysis(struct priv *p)
 +{
++    for (uint64_t ns; (ns = pl_timer_query(p->gpu, p->bar_timer));) {
++        p->bar_timings[p->bar_timing_next] = ns;
++        p->bar_timing_next = (p->bar_timing_next + 1) % BAR_TIMING_SAMPLES;
++        p->bar_timing_count = MPMIN(p->bar_timing_count + 1,
++                                    BAR_TIMING_SAMPLES);
++    }
 +    for (int i = 0; i < BAR_ANALYSIS_SLOTS; i++) {
 +        struct bar_analysis_slot *slot = &p->bar_slots[i];
 +        if (!slot->pending || pl_buf_poll(p->gpu, slot->buf, 0))
@@ -295,13 +653,184 @@ index 61bf4c4c1c1f7d6af4245e1e41844cb4f785df73..e7ce166c3088ef04898ef521f89a48e5
 +    return NULL;
 +}
 +
++static bool comparable_bar_result(const struct bar_result *a,
++                                  const struct bar_result *b)
++{
++    return a && b && a->valid && b->valid &&
++           a->source_w == b->source_w && a->source_h == b->source_h;
++}
++
++static int bar_change_direction(const struct bar_result *from,
++                                const struct bar_result *to)
++{
++    if (!comparable_bar_result(from, to))
++        return 0;
++    int top = to->top - from->top;
++    int bottom = to->bottom - from->bottom;
++    if (top <= 0 && bottom <= 0 && (top < 0 || bottom < 0))
++        return -1;
++    if (top >= 0 && bottom >= 0 && (top > 0 || bottom > 0))
++        return 1;
++    return 0;
++}
++
++static bool strong_bar_boundary(const struct bar_result *result)
++{
++    return result && result->valid &&
++           (result->boundary_exact || (!result->top && !result->bottom));
++}
++
++static bool coherent_bar_motion(struct priv *p,
++                                const struct bar_result *anchor,
++                                const struct bar_result *current,
++                                const struct bar_result *next,
++                                const struct bar_result *later)
++{
++    if (!comparable_bar_result(anchor, current) ||
++        !comparable_bar_result(current, next) ||
++        !comparable_bar_result(next, later) || !strong_bar_boundary(anchor) ||
++        !strong_bar_boundary(current) || !strong_bar_boundary(next) ||
++        !strong_bar_boundary(later))
++        return false;
++
++    int first = bar_change_direction(anchor, current);
++    int second = bar_change_direction(current, next);
++    int third = bar_change_direction(next, later);
++    if (!first || second != first || (third && third != first))
++        return false;
++
++    // A genuine centered aperture animation advances both edges by a similar
++    // amount on consecutive frames. Matte-boundary residue instead plateaus,
++    // reverses, or changes step size as different encoded blocks cross the
++    // threshold. Allow one row of measurement variation per edge.
++    int at = current->top - anchor->top;
++    int ab = current->bottom - anchor->bottom;
++    int bt = next->top - current->top;
++    int bb = next->bottom - current->bottom;
++    int ct = later->top - next->top;
++    int cb = later->bottom - next->bottom;
++    if (!third && (abs(at - p->active_motion_top_step) > 2 ||
++                   abs(ab - p->active_motion_bottom_step) > 2 ||
++                   (!p->active_motion_top_step &&
++                    !p->active_motion_bottom_step)))
++        return false;
++    return abs(at - ab) <= 1 && abs(bt - bb) <= 1 && abs(ct - cb) <= 1 &&
++           abs(at - bt) <= 2 && (!third || abs(bt - ct) <= 2);
++}
++
++static const struct bar_result *stable_bar_result(struct priv *p, uint64_t tag)
++{
++    const struct bar_result *result = find_bar_result(p, tag);
++    if (!result || !result->valid || !p->active_image_available)
++        return result;
++
++    const struct bar_result *next = find_bar_result(p, tag + 1);
++    const struct bar_result *later = find_bar_result(p, tag + 2);
++    if (!comparable_bar_result(&p->active_image, result))
++        return result;
++
++    int top_delta = abs(result->top - p->active_image.top);
++    int bottom_delta = abs(result->bottom - p->active_image.bottom);
++    if (!top_delta && !bottom_delta)
++        return result;
++
++    // About 0.56% of source height per edge: 12 rows at 2160p, 6 at
++    // 1080p. This is an ambiguity envelope, not output quantization. A raw
++    // sequence that moves coherently escapes it on its matching frame.
++    int micro = MPMAX(2, result->source_h / 180);
++    bool future_available = comparable_bar_result(result, next) &&
++                            comparable_bar_result(next, later);
++    bool motion_endpoint = future_available && strong_bar_boundary(result) &&
++        strong_bar_boundary(next) && strong_bar_boundary(later) &&
++        result->top == next->top &&
++        result->bottom == next->bottom && result->top == later->top &&
++        result->bottom == later->bottom &&
++        abs((result->top - p->active_image.top) -
++            p->active_motion_top_step) <= 2 &&
++        abs((result->bottom - p->active_image.bottom) -
++            p->active_motion_bottom_step) <= 2 &&
++        (p->active_motion_top_step || p->active_motion_bottom_step);
++    if (top_delta <= micro && bottom_delta <= micro &&
++        (!future_available || !motion_endpoint) &&
++        !coherent_bar_motion(p, &p->active_image, result, next, later))
++    {
++        MP_TRACE(p, "Active image micro hold frame=%" PRIu64
++                 " candidate=%d/%d anchor=%d/%d limit=%d.\n", tag - 1,
++                 result->top, result->bottom, p->active_image.top,
++                 p->active_image.bottom, micro);
++        return &p->active_image;
++    }
++    return result;
++}
++
++static bool confirmed_faint_width_change(struct priv *p,
++                                         const struct bar_result *result)
++{
++    if (!result || !result->valid || !result->faint_structured ||
++        (result->side_matte_mask != 1 && result->side_matte_mask != 2) ||
++        !result->top || result->breakout)
++        return false;
++
++    const struct bar_result *next = find_bar_result(p, result->tag + 1);
++    const struct bar_result *later = find_bar_result(p, result->tag + 2);
++    return comparable_bar_result(result, next) &&
++           comparable_bar_result(next, later) &&
++           next->top == result->top && next->bottom == result->bottom &&
++           later->top == result->top && later->bottom == result->bottom &&
++           next->side_matte_mask == result->side_matte_mask &&
++           later->width_spanning && !next->breakout && !later->breakout;
++}
++
++static bool ambiguous_width_change(struct priv *p,
++                                   const struct bar_result *result)
++{
++    if (!result || !result->valid || result->width_spanning ||
++        (result->top == 0 && result->bottom == 0) ||
++        confirmed_faint_width_change(p, result))
++        return false;
++    if (!p->active_image_available ||
++        p->active_image.source_w != result->source_w ||
++        p->active_image.source_h != result->source_h)
++        return true;
++    return p->active_image.top != result->top ||
++           p->active_image.bottom != result->bottom;
++}
++
 +static void commit_active_image(struct priv *p, uint64_t tag,
 +                                int source_w, int source_h)
 +{
-+    const struct bar_result *result = find_bar_result(p, tag);
-+    if (result && result->valid) {
++    const struct bar_result *result = stable_bar_result(p, tag);
++    if (result && tag != p->bar_last_commit_tag) {
++        if (!p->bar_first_commit_tag)
++            p->bar_first_commit_tag = tag;
++        p->bar_last_commit_tag = tag;
++        p->bar_commit_count++;
++        p->bar_indeterminate_count += result->indeterminate;
++    }
++    bool ambiguous = ambiguous_width_change(p, result);
++    if (result && result->valid && !ambiguous) {
++        if (!p->active_image_available ||
++            p->active_image.top != result->top ||
++            p->active_image.bottom != result->bottom)
++        {
++            MP_VERBOSE(p, "Active image frame=%" PRIu64 " source=%dx%d "
++                       "top=%d bottom=%d active=%dx%d.\n", tag - 1,
++                       result->source_w, result->source_h, result->top,
++                       result->bottom, result->source_w,
++                       result->source_h - result->top - result->bottom);
++        }
++        if (p->active_image_available && result != &p->active_image) {
++            p->active_motion_top_step = result->top - p->active_image.top;
++            p->active_motion_bottom_step =
++                result->bottom - p->active_image.bottom;
++        }
 +        p->active_image = *result;
 +        p->active_image_available = true;
++    } else if (ambiguous) {
++        MP_TRACE(p, "Holding active image frame=%" PRIu64 " candidate="
++                 "%dx%d top=%d bottom=%d: picture does not span width.\n",
++                 tag - 1, result->source_w, result->source_h, result->top,
++                 result->bottom);
 +    } else if (!p->active_image_available && source_w > 0 && source_h > 0) {
 +        // Startup fallback until the first asynchronous result is ready.
 +        p->active_image = (struct bar_result) {
@@ -317,8 +846,8 @@ index 61bf4c4c1c1f7d6af4245e1e41844cb4f785df73..e7ce166c3088ef04898ef521f89a48e5
 +static struct mp_rect active_source_rect(struct priv *p, uint64_t tag,
 +                                         int width, int height)
 +{
-+    const struct bar_result *result = find_bar_result(p, tag);
-+    if (!result || !result->valid)
++    const struct bar_result *result = stable_bar_result(p, tag);
++    if (!result || !result->valid || ambiguous_width_change(p, result))
 +        result = p->active_image_available ? &p->active_image : NULL;
 +    int top = result && result->source_w == width && result->source_h == height
 +            ? result->top : 0;
@@ -328,7 +857,8 @@ index 61bf4c4c1c1f7d6af4245e1e41844cb4f785df73..e7ce166c3088ef04898ef521f89a48e5
 +}
 +
 +static struct mp_rect fit_active_destination(struct mp_rect canvas,
-+                                             int active_w, int active_h)
++                                             int active_w, int active_h,
++                                             float align_x, float align_y)
 +{
 +    int cw = mp_rect_w(canvas), ch = mp_rect_h(canvas);
 +    if (cw < 1 || ch < 1 || active_w < 1 || active_h < 1)
@@ -343,9 +873,31 @@ index 61bf4c4c1c1f7d6af4245e1e41844cb4f785df73..e7ce166c3088ef04898ef521f89a48e5
 +        h = ch;
 +        w = lrint(ch * source_ar);
 +    }
-+    int x = canvas.x0 + (cw - w) / 2;
-+    int y = canvas.y0 + (ch - h) / 2;
++    int x = canvas.x0 + lrint((cw - w) * (MPCLAMP(align_x, -1, 1) + 1) / 2);
++    int y = canvas.y0 + lrint((ch - h) * (MPCLAMP(align_y, -1, 1) + 1) / 2);
 +    return (struct mp_rect) {x, y, x + w, y + h};
++}
++
++static struct mp_rect map_source_to_active_destination(
++    struct mp_rect active_dst, struct mp_rect source, int source_w,
++    int source_h, int top, int bottom)
++{
++    int active_h = source_h - top - bottom;
++    if (source_w < 1 || active_h < 1)
++        return active_dst;
++
++    int sx0 = MPMIN(source.x0, source.x1);
++    int sx1 = MPMAX(source.x0, source.x1);
++    int sy0 = MPMIN(source.y0, source.y1);
++    int sy1 = MPMAX(source.y0, source.y1);
++    double scale_x = (double) mp_rect_w(active_dst) / source_w;
++    double scale_y = (double) mp_rect_h(active_dst) / active_h;
++    return (struct mp_rect) {
++        active_dst.x0 + lrint(sx0 * scale_x),
++        active_dst.y0 + lrint((sy0 - top) * scale_y),
++        active_dst.x0 + lrint(sx1 * scale_x),
++        active_dst.y0 + lrint((sy1 - top) * scale_y),
++    };
 +}
 +
 +static const struct pl_buffer_var bar_buffer_vars[] = {{
@@ -359,7 +911,59 @@ index 61bf4c4c1c1f7d6af4245e1e41844cb4f785df73..e7ce166c3088ef04898ef521f89a48e5
 +    .layout = {
 +        .offset = 0,
 +        .stride = sizeof(uint32_t) * 4,
-+        .size = sizeof(struct bar_gpu_data),
++        .size = sizeof(((struct bar_gpu_data *) 0)->rows),
++    },
++}, {
++    .var = {
++        .name = "bright",
++        .type = PL_VAR_UINT,
++        .dim_v = 1,
++        .dim_m = 1,
++        .dim_a = BAR_ANALYSIS_MAX_ROWS,
++    },
++    .layout = {
++        .offset = offsetof(struct bar_gpu_data, bright),
++        .stride = sizeof(uint32_t),
++        .size = sizeof(((struct bar_gpu_data *) 0)->bright),
++    },
++}, {
++    .var = {
++        .name = "edge_bright",
++        .type = PL_VAR_UINT,
++        .dim_v = 1,
++        .dim_m = 1,
++        .dim_a = BAR_ANALYSIS_MAX_ROWS,
++    },
++    .layout = {
++        .offset = offsetof(struct bar_gpu_data, edge_bright),
++        .stride = sizeof(uint32_t),
++        .size = sizeof(((struct bar_gpu_data *) 0)->edge_bright),
++    },
++}, {
++    .var = {
++        .name = "side",
++        .type = PL_VAR_UINT,
++        .dim_v = 4,
++        .dim_m = 1,
++        .dim_a = BAR_ANALYSIS_MAX_ROWS * 2,
++    },
++    .layout = {
++        .offset = offsetof(struct bar_gpu_data, side),
++        .stride = sizeof(uint32_t) * 4,
++        .size = sizeof(((struct bar_gpu_data *) 0)->side),
++    },
++}, {
++    .var = {
++        .name = "tiles",
++        .type = PL_VAR_UINT,
++        .dim_v = 1,
++        .dim_m = 1,
++        .dim_a = BAR_ANALYSIS_MAX_ROWS * BAR_ANALYSIS_TILES,
++    },
++    .layout = {
++        .offset = offsetof(struct bar_gpu_data, tiles),
++        .stride = sizeof(uint32_t),
++        .size = sizeof(((struct bar_gpu_data *) 0)->tiles),
 +    },
 +}};
 +
@@ -431,19 +1035,56 @@ index 61bf4c4c1c1f7d6af4245e1e41844cb4f785df73..e7ce166c3088ef04898ef521f89a48e5
 +        "shared uint row_min[64];\n"
 +        "shared uint row_max[64];\n"
 +        "shared uint row_sum[64];\n"
-+        "shared uint row_count[64];\n";
++        "shared uint row_count[64];\n"
++        "shared uint row_bright[64];\n"
++        "shared uint row_edge_bright[64];\n"
++        "shared uint side_min[64];\n"
++        "shared uint side_max[64];\n"
++        "shared uint side_sum[64];\n"
++        "shared uint side_count[64];\n"
++        "shared uint tile_min[64];\n"
++        "shared uint tile_max[64];\n"
++        "shared uint tile_count[64];\n";
++    // Normalize UNORM samples to one 16-bit code space. Software 10-bit
++    // uploads may be unshifted in an r16 texture while hardware P010 surfaces
++    // carry the same codes left-shifted by six bits.
++    int storage_depth = luma->texture->params.format->component_depth[component];
++    int color_depth = frame->repr.bits.color_depth > 0
++                    ? frame->repr.bits.color_depth : storage_depth;
++    int bit_shift = frame->repr.bits.bit_shift;
++    double normalization_scale = 1.0;
++    if (storage_depth > 0 && storage_depth <= 16 && color_depth > 0 &&
++        color_depth <= storage_depth && bit_shift >= 0 &&
++        bit_shift + color_depth <= storage_depth)
++    {
++        normalization_scale = ((1u << storage_depth) - 1.0) /
++            (((1u << color_depth) - 1.0) * (1u << bit_shift));
++    }
 +    char *body = talloc_asprintf(NULL,
 +        "uint lane = gl_LocalInvocationID.x;\n"
 +        "uint y = gl_WorkGroupID.y;\n"
 +        "uvec2 size = uvec2(textureSize(luma_tex, 0));\n"
-+        "uint mn = 65535u, mx = 0u, sum = 0u, count = 0u;\n"
-+        "for (uint x = lane; x < size.x; x += 64u) {\n"
-+        "    float v = texelFetch(luma_tex, ivec2(x, y), 0)[%d];\n"
++        "uint mn = 65535u, mx = 0u, sum = 0u, count = 0u, hi = 0u, edge_hi = 0u;\n"
++        "uint side_width = max(4u, size.x / 64u);\n"
++        "uint lmn = 65535u, lmx = 0u, lsum = 0u, lcount = 0u;\n"
++        "uint rmn = 65535u, rmx = 0u, rsum = 0u, rcount = 0u;\n"
++        "uint tile = lane & 31u, tile_half = lane >> 5u;\n"
++        "uint tile_x0 = size.x * tile / 32u;\n"
++        "uint tile_x1 = size.x * (tile + 1u) / 32u;\n"
++        "for (uint x = tile_x0 + tile_half; x < tile_x1; x += 2u) {\n"
++        "    float v = texelFetch(luma_tex, ivec2(x, y), 0)[%d] * %.9f;\n"
 +        "    uint q = uint(clamp(v, 0.0, 1.0) * 65535.0 + 0.5);\n"
 +        "    mn = min(mn, q); mx = max(mx, q); sum += q; count++;\n"
++        "    bool bright_pixel = q > 6000u;\n"
++        "    hi += bright_pixel ? 1u : 0u;\n"
++        "    if (x < side_width) { lmn = min(lmn, q); lmx = max(lmx, q); lsum += q; lcount++; }\n"
++        "    if (x + side_width >= size.x) { rmn = min(rmn, q); rmx = max(rmx, q); rsum += q; rcount++; }\n"
++        "    edge_hi += bright_pixel && (x < size.x / 8u || x >= 7u * size.x / 8u) ? 1u : 0u;\n"
 +        "}\n"
 +        "row_min[lane] = mn; row_max[lane] = mx;\n"
-+        "row_sum[lane] = sum; row_count[lane] = count;\n"
++        "row_sum[lane] = sum; row_count[lane] = count; row_bright[lane] = hi;\n"
++        "row_edge_bright[lane] = edge_hi;\n"
++        "tile_min[lane] = mn; tile_max[lane] = mx; tile_count[lane] = count;\n"
 +        "barrier();\n"
 +        "for (uint step = 32u; step > 0u; step >>= 1u) {\n"
 +        "    if (lane < step) {\n"
@@ -451,12 +1092,39 @@ index 61bf4c4c1c1f7d6af4245e1e41844cb4f785df73..e7ce166c3088ef04898ef521f89a48e5
 +        "        row_max[lane] = max(row_max[lane], row_max[lane + step]);\n"
 +        "        row_sum[lane] += row_sum[lane + step];\n"
 +        "        row_count[lane] += row_count[lane + step];\n"
++        "        row_bright[lane] += row_bright[lane + step];\n"
++        "        row_edge_bright[lane] += row_edge_bright[lane + step];\n"
 +        "    }\n"
 +        "    barrier();\n"
 +        "}\n"
-+        "if (lane == 0u) rows[y] = uvec4(row_min[0], row_max[0], "
-+        "                                row_sum[0], row_count[0]);\n",
-+        component);
++        "if (lane == 0u) {\n"
++        "    rows[y] = uvec4(row_min[0], row_max[0], row_sum[0], row_count[0]);\n"
++        "    bright[y] = row_bright[0];\n"
++        "    edge_bright[y] = row_edge_bright[0];\n"
++        "}\n"
++        "if (lane < 32u) {\n"
++        "    tile_min[lane] = min(tile_min[lane], tile_min[lane + 32u]);\n"
++        "    tile_max[lane] = max(tile_max[lane], tile_max[lane + 32u]);\n"
++        "    tile_count[lane] += tile_count[lane + 32u];\n"
++        "    tiles[y * 32u + lane] = tile_count[lane] > 0u\n"
++        "        ? tile_min[lane] | (tile_max[lane] << 16u) : 0xffffffffu;\n"
++        "}\n"
++        "side_min[lane] = lmn; side_max[lane] = lmx; side_sum[lane] = lsum; side_count[lane] = lcount;\n"
++        "barrier();\n"
++        "for (uint step = 32u; step > 0u; step >>= 1u) {\n"
++        "    if (lane < step) { side_min[lane] = min(side_min[lane], side_min[lane + step]); side_max[lane] = max(side_max[lane], side_max[lane + step]); side_sum[lane] += side_sum[lane + step]; side_count[lane] += side_count[lane + step]; }\n"
++        "    barrier();\n"
++        "}\n"
++        "if (lane == 0u) side[y * 2u] = uvec4(side_min[0], side_max[0], side_sum[0], side_count[0]);\n"
++        "barrier();\n"
++        "side_min[lane] = rmn; side_max[lane] = rmx; side_sum[lane] = rsum; side_count[lane] = rcount;\n"
++        "barrier();\n"
++        "for (uint step = 32u; step > 0u; step >>= 1u) {\n"
++        "    if (lane < step) { side_min[lane] = min(side_min[lane], side_min[lane + step]); side_max[lane] = max(side_max[lane], side_max[lane + step]); side_sum[lane] += side_sum[lane + step]; side_count[lane] += side_count[lane + step]; }\n"
++        "    barrier();\n"
++        "}\n"
++        "if (lane == 0u) side[y * 2u + 1u] = uvec4(side_min[0], side_max[0], side_sum[0], side_count[0]);\n",
++        component, normalization_scale);
 +
 +    pl_shader sh = pl_dispatch_begin(p->bar_dispatch);
 +    bool ok = pl_shader_custom(sh, &(struct pl_custom_shader) {
@@ -472,6 +1140,7 @@ index 61bf4c4c1c1f7d6af4245e1e41844cb4f785df73..e7ce166c3088ef04898ef521f89a48e5
 +    }) && pl_dispatch_compute(p->bar_dispatch, pl_dispatch_compute_params(
 +        .shader = &sh,
 +        .dispatch_size = {1, height, 1},
++        .timer = p->bar_timer,
 +    ));
 +    talloc_free(body);
 +    if (!ok) {
@@ -489,20 +1158,20 @@ index 61bf4c4c1c1f7d6af4245e1e41844cb4f785df73..e7ce166c3088ef04898ef521f89a48e5
  static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src,
                        struct pl_frame *frame)
  {
-@@ -1174,6 +1525,12 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
+@@ -1174,6 +2177,12 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
      update_lut(p, &p->next_opts->image_lut);
      frame->lut = p->next_opts->image_lut.lut;
      frame->lut_type = p->next_opts->image_lut.type;
 +
 +    bool acquired = !frame->acquire || frame->acquire(gpu, frame);
-+    if (acquired)
++    if (acquired && p->next_opts->active_image_detection)
 +        submit_bar_analysis(p, frame, fp->causal_scene_tag);
 +    if (frame->release)
 +        frame->release(gpu, frame);
      return true;
  }
  
-@@ -1498,6 +1855,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1498,6 +2507,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
              p->last_pts = 0.0;
              p->last_id = 0;
              reset_authored_scene_state(p);
@@ -512,46 +1181,90 @@ index 61bf4c4c1c1f7d6af4245e1e41844cb4f785df73..e7ce166c3088ef04898ef521f89a48e5
              p->want_reset = false;
              pl_renderer_flush_cache(p->rr);
          }
-@@ -1797,6 +2157,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1792,11 +2804,15 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+     }
+ 
+     struct pl_frame_mix mix = {0};
++    const struct pl_frame *bar_single_frame = NULL;
++    uint64_t bar_single_signature = 0;
++    float bar_single_timestamp = 0;
+     if (frame->current) {
+         // Update queue state
          struct pl_queue_params qparams = *pl_queue_params(
              .pts = frame->current->pts + pts_offset,
              .radius = pl_frame_mix_radius(&params),
-+            .prefetch_frames = 3,
++            .prefetch_frames = p->next_opts->active_image_detection ? 4 : 0,
              .vsync_duration = can_interpolate ? frame->ideal_frame_vsync_duration : 0,
              .interpolation_threshold = opts->interpolation_threshold,
              .drift_compensation = 0,
-@@ -1831,6 +2192,25 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1831,6 +2847,61 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
              break;
          }
  
 +        consume_bar_analysis(p);
-+        commit_active_image(p, frame->frame_id + 1,
-+                            vo->params->w, vo->params->h);
++        if (p->next_opts->active_image_detection) {
++            commit_active_image(p, frame->frame_id + 1,
++                                vo->params->w, vo->params->h);
++        } else {
++            p->active_image_available = false;
++            p->automatic_aspect_effective = false;
++            memset(p->bar_results, 0, sizeof(p->bar_results));
++        }
++        int canvas_w = swframe.fbo->params.w;
++        int canvas_h = swframe.fbo->params.h;
++        struct mp_rect aspect_canvas = {0, 0, canvas_w, canvas_h};
++        double requested_canvas_ar =
++            p->next_opts->automatic_aspect_ratio_canvas;
++        if (requested_canvas_ar > 0) {
++            int visible_h = lrint(canvas_w / requested_canvas_ar);
++            if (visible_h > 0 && visible_h < canvas_h) {
++                int inset = (canvas_h - visible_h) / 2;
++                aspect_canvas.y0 = inset;
++                aspect_canvas.y1 = inset + visible_h;
++            }
++        }
 +        p->automatic_aspect_effective =
++            p->next_opts->active_image_detection &&
 +            p->next_opts->automatic_aspect_ratio && vo->opts->fullscreen &&
-+            (int64_t) swframe.fbo->params.w * 9 >
-+            (int64_t) swframe.fbo->params.h * 16;
-+        if (p->automatic_aspect_effective && p->active_image_available) {
++            (int64_t) mp_rect_w(aspect_canvas) * 9 >
++            (int64_t) mp_rect_h(aspect_canvas) * 16;
++        bool hard_crop_effective = p->next_opts->active_image_detection &&
++            vo->opts->fullscreen &&
++            p->next_opts->automatic_aspect_ratio_crop;
++        bool detected_framing_effective = vo->opts->fullscreen &&
++            (p->automatic_aspect_effective ||
++             p->next_opts->automatic_aspect_ratio_crop);
++        if (detected_framing_effective && p->active_image_available) {
 +            int active_h = p->active_image.source_h - p->active_image.top -
 +                           p->active_image.bottom;
-+            struct mp_rect canvas = {
-+                0, 0, swframe.fbo->params.w, swframe.fbo->params.h,
-+            };
 +            struct mp_rect auto_dst = fit_active_destination(
-+                canvas, p->active_image.source_w, active_h);
-+            apply_crop(&target, auto_dst, swframe.fbo->params.w,
++                aspect_canvas, p->active_image.source_w, active_h,
++                vo->opts->align_x, vo->opts->align_y);
++            // Automatic management frames from the detected aperture but
++            // leaves the complete encoded source available. Authored effects
++            // may therefore overflow into otherwise unused canvas space while
++            // the base image remains perfectly stable. The explicit crop mode
++            // retains its promise to remove everything outside the aperture.
++            struct mp_rect render_dst = auto_dst;
++            if (p->automatic_aspect_effective && !hard_crop_effective) {
++                render_dst = map_source_to_active_destination(
++                    auto_dst, p->src, p->active_image.source_w,
++                    p->active_image.source_h,
++                    p->active_image.top, p->active_image.bottom);
++            }
++            apply_crop(&target, render_dst, swframe.fbo->params.w,
 +                       swframe.fbo->params.h);
 +        }
 +
          // Update source crop and overlays on all existing frames. We
          // technically own the `pl_frame` struct so this is kosher. This could
          // be partially avoided by instead flushing the queue on resizes, but
-@@ -1842,7 +2222,13 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1842,7 +2913,13 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
  #if PL_API_VER >= 367
              apply_dovi_enhancement_layer(p, image, fp);
  #endif
 -            apply_crop(image, p->src, vo->params->w, vo->params->h);
-+            if (p->automatic_aspect_effective) {
++            if (hard_crop_effective) {
 +                struct mp_rect auto_src = active_source_rect(
 +                    p, fp->causal_scene_tag, vo->params->w, vo->params->h);
 +                apply_crop(image, auto_src, vo->params->w, vo->params->h);
@@ -561,7 +1274,51 @@ index 61bf4c4c1c1f7d6af4245e1e41844cb4f785df73..e7ce166c3088ef04898ef521f89a48e5
              if (opts->blend_subs) {
                  if (frame->redraw)
                      p->osd_sync++;
-@@ -2523,6 +2909,26 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -1885,6 +2962,43 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+             ((uint64_t *) mix.signatures)[i] ^= fp->osd_sync << 48;
+         }
+ 
++        // Never temporally blend two different authored apertures. Around an
++        // AR transition, render the current frame alone; this keeps optional
++        // interpolation from softening or delaying an otherwise exact cut.
++        const struct pl_frame *current = pl_frame_mix_current(&mix);
++        if (detected_framing_effective && current && mix.num_frames > 1) {
++            bool mixed_apertures = false;
++            int current_index = -1;
++            const struct mp_image *current_mpi = current->user_data;
++            const struct frame_priv *current_fp = current_mpi->priv;
++            struct mp_rect current_aperture = active_source_rect(
++                p, current_fp->causal_scene_tag,
++                vo->params->w, vo->params->h);
++            for (int i = 0; i < mix.num_frames; i++) {
++                const struct pl_frame *image = mix.frames[i];
++                if (image == current)
++                    current_index = i;
++                const struct mp_image *mpi = image->user_data;
++                const struct frame_priv *fp = mpi->priv;
++                struct mp_rect aperture = active_source_rect(
++                    p, fp->causal_scene_tag,
++                    vo->params->w, vo->params->h);
++                if (aperture.x0 != current_aperture.x0 ||
++                    aperture.y0 != current_aperture.y0 ||
++                    aperture.x1 != current_aperture.x1 ||
++                    aperture.y1 != current_aperture.y1)
++                    mixed_apertures = true;
++            }
++            if (mixed_apertures && current_index >= 0) {
++                bar_single_frame = current;
++                bar_single_signature = mix.signatures[current_index];
++                mix.num_frames = 1;
++                mix.frames = &bar_single_frame;
++                mix.signatures = &bar_single_signature;
++                mix.timestamps = &bar_single_timestamp;
++            }
++        }
++
+         // Update dynamic hook parameters
+         for (int i = 0; i < pars->params.num_hooks; i++)
+             update_hook_opts_dynamic(vo, p, p->hooks[i], frame->current);
+@@ -2529,6 +3643,44 @@ static int control(struct vo *vo, uint32_t request, void *data)
          return VO_TRUE;
      }
  
@@ -571,7 +1328,25 @@ index 61bf4c4c1c1f7d6af4245e1e41844cb4f785df73..e7ce166c3088ef04898ef521f89a48e5
 +        *out = (struct voctrl_active_image) {
 +            .available = p->active_image_available,
 +            .automatic_effective = p->automatic_aspect_effective,
++            .breakout = p->active_image_available && p->active_image.breakout,
 +        };
++        if (p->bar_timing_count) {
++            uint64_t sorted[BAR_TIMING_SAMPLES];
++            memcpy(sorted, p->bar_timings,
++                   p->bar_timing_count * sizeof(sorted[0]));
++            for (int i = 1; i < p->bar_timing_count; i++) {
++                uint64_t value = sorted[i];
++                int j = i;
++                while (j > 0 && sorted[j - 1] > value) {
++                    sorted[j] = sorted[j - 1];
++                    j--;
++                }
++                sorted[j] = value;
++            }
++            out->gpu_ns_median = sorted[(p->bar_timing_count - 1) / 2];
++            out->gpu_ns_p99 = sorted[((p->bar_timing_count - 1) * 99) / 100];
++            out->timing_samples = p->bar_timing_count;
++        }
 +        if (p->active_image_available) {
 +            out->source_w = p->active_image.source_w;
 +            out->source_h = p->active_image.source_h;
@@ -588,35 +1363,52 @@ index 61bf4c4c1c1f7d6af4245e1e41844cb4f785df73..e7ce166c3088ef04898ef521f89a48e5
      case VOCTRL_SCREENSHOT:
          video_screenshot(vo, data);
          return true;
-@@ -2767,6 +3173,9 @@ static void uninit(struct vo *vo)
+@@ -2768,11 +3920,22 @@ static void uninit(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
+ 
++    if (p->bar_commit_count) {
++        MP_VERBOSE(p, "Active image coverage first=%" PRIu64 " last=%" PRIu64
++                   " frames=%" PRIu64 " indeterminate=%" PRIu64 ".\n",
++                   p->bar_first_commit_tag - 1, p->bar_last_commit_tag - 1,
++                   p->bar_commit_count, p->bar_indeterminate_count);
++    }
++
+     // Drain any in-flight uploads.
+     if (p->gpu)
          pl_gpu_finish(p->gpu);
  
      pl_queue_destroy(&p->queue); // destroy this first
 +    for (int i = 0; i < BAR_ANALYSIS_SLOTS; i++)
 +        pl_buf_destroy(p->gpu, &p->bar_slots[i].buf);
++    pl_timer_destroy(p->gpu, &p->bar_timer);
 +    pl_dispatch_destroy(&p->bar_dispatch);
      for (int i = 0; i < MP_ARRAY_SIZE(p->osd_state.entries); i++)
          pl_tex_destroy(p->gpu, &p->osd_state.entries[i].tex);
      for (int i = 0; i < p->num_sub_tex; i++)
-@@ -2862,6 +3271,9 @@ static int preinit(struct vo *vo)
+@@ -2868,6 +4031,10 @@ static int preinit(struct vo *vo)
      pl_gpu_set_cache(p->gpu, p->shader_cache.cache);
      p->rr = pl_renderer_create(p->pllog, p->gpu);
      p->queue = pl_queue_create(p->gpu);
 +    p->bar_dispatch = pl_dispatch_create(p->pllog, p->gpu);
++    p->bar_timer = pl_timer_create(p->gpu);
 +    if (!p->rr || !p->queue || !p->bar_dispatch)
 +        goto err_out;
      p->osd_fmt[SUBBITMAP_LIBASS] = pl_find_named_fmt(p->gpu, "r8");
      p->osd_fmt[SUBBITMAP_BGRA] = pl_find_named_fmt(p->gpu, "bgra8");
      p->osd_sync = 1;
-@@ -3216,7 +3628,10 @@ static void update_render_options(struct vo *vo)
+@@ -3222,7 +4389,11 @@ static void update_render_options(struct vo *vo)
      // Request as many frames as required from the decoder, depending on the
      // speed VPS/FPS ratio libplacebo may need more frames. Request frames up to
      // ratio of 1/2, but only if anti aliasing is enabled.
 -    int req_frames = 2;
 +    // Keep two future source frames available for zero-presentation-latency
-+    // asynchronous frame analysis. This is a minimum; temporal interpolation
-+    // may already require a wider decoder queue.
-+    int req_frames = 3;
++    // asynchronous frame analysis. With detection disabled, preserve mpv's
++    // original current-plus-one-future-frame baseline. Temporal interpolation
++    // may already require a wider decoder queue in either mode.
++    int req_frames = p->next_opts->active_image_detection ? 3 : 2;
      if (pars->params.frame_mixer) {
          req_frames += ceilf(pars->params.frame_mixer->kernel->radius) *
                        (pars->params.skip_anti_aliasing ? 1 : 2);
+-- 
+2.54.0.windows.1
