@@ -4,6 +4,7 @@ ExternalProject_Add(libssh
         openssl
     GIT_REPOSITORY https://gitlab.com/libssh/libssh-mirror.git
     SOURCE_DIR ${SOURCE_LOCATION}
+    GIT_TAG 301d0e16dfa8a5cac1cff956b6880ca90eb82864
     GIT_CLONE_FLAGS "--filter=tree:0"
     UPDATE_COMMAND ""
     CONFIGURE_COMMAND ${EXEC} CONF=1 cmake -H<SOURCE_DIR> -B<BINARY_DIR>
