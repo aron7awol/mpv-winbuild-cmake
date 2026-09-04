@@ -1216,7 +1216,7 @@ index bf5cb1231..3faec75c1 100644
 +        double requested_canvas_ar =
 +            p->next_opts->automatic_aspect_ratio_canvas;
 +        if (requested_canvas_ar > 0) {
-+            int visible_h = lrint(canvas_w / requested_canvas_ar);
++            int visible_h = 2 * floor(canvas_w / requested_canvas_ar / 2.0 + 0.5);
 +            if (visible_h > 0 && visible_h < canvas_h) {
 +                int inset = (canvas_h - visible_h) / 2;
 +                aspect_canvas.y0 = inset;
