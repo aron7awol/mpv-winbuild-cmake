@@ -5,14 +5,14 @@ Subject: [PATCH] gpu-next: add causal scene detection and acceleration
 
 ---
  DOCS/man/input.rst                  |  11 ++
- DOCS/man/options.rst                |  13 +++
+ DOCS/man/options.rst                |  15 +++
  TOOLS/causal_scene_validate.md      |  24 +++++
  TOOLS/causal_scene_validate.py      | 125 ++++++++++++++++++++++
  TOOLS/test_causal_scene_validate.py |  55 ++++++++++
  player/command.c                    |  60 +++++++++++
  video/mp_image.h                    |  23 ++++
  video/out/vo_gpu_next.c             | 160 ++++++++++++++++++++++++++++
- 8 files changed, 471 insertions(+)
+ 8 files changed, 473 insertions(+)
  create mode 100644 TOOLS/causal_scene_validate.md
  create mode 100644 TOOLS/causal_scene_validate.py
  create mode 100644 TOOLS/test_causal_scene_validate.py
@@ -26,7 +26,7 @@ index b0e856579dffaf0e32d14dce56e6cf74716b51ab..aa347c90864ac3a7f301f5be2adaaa59
          not static MaxFALL metadata.
  
 +    ``video-params/causal-scene-*``
-+        Diagnostic-only causal scene trace: effective delayed-readback mode,
++        Diagnostic-only causal scene trace: effective readback mode,
 +        submitted and consumed source-frame tags, latency, descriptor
 +        validity/withheld reason, histogram TV, tile MAD, translated-motion
 +        fraction, residual, score, trigger/count, authored-boundary tag/source,
@@ -43,7 +43,7 @@ diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
 index a17e45a9c5c32d6280792b8c3c8f9854a8b4f55d..e5b024cbcbbaa47ef65a3c6795977056501fef92 100644
 --- a/DOCS/man/options.rst
 +++ b/DOCS/man/options.rst
-@@ -7861,6 +7861,19 @@ them.
+@@ -7861,6 +7861,21 @@ them.
      measurement even when delayed peak detection is enabled. Defaults to yes.
      (Only for ``--vo=gpu-next``)
  
@@ -51,7 +51,9 @@ index a17e45a9c5c32d6280792b8c3c8f9854a8b4f55d..e5b024cbcbbaa47ef65a3c6795977056
 +    Enable hidden, diagnostics-only causal scene descriptor instrumentation.
 +    It analyzes consecutive tagged source frames before RGB hooks and exposes
 +    native properties. Verbose logs report lifecycle/events; full per-frame
-+    metrics require trace logging without changing rendering. This
++    metrics require trace logging without changing rendering. The causal
++    detector remains same-frame and does not inherit
++    ``--allow-delayed-peak-detect``. This
 +    session-only option defaults to no. (Only for ``--vo=gpu-next``)
 +
 +``--hdr-causal-scene-acceleration=<yes|no>``

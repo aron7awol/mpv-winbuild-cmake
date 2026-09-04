@@ -1,4 +1,4 @@
-From 1607d55e6bcbade09788c90a8644af45025eaa29 Mon Sep 17 00:00:00 2001
+From 1fd7bf770a68856fff01cc7b1b395dcf9e701864 Mon Sep 17 00:00:00 2001
 From: Aaron <aaronmedeiros@gmail.com>
 Date: Thu, 13 Aug 2026 15:21:41 -0400
 Subject: [PATCH] causal scene detection: add native descriptors and
@@ -7,11 +7,11 @@ Subject: [PATCH] causal scene detection: add native descriptors and
 ---
  src/include/libplacebo/renderer.h           |  35 ++
  src/include/libplacebo/shaders/colorspace.h |  18 +
- src/renderer.c                              | 485 +++++++++++++++++++-
- src/shaders/colorspace.c                    | 416 ++++++++++++++++-
+ src/renderer.c                              | 484 +++++++++++++++++++-
+ src/shaders/colorspace.c                    | 418 ++++++++++++++++-
  src/tests/causal_test.h                     |  31 ++
- src/tests/gpu_tests.c                       | 444 ++++++++++++++++++
- 6 files changed, 1400 insertions(+), 29 deletions(-)
+ src/tests/gpu_tests.c                       | 446 ++++++++++++++++++
+ 6 files changed, 1403 insertions(+), 29 deletions(-)
  create mode 100644 src/tests/causal_test.h
 
 diff --git a/src/include/libplacebo/renderer.h b/src/include/libplacebo/renderer.h
@@ -119,7 +119,7 @@ index 837f0d16..7731b582 100644
  // pl_get_detected_hdr_metadata it never re-labels physical CIE Y metadata.
  PL_API bool pl_get_detected_tone_map_range(const pl_shader_obj state,
 diff --git a/src/renderer.c b/src/renderer.c
-index bf839c54..63280ecd 100644
+index bf839c54..2b896cba 100644
 --- a/src/renderer.c
 +++ b/src/renderer.c
 @@ -22,6 +22,7 @@
@@ -367,8 +367,7 @@ index bf839c54..63280ecd 100644
 +        return;
 +    if (!pass->image.causal_scene_tag) {
 +        rr->causal_unavailable = (struct pl_causal_scene_diagnostics) {
-+            .effective_allow_delayed = params->peak_detect_params
-+                ? params->peak_detect_params->allow_delayed : true,
++            .effective_allow_delayed = false,
 +            .authored_boundary_tag = pass->image.scene_cut_tag,
 +            .authored_boundary_source = pass->image.scene_cut_source,
 +            .active_metric_branch = params->color_map_params
@@ -390,8 +389,7 @@ index bf839c54..63280ecd 100644
 +    if (pass->image.field != PL_FIELD_NONE || pass->image.rotation ||
 +        !pass->causal_proxy) {
 +        rr->causal_unavailable = (struct pl_causal_scene_diagnostics) {
-+            .effective_allow_delayed = params->peak_detect_params
-+                ? params->peak_detect_params->allow_delayed : true,
++            .effective_allow_delayed = false,
 +            .submitted_tag = pass->image.causal_scene_tag,
 +            .authored_boundary_tag = pass->image.scene_cut_tag,
 +            .authored_boundary_source = pass->image.scene_cut_source,
@@ -433,9 +431,11 @@ index bf839c54..63280ecd 100644
 +#undef CAUSAL_SIG_FLOAT
 +#undef CAUSAL_SIG
 +
++    // The causal detector is intentionally same-frame even when ordinary peak
++    // detection is delayed. Sharing a delayed peak transaction lets its buffer
++    // lifetime diverge from the independently consumed causal state.
 +    struct pl_peak_detect_params causal = {
-+        .allow_delayed = params->peak_detect_params
-+            ? params->peak_detect_params->allow_delayed : true,
++        .allow_delayed = false,
 +        .metric = params->color_map_params
 +            ? params->color_map_params->tone_mapping_metric
 +            : PL_TONE_MAP_METRIC_STANDARD,
@@ -811,20 +811,19 @@ index bf839c54..63280ecd 100644
          return true;
      }
  
-@@ -2235,6 +2677,11 @@ static bool pass_scale_main(struct pass_state *pass)
+@@ -2235,6 +2677,10 @@ static bool pass_scale_main(struct pass_state *pass)
  done:
      if (info.dir != SAMPLER_UP)
          hdr_update_peak(pass);
-+    // In delayed mode, a pre-existing peak transaction can occupy the shared
-+    // buffer at the first scheduling point. Retry after peak scheduling so
-+    // the causal reducer appends to that frame's tagged transaction instead
-+    // of starving behind a continuous peak stream.
++    // Retry after peak scheduling so the causal reducer can share the current
++    // transaction when both paths are synchronous. A delayed peak transaction
++    // is deliberately kept separate from the same-frame causal detector.
 +    causal_update(pass);
      pass_hook(pass, img, PL_HOOK_SCALED);
      return true;
  }
 diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
-index 86cad57f..60294bb1 100644
+index 0fdb504a..b4b0186a 100644
 --- a/src/shaders/colorspace.c
 +++ b/src/shaders/colorspace.c
 @@ -20,8 +20,10 @@
@@ -1170,7 +1169,7 @@ index 86cad57f..60294bb1 100644
      pl_color_space_infer(&csp);
  
      sh_desc(sh, (struct pl_shader_desc) {
-@@ -1997,6 +2229,131 @@ retry_ssbo:
+@@ -1997,6 +2229,133 @@ retry_ssbo:
      return true;
  }
  
@@ -1204,7 +1203,9 @@ index 86cad57f..60294bb1 100644
 +    // submitted for this exact source tag. Its normal single consume delivers
 +    // the descriptor payload into our isolated causal history below.
 +    borrow = borrowed_state ? borrowed_state->priv : NULL;
-+    append_peak = borrow && borrow->peak.buf &&
++    append_peak = !params->allow_delayed && borrow && borrow->peak.buf &&
++        borrow->peak.buf->params.storable &&
++        !borrow->peak.params.allow_delayed &&
 +        borrow->peak.params.causal_scene_enabled &&
 +        borrow->peak.params.causal_scene_tag == params->causal_scene_tag;
 +    if (!append_peak)
@@ -1302,7 +1303,7 @@ index 86cad57f..60294bb1 100644
  bool pl_get_detected_hdr_metadata(const pl_shader_obj state,
                                    struct pl_hdr_metadata *out)
  {
-@@ -2004,7 +2361,7 @@ bool pl_get_detected_hdr_metadata(const pl_shader_obj state,
+@@ -2004,7 +2363,7 @@ bool pl_get_detected_hdr_metadata(const pl_shader_obj state,
          return false;
  
      struct sh_color_map_obj *obj = state->priv;
@@ -1311,7 +1312,7 @@ index 86cad57f..60294bb1 100644
      if (!obj->peak.avg_pq)
          return false;
  
-@@ -2020,7 +2377,7 @@ bool pl_get_peak_detect_metrics(const pl_shader_obj state,
+@@ -2020,7 +2379,7 @@ bool pl_get_peak_detect_metrics(const pl_shader_obj state,
          return false;
  
      struct sh_color_map_obj *obj = state->priv;
@@ -1320,7 +1321,7 @@ index 86cad57f..60294bb1 100644
      if (!obj->peak.avg_pq)
          return false;
  
-@@ -2043,6 +2400,45 @@ bool pl_get_peak_detect_metrics(const pl_shader_obj state,
+@@ -2043,6 +2402,45 @@ bool pl_get_peak_detect_metrics(const pl_shader_obj state,
      return true;
  }
  
@@ -1366,7 +1367,7 @@ index 86cad57f..60294bb1 100644
  bool pl_get_detected_tone_map_range(const pl_shader_obj state,
                                      enum pl_tone_map_metric metric,
                                      float *max_pq, float *avg_pq)
-@@ -2050,7 +2446,7 @@ bool pl_get_detected_tone_map_range(const pl_shader_obj state,
+@@ -2050,7 +2448,7 @@ bool pl_get_detected_tone_map_range(const pl_shader_obj state,
      if (!state || state->type != PL_SHADER_OBJ_COLOR_MAP)
          return false;
      struct sh_color_map_obj *obj = state->priv;
@@ -1413,7 +1414,7 @@ index 00000000..5d21d29e
 +bool pl_get_causal_test_descriptors(pl_shader_obj state,
 +                                    struct pl_causal_test_descriptors *out);
 diff --git a/src/tests/gpu_tests.c b/src/tests/gpu_tests.c
-index 965221f5..a14f9eee 100644
+index 965221f5..c66299b4 100644
 --- a/src/tests/gpu_tests.c
 +++ b/src/tests/gpu_tests.c
 @@ -1,5 +1,6 @@
@@ -1423,7 +1424,7 @@ index 965221f5..a14f9eee 100644
  
  #include <libplacebo/renderer.h>
  #include <libplacebo/utils/frame_queue.h>
-@@ -1969,6 +1970,444 @@ static void pl_test_host_ptr(pl_gpu gpu)
+@@ -1969,6 +1970,446 @@ static void pl_test_host_ptr(pl_gpu gpu)
  #endif // unix
  }
  
@@ -1562,9 +1563,9 @@ index 965221f5..a14f9eee 100644
 +    pl_renderer_destroy(&rr_peak_ref);
 +    pl_renderer_destroy(&rr_peak);
 +
-+    // Delayed mode has backend-dependent completion latency. Poll the live
-+    // owner first (never the sink) across a bounded tagged sequence, then
-+    // verify that its single consume reached the borrowed causal sink.
++    // Delayed peak detection and same-frame causal detection use independent
++    // transactions. This avoids borrowing a live peak buffer whose lifetime
++    // may extend past the causal detector's synchronous consume point.
 +    pl_renderer rr_delayed = pl_renderer_create(gpu->log, gpu);
 +    REQUIRE(rr_delayed);
 +    peak.allow_delayed = true;
@@ -1580,11 +1581,13 @@ index 965221f5..a14f9eee 100644
 +            PL_CAUSAL_TEST_PROXY_W * PL_CAUSAL_TEST_PROXY_H, &causal_desc);
 +        free(proxy);
 +    }
-+    REQUIRE(delivered && causal_desc.borrowed_peak_transaction &&
++    REQUIRE(delivered && !causal_desc.borrowed_peak_transaction &&
 +            causal_desc.readback_count == 1);
 +    REQUIRE(pl_renderer_get_causal_scene_diagnostics(rr_delayed, &shared_diag));
-+    REQUIRE(shared_diag.submitted_tag >= shared_diag.consumed_tag &&
-+            shared_diag.readback_latency_frames >= 0 && !shared_diag.acceleration_applied);
++    REQUIRE(shared_diag.submitted_tag == shared_diag.consumed_tag &&
++            shared_diag.readback_latency_frames == 0 &&
++            !shared_diag.effective_allow_delayed &&
++            !shared_diag.acceleration_applied);
 +    pl_renderer_destroy(&rr_delayed);
 +
 +
@@ -1868,7 +1871,7 @@ index 965221f5..a14f9eee 100644
  void gpu_shader_tests(pl_gpu gpu)
  {
      pl_buffer_tests(gpu);
-@@ -1979,6 +2418,11 @@ void gpu_shader_tests(pl_gpu gpu)
+@@ -1979,6 +2420,11 @@ void gpu_shader_tests(pl_gpu gpu)
      pl_render_tests(gpu);
      pl_render_bits_tests(gpu);
      pl_ycbcr_tests(gpu);
@@ -1880,3 +1883,5 @@ index 965221f5..a14f9eee 100644
  
      REQUIRE(!pl_gpu_is_failed(gpu));
  }
+-- 
+2.54.0.windows.1
