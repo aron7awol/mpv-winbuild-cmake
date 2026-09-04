@@ -174,10 +174,14 @@ index bf5cb1231..3faec75c1 100644
      pl_swapchain sw;
      pl_fmt osd_fmt[SUBBITMAP_COUNT];
      pl_tex *sub_tex;
-@@ -148,6 +202,10 @@ struct priv {
+@@ -148,10 +202,14 @@ struct priv {
      bool frame_pending;
      bool paused;
      uint64_t causal_scene_last_logged_tag;
+     uint64_t causal_scene_last_boundary_tag;
+     int causal_scene_last_withheld_reason;
+     bool causal_scene_log_active;
+     bool causal_scene_last_allow_delayed;
 +    struct bar_result active_image;
 +    int active_motion_top_step, active_motion_bottom_step;
 +    bool active_image_available;

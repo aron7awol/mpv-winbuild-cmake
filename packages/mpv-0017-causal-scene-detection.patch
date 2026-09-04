@@ -1,27 +1,27 @@
-From cd5fc7897c9bc403debcb1693ccc90547a172ca7 Mon Sep 17 00:00:00 2001
+From 56c46e8afde34320f3d6bde78c82244aeca4f008 Mon Sep 17 00:00:00 2001
 From: Aaron <aaronmedeiros@gmail.com>
 Date: Thu, 13 Aug 2026 14:59:33 -0400
 Subject: [PATCH] gpu-next: add causal scene detection and acceleration
 
 ---
- DOCS/man/input.rst                  |  11 +++
+ DOCS/man/input.rst                  |  11 ++
  DOCS/man/options.rst                |  13 +++
- TOOLS/causal_scene_validate.md      |  24 ++++++
- TOOLS/causal_scene_validate.py      | 125 ++++++++++++++++++++++++++++
- TOOLS/test_causal_scene_validate.py |  55 ++++++++++++
- player/command.c                    |  60 +++++++++++++
- video/mp_image.h                    |  23 +++++
- video/out/vo_gpu_next.c             |  81 ++++++++++++++++++
- 8 files changed, 392 insertions(+)
+ TOOLS/causal_scene_validate.md      |  24 +++++
+ TOOLS/causal_scene_validate.py      | 125 ++++++++++++++++++++++
+ TOOLS/test_causal_scene_validate.py |  55 ++++++++++
+ player/command.c                    |  60 +++++++++++
+ video/mp_image.h                    |  23 ++++
+ video/out/vo_gpu_next.c             | 160 ++++++++++++++++++++++++++++
+ 8 files changed, 471 insertions(+)
  create mode 100644 TOOLS/causal_scene_validate.md
  create mode 100644 TOOLS/causal_scene_validate.py
  create mode 100644 TOOLS/test_causal_scene_validate.py
 
 diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
-index e71e2c0d8dd2069518336fb0c2d295ef748f225a..851760c1537e0e75143e2667713d2b35c724b717 100644
+index b0e856579dffaf0e32d14dce56e6cf74716b51ab..aa347c90864ac3a7f301f5be2adaaa59b446a4a4 100644
 --- a/DOCS/man/input.rst
 +++ b/DOCS/man/input.rst
-@@ -2932,6 +2932,17 @@ Property list
+@@ -2950,6 +2950,17 @@ Property list
          black pixels. It is independent of ``--hdr-peak-percentile`` and is
          not static MaxFALL metadata.
  
@@ -40,7 +40,7 @@ index e71e2c0d8dd2069518336fb0c2d295ef748f225a..851760c1537e0e75143e2667713d2b35
          Unsmoothed percentile peak and PQ-domain frame average for the selected
          non-standard ``--tone-mapping-metric``, expressed in cd/mÂ². Unavailable
 diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
-index 7e870100627827fe6045a7e5da662177475c65c8..fcca228eb4bf06acbb19f2d1a19eeda9b2ab4199 100644
+index a17e45a9c5c32d6280792b8c3c8f9854a8b4f55d..e5b024cbcbbaa47ef65a3c6795977056501fef92 100644
 --- a/DOCS/man/options.rst
 +++ b/DOCS/man/options.rst
 @@ -7861,6 +7861,19 @@ them.
@@ -50,8 +50,8 @@ index 7e870100627827fe6045a7e5da662177475c65c8..fcca228eb4bf06acbb19f2d1a19eeda9
 +``--hdr-causal-scene-diagnostics=<yes|no>``
 +    Enable hidden, diagnostics-only causal scene descriptor instrumentation.
 +    It analyzes consecutive tagged source frames before RGB hooks and exposes
-+    a native trace through ``video-out-params`` and verbose logs. It does not
-+    change HDR peak smoothing, tone mapping, or rendered output. This
++    native properties. Verbose logs report lifecycle/events; full per-frame
++    metrics require trace logging without changing rendering. This
 +    session-only option defaults to no. (Only for ``--vo=gpu-next``)
 +
 +``--hdr-causal-scene-acceleration=<yes|no>``
@@ -286,7 +286,7 @@ index 0000000000000000000000000000000000000000..13d18af4a0359bb0382249787652be69
 +if __name__ == "__main__":
 +    unittest.main()
 diff --git a/player/command.c b/player/command.c
-index 56bd0bf884459047f86974b942d78e2706b0a38c..4a5bcfcd890aa1badf8f2ef5ab258fdd1590a089 100644
+index c7e0f863b15590444d5de599cbf6e7b230ce0b4c..c3064b5375275155f4160ca8074f204ce3d789b6 100644
 --- a/player/command.c
 +++ b/player/command.c
 @@ -34,6 +34,7 @@
@@ -297,7 +297,7 @@ index 56bd0bf884459047f86974b942d78e2706b0a38c..4a5bcfcd890aa1badf8f2ef5ab258fdd
  
  #include "mpv_talloc.h"
  #include "client.h"
-@@ -2520,6 +2521,25 @@ static int property_imgparams(const struct mp_image_params *p, int action, void
+@@ -2524,6 +2525,25 @@ static int property_imgparams(const struct mp_image_params *p, int action, void
      bool has_crop = mp_rect_w(p->crop) > 0 && mp_rect_h(p->crop) > 0;
      const char *aspect_name = get_aspect_ratio_name(d_w / (double)d_h);
      const char *sar_name = get_aspect_ratio_name(p->w / (double)p->h);
@@ -323,7 +323,7 @@ index 56bd0bf884459047f86974b942d78e2706b0a38c..4a5bcfcd890aa1badf8f2ef5ab258fdd
      const char *pixelformat_name = p->imgfmt_name ? p->imgfmt_name :
                                                     mp_imgfmt_to_name(p->imgfmt);
      struct m_sub_property props[] = {
-@@ -2590,6 +2610,46 @@ static int property_imgparams(const struct mp_image_params *p, int action, void
+@@ -2594,6 +2614,46 @@ static int property_imgparams(const struct mp_image_params *p, int action, void
                             (MP_SCENE_CUT_DOVI | MP_SCENE_CUT_HDR10PLUS)
                           ? "dv+hdr10plus" : "none"),
              .unavailable = !peak->valid},
@@ -405,18 +405,22 @@ index defe0e61a42f3005cb0bc9642ae9f303384eeb5a..ccc620098380278987eee400a27d560d
  
  // Describes image parameters that usually stay constant.
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index 3bd8b045bd776e89a9167aab18007fb523c0c969..a65b0ce746f1b374489d064206b4aea8de54f66c 100644
+index 5e817aaf22c163ffd7ae809f82bed7018ab48a26..e97058d041135caf47ad0830dd4a3f05a24867f2 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
-@@ -145,6 +145,7 @@ struct priv {
+@@ -146,6 +146,11 @@ struct priv {
      bool flush_cache;
      bool frame_pending;
      bool paused;
 +    uint64_t causal_scene_last_logged_tag;
++    uint64_t causal_scene_last_boundary_tag;
++    int causal_scene_last_withheld_reason;
++    bool causal_scene_log_active;
++    bool causal_scene_last_allow_delayed;
  
      uint64_t hdr10plus_stable_signature;
      uint64_t hdr10plus_candidate_signature;
-@@ -184,6 +185,8 @@ static void update_lut(struct priv *p, struct user_lut *lut);
+@@ -186,6 +191,8 @@ static void update_lut(struct priv *p, struct user_lut *lut);
  
  struct gl_next_opts {
      bool delayed_peak;
@@ -425,7 +429,7 @@ index 3bd8b045bd776e89a9167aab18007fb523c0c969..a65b0ce746f1b374489d064206b4aea8
      bool authored_scene_reset;
      int sub_hdr_peak;
      int image_subs_hdr_peak;
-@@ -217,6 +220,10 @@ const struct m_sub_options gl_next_conf = {
+@@ -219,6 +226,10 @@ const struct m_sub_options gl_next_conf = {
          {"image-subs-hdr-peak", OPT_CHOICE(image_subs_hdr_peak, {"sdr", PL_COLOR_SDR_WHITE},
              {"video", -1}, {"video-static", -2}, {"video-dynamic", -3}),  M_RANGE(10, 10000)},
          {"allow-delayed-peak-detect", OPT_BOOL(delayed_peak)},
@@ -436,7 +440,7 @@ index 3bd8b045bd776e89a9167aab18007fb523c0c969..a65b0ce746f1b374489d064206b4aea8
          {"hdr-authored-scene-reset", OPT_BOOL(authored_scene_reset)},
          {"border-background", OPT_CHOICE(border_background,
              {"none",  BACKGROUND_NONE},
-@@ -248,6 +255,8 @@ const struct m_sub_options gl_next_conf = {
+@@ -250,6 +261,8 @@ const struct m_sub_options gl_next_conf = {
          .target_hint = -1,
          .target_hint_strict = true,
          .authored_scene_reset = true,
@@ -445,7 +449,7 @@ index 3bd8b045bd776e89a9167aab18007fb523c0c969..a65b0ce746f1b374489d064206b4aea8
      },
      .size = sizeof(struct gl_next_opts),
      .change_flags = UPDATE_VIDEO,
-@@ -492,6 +501,9 @@ struct frame_priv {
+@@ -573,6 +586,9 @@ struct frame_priv {
      pl_tex el_tex[4];
      struct pl_frame el_frame;
      unsigned authored_scene_cut;
@@ -455,7 +459,7 @@ index 3bd8b045bd776e89a9167aab18007fb523c0c969..a65b0ce746f1b374489d064206b4aea8
  };
  
  static void reset_authored_scene_state(struct priv *p)
-@@ -947,11 +959,15 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
+@@ -1034,11 +1050,15 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
          },
          .rotation = par.rotate / 90,
          .user_data = mpi,
@@ -471,7 +475,27 @@ index 3bd8b045bd776e89a9167aab18007fb523c0c969..a65b0ce746f1b374489d064206b4aea8
      if (frame->scene_cut) {
          const char *source = fp->authored_scene_cut == MP_SCENE_CUT_DOVI
              ? "Dolby Vision" : fp->authored_scene_cut == MP_SCENE_CUT_HDR10PLUS
-@@ -1385,6 +1401,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1397,6 +1417,19 @@ static bool use_auto_softclip(const struct gl_video_opts *opts,
+     return source_color.primaries == PL_COLOR_PRIM_BT_2020 && target_bt709;
+ }
+ 
++static const char *causal_scene_withheld_reason_name(int reason)
++{
++    switch (reason) {
++    case PL_CAUSAL_SCENE_WITHHELD_NONE: return "none";
++    case PL_CAUSAL_SCENE_WITHHELD_DISABLED: return "disabled";
++    case PL_CAUSAL_SCENE_WITHHELD_NO_TAG: return "no-tag";
++    case PL_CAUSAL_SCENE_WITHHELD_PENDING: return "pending";
++    case PL_CAUSAL_SCENE_WITHHELD_DISCONTINUITY: return "discontinuity";
++    case PL_CAUSAL_SCENE_WITHHELD_UNSUPPORTED: return "unsupported";
++    default: return "unknown";
++    }
++}
++
+ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+ {
+     struct priv *p = vo->priv;
+@@ -1472,6 +1505,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
          struct frame_priv *fp = talloc_zero(mpi, struct frame_priv);
          mpi->priv = fp;
          fp->vo = vo;
@@ -480,7 +504,7 @@ index 3bd8b045bd776e89a9167aab18007fb523c0c969..a65b0ce746f1b374489d064206b4aea8
  
          pl_queue_push(p->queue, &(struct pl_source_frame) {
              .pts = mpi->pts,
-@@ -1808,6 +1826,67 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1895,6 +1930,129 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
          } else {
              vo->params->peak_detect = (struct mp_peak_detect_metrics) {0};
          }
@@ -514,8 +538,40 @@ index 3bd8b045bd776e89a9167aab18007fb523c0c969..a65b0ce746f1b374489d064206b4aea8
 +            out->causal_global_motion_residual = causal.global_motion_residual;
 +            out->causal_cut_score = causal.cut_score;
 +
++            bool first = !p->causal_scene_log_active;
++            bool reason_changed = first || causal.withheld_reason !=
++                                  p->causal_scene_last_withheld_reason;
++            bool delayed_changed = first || causal.effective_allow_delayed !=
++                                   p->causal_scene_last_allow_delayed;
++            bool boundary_changed = causal.authored_boundary_tag &&
++                                    causal.authored_boundary_tag !=
++                                    p->causal_scene_last_boundary_tag;
++
++            if (first) {
++                MP_VERBOSE(vo, "Causal scene diagnostics active: state=%s "
++                           "allow-delayed=%d acceleration=%d\n",
++                           causal_scene_withheld_reason_name(causal.withheld_reason),
++                           causal.effective_allow_delayed,
++                           p->next_opts->causal_scene_acceleration);
++            } else if (reason_changed || delayed_changed) {
++                MP_VERBOSE(vo, "Causal scene diagnostics state: state=%s "
++                           "valid=%d submitted=%"PRIu64" consumed=%"PRIu64
++                           " latency=%d allow-delayed=%d\n",
++                           causal_scene_withheld_reason_name(causal.withheld_reason),
++                           causal.descriptor_valid, causal.submitted_tag,
++                           causal.consumed_tag, causal.readback_latency_frames,
++                           causal.effective_allow_delayed);
++            }
++            if ((reason_changed && causal.withheld_reason ==
++                 PL_CAUSAL_SCENE_WITHHELD_DISCONTINUITY) || boundary_changed) {
++                MP_VERBOSE(vo, "Causal scene source reset: submitted=%"PRIu64
++                           " boundary=%"PRIu64" source=%"PRIu64"\n",
++                           causal.submitted_tag, causal.authored_boundary_tag,
++                           causal.authored_boundary_source);
++            }
++
 +            if (causal.consumed_tag && causal.consumed_tag != p->causal_scene_last_logged_tag) {
-+                MP_VERBOSE(vo, "Causal scene diagnostics: submitted=%"PRIu64
++                MP_TRACE(vo, "Causal scene diagnostics: submitted=%"PRIu64
 +                           " consumed=%"PRIu64" latency=%d valid=%d withheld=%d "
 +                           "hist-tv=%f tile-mad=%f shifted-tile-mad=%f motion=%f "
 +                           "residual=%f score=%f trigger=%d count=%"PRIu64
@@ -531,8 +587,21 @@ index 3bd8b045bd776e89a9167aab18007fb523c0c969..a65b0ce746f1b374489d064206b4aea8
 +                           causal.effective_allow_delayed,
 +                           causal.acceleration_applied,
 +                           causal.acceleration_count);
++                if (causal.visual_trigger || causal.acceleration_applied) {
++                    MP_VERBOSE(vo, "Causal scene trigger: consumed=%"PRIu64
++                               " score=%f trigger-count=%"PRIu64
++                               " acceleration-applied=%d acceleration-count=%"PRIu64"\n",
++                               causal.consumed_tag, causal.cut_score,
++                               causal.visual_trigger_count,
++                               causal.acceleration_applied,
++                               causal.acceleration_count);
++                }
 +                p->causal_scene_last_logged_tag = causal.consumed_tag;
 +            }
++            p->causal_scene_log_active = true;
++            p->causal_scene_last_withheld_reason = causal.withheld_reason;
++            p->causal_scene_last_allow_delayed = causal.effective_allow_delayed;
++            p->causal_scene_last_boundary_tag = causal.authored_boundary_tag;
 +        } else if (p->next_opts->causal_scene_diagnostics ||
 +                   p->next_opts->causal_scene_acceleration) {
 +            // Some deliberately unsupported source layouts can bypass the
@@ -544,11 +613,28 @@ index 3bd8b045bd776e89a9167aab18007fb523c0c969..a65b0ce746f1b374489d064206b4aea8
 +            out->causal_allow_delayed = p->next_opts->delayed_peak;
 +            out->causal_submitted_tag = p->last_id + 1;
 +            out->causal_withheld_reason = PL_CAUSAL_SCENE_WITHHELD_UNSUPPORTED;
++            if (!p->causal_scene_log_active || p->causal_scene_last_withheld_reason !=
++                PL_CAUSAL_SCENE_WITHHELD_UNSUPPORTED) {
++                MP_VERBOSE(vo, "Causal scene diagnostics active: state=unsupported "
++                           "allow-delayed=%d acceleration=%d\n",
++                           p->next_opts->delayed_peak,
++                           p->next_opts->causal_scene_acceleration);
++            }
++            p->causal_scene_log_active = true;
++            p->causal_scene_last_withheld_reason =
++                PL_CAUSAL_SCENE_WITHHELD_UNSUPPORTED;
++            p->causal_scene_last_allow_delayed = p->next_opts->delayed_peak;
++        } else if (p->causal_scene_log_active) {
++            MP_VERBOSE(vo, "Causal scene diagnostics inactive\n");
++            p->causal_scene_log_active = false;
++            p->causal_scene_last_logged_tag = 0;
++            p->causal_scene_last_boundary_tag = 0;
++            p->causal_scene_last_withheld_reason = PL_CAUSAL_SCENE_WITHHELD_NONE;
 +        }
      }
      mp_mutex_unlock(&vo->params_mutex);
  
-@@ -3017,6 +3096,8 @@ static void update_render_options(struct vo *vo)
+@@ -3104,6 +3262,8 @@ static void update_render_options(struct vo *vo)
      pars->peak_detect_params.scene_threshold_high = opts->tone_map.scene_threshold_high;
      pars->peak_detect_params.percentile = opts->tone_map.peak_percentile;
      pars->peak_detect_params.allow_delayed = p->next_opts->delayed_peak;
