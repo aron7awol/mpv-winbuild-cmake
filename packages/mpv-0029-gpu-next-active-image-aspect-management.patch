@@ -4,14 +4,18 @@ Date: Wed, 2 Sep 2026 11:27:27 -0400
 Subject: [PATCH] gpu-next: add active image aspect management
 
 Measure native luma asynchronously, publish frame-tagged active-image geometry, and support frame-exact wide-canvas framing plus independent detected-bar cropping. Stabilize encoded matte noise, sparse and windowboxed frames, breakouts, micro aperture motion, and faint structured fade-ins with analysis-only lookahead. Preserve user and fullscreen-UI source crops without changing picture scale, and provide a default-on switch that removes analysis and lookahead overhead when disabled.
+
+Respect effective pixel aspect and rotation in the published ratio and framing.
+Share final geometry with window screenshots, and asynchronously reanalyze an
+already-mapped frame when detection is re-enabled during paused playback.
 ---
  player/command.c        |   34 ++
- video/out/vo.h          |   15 +
- video/out/vo_gpu_next.c | 1175 ++++++++++++++++++++++++++++++++++++++-
- 3 files changed, 1222 insertions(+), 2 deletions(-)
+ video/out/vo.h          |   16 +
+ video/out/vo_gpu_next.c | 1258 ++++++++++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 1306 insertions(+), 2 deletions(-)
 
 diff --git a/player/command.c b/player/command.c
-index 178ff5429..e7671b7d6 100644
+index 178ff5429..f14ff99b8 100644
 --- a/player/command.c
 +++ b/player/command.c
 @@ -2755,6 +2755,39 @@ static int mp_property_gpu_render_formats(void *ctx, struct m_property *prop,
@@ -28,7 +32,7 @@ index 178ff5429..e7671b7d6 100644
 +        !image.available || image.active_w < 1 || image.active_h < 1)
 +        return M_PROPERTY_UNAVAILABLE;
 +
-+    double ratio = (double) image.active_w / image.active_h;
++    double ratio = image.display_ratio;
 +    char *summary = mp_tprintf(128, "%dx%d (%.3f:1)",
 +                               image.active_w, image.active_h, ratio);
 +    struct m_sub_property props[] = {
@@ -63,7 +67,7 @@ index 178ff5429..e7671b7d6 100644
      {"video-params", mp_property_vd_imgparams},
      {"video-frame-info", mp_property_video_frame_info},
 diff --git a/video/out/vo.h b/video/out/vo.h
-index f9c0365a2..466db79e9 100644
+index f9c0365a2..62532521d 100644
 --- a/video/out/vo.h
 +++ b/video/out/vo.h
 @@ -88,6 +88,9 @@ enum mp_voctrl {
@@ -76,7 +80,7 @@ index f9c0365a2..466db79e9 100644
      VOCTRL_SET_CURSOR_VISIBILITY,       // bool*
  
      VOCTRL_CONTENT_TYPE,                // enum mp_content_type*
-@@ -146,6 +149,18 @@ struct voctrl_render_formats {
+@@ -146,6 +149,19 @@ struct voctrl_render_formats {
      char output[VO_RENDER_FORMAT_NAME_MAX];
  };
  
@@ -86,6 +90,7 @@ index f9c0365a2..466db79e9 100644
 +    bool breakout;
 +    int source_w, source_h;
 +    int active_w, active_h;
++    double display_ratio;
 +    int top, bottom;
 +    uint64_t frame_id;
 +    uint64_t gpu_ns_median, gpu_ns_p99;
@@ -96,7 +101,7 @@ index f9c0365a2..466db79e9 100644
  enum mp_content_type {
      MP_CONTENT_NONE, // used for force-window
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index bf5cb1231..3faec75c1 100644
+index 9915da25b..61f8bee03 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
 @@ -23,6 +23,8 @@
@@ -157,7 +162,7 @@ index bf5cb1231..3faec75c1 100644
  struct cache {
      struct mp_log *log;
      struct mpv_global *global;
-@@ -130,6 +174,16 @@ struct priv {
+@@ -130,6 +174,17 @@ struct priv {
      pl_gpu gpu;
      pl_renderer rr;
      pl_queue queue;
@@ -171,14 +176,11 @@ index bf5cb1231..3faec75c1 100644
 +    int bar_timing_count, bar_timing_next;
 +    uint64_t bar_first_commit_tag, bar_last_commit_tag, bar_commit_count;
 +    uint64_t bar_indeterminate_count;
++    uint64_t bar_generation;
      pl_swapchain sw;
      pl_fmt osd_fmt[SUBBITMAP_COUNT];
      pl_tex *sub_tex;
-@@ -148,10 +202,14 @@ struct priv {
-     bool frame_pending;
-     bool paused;
-     uint64_t causal_scene_last_logged_tag;
-     uint64_t causal_scene_last_boundary_tag;
+@@ -152,6 +207,10 @@ struct priv {
      int causal_scene_last_withheld_reason;
      bool causal_scene_log_active;
      bool causal_scene_last_allow_delayed;
@@ -189,7 +191,7 @@ index bf5cb1231..3faec75c1 100644
  
      uint64_t hdr10plus_stable_signature;
      uint64_t hdr10plus_candidate_signature;
-@@ -192,6 +250,10 @@ struct gl_next_opts {
+@@ -196,6 +255,10 @@ struct gl_next_opts {
      bool causal_scene_diagnostics;
      bool causal_scene_acceleration;
      bool authored_scene_reset;
@@ -200,7 +202,7 @@ index bf5cb1231..3faec75c1 100644
      int sub_hdr_peak;
      int image_subs_hdr_peak;
      int border_background;
-@@ -230,6 +292,11 @@ const struct m_sub_options gl_next_conf = {
+@@ -234,6 +297,11 @@ const struct m_sub_options gl_next_conf = {
          {"hdr-causal-scene-diagnostics", OPT_BOOL(causal_scene_diagnostics), M_OPT_NOCFG},
          {"hdr-causal-scene-acceleration", OPT_BOOL(causal_scene_acceleration), M_OPT_NOCFG},
          {"hdr-authored-scene-reset", OPT_BOOL(authored_scene_reset)},
@@ -212,7 +214,7 @@ index bf5cb1231..3faec75c1 100644
          {"border-background", OPT_CHOICE(border_background,
              {"none",  BACKGROUND_NONE},
              {"color", BACKGROUND_COLOR},
-@@ -253,6 +320,7 @@ const struct m_sub_options gl_next_conf = {
+@@ -257,6 +325,7 @@ const struct m_sub_options gl_next_conf = {
          {0},
      },
      .defaults = &(struct gl_next_opts) {
@@ -220,7 +222,15 @@ index bf5cb1231..3faec75c1 100644
          .border_background = BACKGROUND_COLOR,
          .background_blur_radius = 16.0f,
          .inter_preserve = true,
-@@ -1025,6 +1093,941 @@ static bool upload_planes_sw(struct vo *vo, pl_gpu gpu, struct mp_image *mpi,
+@@ -594,6 +663,7 @@ struct frame_priv {
+     // Exact monotonic presentation identity from vo_frame::frame_id. It is
+     // deliberately not a PTS and is carried into libplacebo's readback tag.
+     uint64_t causal_scene_tag;
++    uint64_t bar_generation;
+ };
+ 
+ #if PL_API_VER >= 367
+@@ -1029,6 +1099,1038 @@ static bool upload_planes_sw(struct vo *vo, pl_gpu gpu, struct mp_image *mpi,
      return true;
  }
  
@@ -860,14 +870,35 @@ index bf5cb1231..3faec75c1 100644
 +    return (struct mp_rect) {0, top, width, height - bottom};
 +}
 +
++static double active_display_ratio(const struct mp_image_params *params,
++                                   int width, int height)
++{
++    double par = params && params->p_w > 0 && params->p_h > 0
++               ? (double) params->p_w / params->p_h : 1.0;
++    double ratio = (double) width * par / MPMAX(height, 1);
++    if (params && params->rotate % 180 == 90)
++        ratio = 1.0 / ratio;
++    return ratio;
++}
++
++static struct mp_rect rotated_active_source_rect(struct priv *p, uint64_t tag,
++                                                  const struct mp_image_params *params)
++{
++    int width = params->w, height = params->h;
++    struct mp_rect src = active_source_rect(p, tag, width, height);
++    if (params->rotate % 180 == 90)
++        MPSWAP(int, width, height);
++    mp_rect_rotate(&src, width, height, params->rotate);
++    return src;
++}
++
 +static struct mp_rect fit_active_destination(struct mp_rect canvas,
-+                                             int active_w, int active_h,
++                                             double source_ar,
 +                                             float align_x, float align_y)
 +{
 +    int cw = mp_rect_w(canvas), ch = mp_rect_h(canvas);
-+    if (cw < 1 || ch < 1 || active_w < 1 || active_h < 1)
++    if (cw < 1 || ch < 1 || !isfinite(source_ar) || source_ar <= 0)
 +        return canvas;
-+    double source_ar = (double) active_w / active_h;
 +    double canvas_ar = (double) cw / ch;
 +    int w, h;
 +    if (source_ar >= canvas_ar) {
@@ -883,25 +914,78 @@ index bf5cb1231..3faec75c1 100644
 +}
 +
 +static struct mp_rect map_source_to_active_destination(
-+    struct mp_rect active_dst, struct mp_rect source, int source_w,
-+    int source_h, int top, int bottom)
++    struct mp_rect active_dst, struct mp_rect source, struct mp_rect aperture)
 +{
-+    int active_h = source_h - top - bottom;
-+    if (source_w < 1 || active_h < 1)
++    int ax = MPMIN(aperture.x0, aperture.x1);
++    int ay = MPMIN(aperture.y0, aperture.y1);
++    int aw = abs(mp_rect_w(aperture));
++    int ah = abs(mp_rect_h(aperture));
++    if (aw < 1 || ah < 1)
 +        return active_dst;
 +
 +    int sx0 = MPMIN(source.x0, source.x1);
 +    int sx1 = MPMAX(source.x0, source.x1);
 +    int sy0 = MPMIN(source.y0, source.y1);
 +    int sy1 = MPMAX(source.y0, source.y1);
-+    double scale_x = (double) mp_rect_w(active_dst) / source_w;
-+    double scale_y = (double) mp_rect_h(active_dst) / active_h;
++    double scale_x = (double) mp_rect_w(active_dst) / aw;
++    double scale_y = (double) mp_rect_h(active_dst) / ah;
 +    return (struct mp_rect) {
-+        active_dst.x0 + lrint(sx0 * scale_x),
-+        active_dst.y0 + lrint((sy0 - top) * scale_y),
-+        active_dst.x0 + lrint(sx1 * scale_x),
-+        active_dst.y0 + lrint((sy1 - top) * scale_y),
++        active_dst.x0 + lrint((sx0 - ax) * scale_x),
++        active_dst.y0 + lrint((sy0 - ay) * scale_y),
++        active_dst.x0 + lrint((sx1 - ax) * scale_x),
++        active_dst.y0 + lrint((sy1 - ay) * scale_y),
 +    };
++}
++
++struct active_geometry {
++    struct mp_rect dst;
++    bool automatic, crop;
++};
++
++// Live rendering and scaled/window screenshots must use the same geometry.
++// Source-only screenshots deliberately retain mpv's ordinary source framing.
++static struct active_geometry resolve_active_geometry(struct vo *vo,
++                                                       int width, int height)
++{
++    struct priv *p = vo->priv;
++    struct active_geometry geometry = {.dst = p->dst};
++    if (!p->next_opts->active_image_detection || !vo->opts->fullscreen ||
++        !vo->params)
++        return geometry;
++
++    struct mp_rect canvas = {0, 0, width, height};
++    double canvas_ar = p->next_opts->automatic_aspect_ratio_canvas;
++    if (canvas_ar > 0) {
++        int visible_h = 2 * floor(width / canvas_ar / 2.0 + 0.5);
++        if (visible_h > 0 && visible_h < height) {
++            canvas.y0 = (height - visible_h) / 2;
++            canvas.y1 = canvas.y0 + visible_h;
++        }
++    }
++    geometry.automatic = p->next_opts->automatic_aspect_ratio &&
++        (int64_t) mp_rect_w(canvas) * 9 > (int64_t) mp_rect_h(canvas) * 16;
++    geometry.crop = p->next_opts->automatic_aspect_ratio_crop;
++    if ((!geometry.automatic && !geometry.crop) || !p->active_image_available ||
++        p->active_image.source_w != vo->params->w ||
++        p->active_image.source_h != vo->params->h)
++        return geometry;
++
++    int active_h = p->active_image.source_h - p->active_image.top -
++                   p->active_image.bottom;
++    double ratio = active_display_ratio(vo->params,
++                                        p->active_image.source_w, active_h);
++    // mpv's monitor PAR is the correction applied to destination pixel width.
++    if (p->osd_res.display_par > 0)
++        ratio *= p->osd_res.display_par;
++    geometry.dst = fit_active_destination(canvas, ratio,
++                                           vo->opts->align_x, vo->opts->align_y);
++    if (geometry.automatic && !geometry.crop) {
++        struct mp_rect aperture = rotated_active_source_rect(
++            p, p->active_image.tag, vo->params);
++        geometry.dst = map_source_to_active_destination(geometry.dst,
++                                                         p->src, aperture);
++    }
++    return geometry;
 +}
 +
 +static const struct pl_buffer_var bar_buffer_vars[] = {{
@@ -1159,23 +1243,54 @@ index bf5cb1231..3faec75c1 100644
 +    return true;
 +}
 +
++static void analyze_mapped_frame(struct priv *p, struct pl_frame *frame)
++{
++    struct mp_image *mpi = frame->user_data;
++    struct frame_priv *fp = mpi->priv;
++    if (!p->next_opts->active_image_detection || fp->bar_generation == p->bar_generation)
++        return;
++    bool submitted = find_bar_result(p, fp->causal_scene_tag) != NULL;
++    for (int i = 0; i < BAR_ANALYSIS_SLOTS; i++) {
++        submitted |= p->bar_slots[i].pending &&
++                     p->bar_slots[i].tag == fp->causal_scene_tag;
++    }
++    if (!submitted) {
++        bool acquired = !frame->acquire || frame->acquire(p->gpu, frame);
++        if (acquired) {
++            submitted = submit_bar_analysis(p, frame, fp->causal_scene_tag);
++            if (frame->release)
++                frame->release(p->gpu, frame);
++        }
++    }
++    if (submitted)
++        fp->bar_generation = p->bar_generation;
++}
++
  static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src,
                        struct pl_frame *frame)
  {
-@@ -1174,6 +2177,12 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
+@@ -1178,6 +2280,8 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
      update_lut(p, &p->next_opts->image_lut);
      frame->lut = p->next_opts->image_lut.lut;
      frame->lut_type = p->next_opts->image_lut.type;
 +
-+    bool acquired = !frame->acquire || frame->acquire(gpu, frame);
-+    if (acquired && p->next_opts->active_image_detection)
-+        submit_bar_analysis(p, frame, fp->causal_scene_tag);
-+    if (frame->release)
-+        frame->release(gpu, frame);
++    analyze_mapped_frame(p, frame);
      return true;
  }
  
-@@ -1498,6 +2507,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1227,8 +2331,11 @@ static void update_options(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
+     pl_options pars = p->pars;
++    bool detection_was_enabled = p->next_opts->active_image_detection;
+     bool changed = m_config_cache_update(p->opts_cache);
+     changed = m_config_cache_update(p->next_opts_cache) || changed;
++    if (!detection_was_enabled && p->next_opts->active_image_detection)
++        p->bar_generation++;
+     if (changed) {
+         update_render_options(vo);
+         // Cached intermediates were produced with the previous options.
+@@ -1515,6 +2622,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
              p->last_pts = 0.0;
              p->last_id = 0;
              reset_authored_scene_state(p);
@@ -1185,7 +1300,7 @@ index bf5cb1231..3faec75c1 100644
              p->want_reset = false;
              pl_renderer_flush_cache(p->rr);
          }
-@@ -1792,11 +2804,15 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1809,11 +2919,15 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
      }
  
      struct pl_frame_mix mix = {0};
@@ -1201,76 +1316,49 @@ index bf5cb1231..3faec75c1 100644
              .vsync_duration = can_interpolate ? frame->ideal_frame_vsync_duration : 0,
              .interpolation_threshold = opts->interpolation_threshold,
              .drift_compensation = 0,
-@@ -1831,6 +2847,61 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1848,6 +2962,34 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
              break;
          }
  
++        // Enabling analysis while paused must also cover already-mapped frames.
++        // Generation checks make this a no-op on the ordinary playback path.
++        for (int i = 0; i < mix.num_frames; i++)
++            analyze_mapped_frame(p, (struct pl_frame *) mix.frames[i]);
 +        consume_bar_analysis(p);
 +        if (p->next_opts->active_image_detection) {
 +            commit_active_image(p, frame->frame_id + 1,
 +                                vo->params->w, vo->params->h);
++            if (frame->still || p->paused) {
++                for (int i = 0; i < BAR_ANALYSIS_SLOTS; i++) {
++                    if (p->bar_slots[i].pending &&
++                        p->bar_slots[i].tag == frame->frame_id + 1)
++                        vo->want_redraw = true;
++                }
++            }
 +        } else {
 +            p->active_image_available = false;
 +            p->automatic_aspect_effective = false;
 +            memset(p->bar_results, 0, sizeof(p->bar_results));
 +        }
-+        int canvas_w = swframe.fbo->params.w;
-+        int canvas_h = swframe.fbo->params.h;
-+        struct mp_rect aspect_canvas = {0, 0, canvas_w, canvas_h};
-+        double requested_canvas_ar =
-+            p->next_opts->automatic_aspect_ratio_canvas;
-+        if (requested_canvas_ar > 0) {
-+            int visible_h = 2 * floor(canvas_w / requested_canvas_ar / 2.0 + 0.5);
-+            if (visible_h > 0 && visible_h < canvas_h) {
-+                int inset = (canvas_h - visible_h) / 2;
-+                aspect_canvas.y0 = inset;
-+                aspect_canvas.y1 = inset + visible_h;
-+            }
-+        }
-+        p->automatic_aspect_effective =
-+            p->next_opts->active_image_detection &&
-+            p->next_opts->automatic_aspect_ratio && vo->opts->fullscreen &&
-+            (int64_t) mp_rect_w(aspect_canvas) * 9 >
-+            (int64_t) mp_rect_h(aspect_canvas) * 16;
-+        bool hard_crop_effective = p->next_opts->active_image_detection &&
-+            vo->opts->fullscreen &&
-+            p->next_opts->automatic_aspect_ratio_crop;
-+        bool detected_framing_effective = vo->opts->fullscreen &&
-+            (p->automatic_aspect_effective ||
-+             p->next_opts->automatic_aspect_ratio_crop);
-+        if (detected_framing_effective && p->active_image_available) {
-+            int active_h = p->active_image.source_h - p->active_image.top -
-+                           p->active_image.bottom;
-+            struct mp_rect auto_dst = fit_active_destination(
-+                aspect_canvas, p->active_image.source_w, active_h,
-+                vo->opts->align_x, vo->opts->align_y);
-+            // Automatic management frames from the detected aperture but
-+            // leaves the complete encoded source available. Authored effects
-+            // may therefore overflow into otherwise unused canvas space while
-+            // the base image remains perfectly stable. The explicit crop mode
-+            // retains its promise to remove everything outside the aperture.
-+            struct mp_rect render_dst = auto_dst;
-+            if (p->automatic_aspect_effective && !hard_crop_effective) {
-+                render_dst = map_source_to_active_destination(
-+                    auto_dst, p->src, p->active_image.source_w,
-+                    p->active_image.source_h,
-+                    p->active_image.top, p->active_image.bottom);
-+            }
-+            apply_crop(&target, render_dst, swframe.fbo->params.w,
-+                       swframe.fbo->params.h);
-+        }
++        struct active_geometry geometry = resolve_active_geometry(
++            vo, swframe.fbo->params.w, swframe.fbo->params.h);
++        p->automatic_aspect_effective = geometry.automatic;
++        bool hard_crop_effective = geometry.crop;
++        bool detected_framing_effective = geometry.automatic || geometry.crop;
++        apply_crop(&target, geometry.dst, swframe.fbo->params.w,
++                   swframe.fbo->params.h);
 +
          // Update source crop and overlays on all existing frames. We
          // technically own the `pl_frame` struct so this is kosher. This could
          // be partially avoided by instead flushing the queue on resizes, but
-@@ -1842,7 +2913,13 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1859,7 +3001,13 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
  #if PL_API_VER >= 367
              apply_dovi_enhancement_layer(p, image, fp);
  #endif
 -            apply_crop(image, p->src, vo->params->w, vo->params->h);
 +            if (hard_crop_effective) {
-+                struct mp_rect auto_src = active_source_rect(
-+                    p, fp->causal_scene_tag, vo->params->w, vo->params->h);
++                struct mp_rect auto_src = rotated_active_source_rect(
++                    p, fp->causal_scene_tag, vo->params);
 +                apply_crop(image, auto_src, vo->params->w, vo->params->h);
 +            } else {
 +                apply_crop(image, p->src, vo->params->w, vo->params->h);
@@ -1278,7 +1366,7 @@ index bf5cb1231..3faec75c1 100644
              if (opts->blend_subs) {
                  if (frame->redraw)
                      p->osd_sync++;
-@@ -1885,6 +2962,43 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1902,6 +3050,43 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
              ((uint64_t *) mix.signatures)[i] ^= fp->osd_sync << 48;
          }
  
@@ -1322,7 +1410,23 @@ index bf5cb1231..3faec75c1 100644
          // Update dynamic hook parameters
          for (int i = 0; i < pars->params.num_hooks; i++)
              update_hook_opts_dynamic(vo, p, p->hooks[i], frame->current);
-@@ -2529,6 +3643,44 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -2385,6 +3570,15 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
+         target.color.transfer = PL_COLOR_TRC_GAMMA22;
+     }
+ 
++    if (args->scaled) {
++        struct active_geometry geometry = resolve_active_geometry(
++            vo, fbo->params.w, fbo->params.h);
++        dst = geometry.dst;
++        if (geometry.crop) {
++            struct frame_priv *fp = mpi->priv;
++            src = rotated_active_source_rect(p, fp->causal_scene_tag, &mpi->params);
++        }
++    }
+     apply_crop(&image, src, mpi->params.w, mpi->params.h);
+     apply_crop(&target, dst, fbo->params.w, fbo->params.h);
+     update_tm_viz(&pars->color_map_params, &target);
+@@ -2608,6 +3802,46 @@ static int control(struct vo *vo, uint32_t request, void *data)
          return VO_TRUE;
      }
  
@@ -1359,6 +1463,8 @@ index bf5cb1231..3faec75c1 100644
 +                            p->active_image.bottom;
 +            out->top = p->active_image.top;
 +            out->bottom = p->active_image.bottom;
++            out->display_ratio = active_display_ratio(vo->params,
++                                                       out->active_w, out->active_h);
 +            out->frame_id = p->active_image.tag ? p->active_image.tag - 1 : 0;
 +        }
 +        return VO_TRUE;
@@ -1367,7 +1473,7 @@ index bf5cb1231..3faec75c1 100644
      case VOCTRL_SCREENSHOT:
          video_screenshot(vo, data);
          return true;
-@@ -2768,11 +3920,22 @@ static void uninit(struct vo *vo)
+@@ -2847,11 +4081,22 @@ static void uninit(struct vo *vo)
  {
      struct priv *p = vo->priv;
  
@@ -1390,18 +1496,19 @@ index bf5cb1231..3faec75c1 100644
      for (int i = 0; i < MP_ARRAY_SIZE(p->osd_state.entries); i++)
          pl_tex_destroy(p->gpu, &p->osd_state.entries[i].tex);
      for (int i = 0; i < p->num_sub_tex; i++)
-@@ -2868,6 +4031,10 @@ static int preinit(struct vo *vo)
+@@ -2947,6 +4192,11 @@ static int preinit(struct vo *vo)
      pl_gpu_set_cache(p->gpu, p->shader_cache.cache);
      p->rr = pl_renderer_create(p->pllog, p->gpu);
      p->queue = pl_queue_create(p->gpu);
 +    p->bar_dispatch = pl_dispatch_create(p->pllog, p->gpu);
++    p->bar_generation = 1;
 +    p->bar_timer = pl_timer_create(p->gpu);
 +    if (!p->rr || !p->queue || !p->bar_dispatch)
 +        goto err_out;
      p->osd_fmt[SUBBITMAP_LIBASS] = pl_find_named_fmt(p->gpu, "r8");
      p->osd_fmt[SUBBITMAP_BGRA] = pl_find_named_fmt(p->gpu, "bgra8");
      p->osd_sync = 1;
-@@ -3222,7 +4389,11 @@ static void update_render_options(struct vo *vo)
+@@ -3301,7 +4551,11 @@ static void update_render_options(struct vo *vo)
      // Request as many frames as required from the decoder, depending on the
      // speed VPS/FPS ratio libplacebo may need more frames. Request frames up to
      // ratio of 1/2, but only if anti aliasing is enabled.
@@ -1414,5 +1521,3 @@ index bf5cb1231..3faec75c1 100644
      if (pars->params.frame_mixer) {
          req_frames += ceilf(pars->params.frame_mixer->kernel->radius) *
                        (pars->params.skip_anti_aliasing ? 1 : 2);
--- 
-2.54.0.windows.1

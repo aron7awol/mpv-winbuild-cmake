@@ -1,0 +1,40 @@
+From: mpv-ht developers <dev@mpv-ht.local>
+Date: Sat, 5 Sep 2026 12:00:00 -0400
+Subject: [PATCH] gpu-next: expose automatic linear-PQ second stage
+
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 61f8bee..6dd6b63 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -4647,6 +4647,7 @@ AV_NOWARN_DEPRECATED(
+     pars->color_map_params.ambient_gamma = opts->tone_map.ambient_gamma;
+     pars->color_map_params.hlg_reference_peak = opts->tone_map.hlg_reference_peak;
+     pars->color_map_params.hard_clip_hdr_target = opts->target_peak > 0;
++    pars->color_map_params.auto_pq_second_pass = opts->tone_map.auto_pq_second_pass;
+     pars->color_map_params.inverse_tone_mapping = opts->tone_map.inverse;
+     pars->color_map_params.contrast_recovery = opts->tone_map.contrast_recovery;
+     pars->color_map_params.visualize_lut = opts->tone_map.visualize;
+diff --git a/video/out/gpu/video.c b/video/out/gpu/video.c
+index 1bd3bcf..8b14c69 100644
+--- a/video/out/gpu/video.c
++++ b/video/out/gpu/video.c
+@@ -478,6 +478,7 @@ const struct m_sub_options gl_video_conf = {
+             {"maxrgb-itp", TONE_MAPPING_METRIC_MAXRGB_ITP},
+             {"maxrgb-adaptive", TONE_MAPPING_METRIC_MAXRGB_ADAPTIVE},
+             {"maxrgb-rgb", TONE_MAPPING_METRIC_MAXRGB_RGB})},
++        {"tone-mapping-auto-pq-second-pass", OPT_BOOL(tone_map.auto_pq_second_pass)},
+         {"tone-mapping-adaptive-chroma-strength",
+             OPT_FLOAT(tone_map.adaptive_chroma_strength), M_RANGE(0.0, 100.0)},
+         {"tone-mapping-ambient-gamma",
+diff --git a/video/out/gpu/video.h b/video/out/gpu/video.h
+index 3ee7125..4161375 100644
+--- a/video/out/gpu/video.h
++++ b/video/out/gpu/video.h
+@@ -129,6 +129,7 @@ struct gl_tone_map_opts {
+     int curve;
+     int metric;
+     float adaptive_chroma_strength;
++    bool auto_pq_second_pass;
+     float ambient_gamma;
+     float curve_param;
+     float max_boost;

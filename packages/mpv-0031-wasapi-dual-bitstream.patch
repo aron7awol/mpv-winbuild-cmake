@@ -1,0 +1,633 @@
+From: mpv-ht development <mpv-ht@localhost>
+Subject: [PATCH] wasapi: duplicate bitstream to two synchronized endpoints
+
+Opt-in same-track dual WASAPI transport, exact format negotiation, bounded
+byte-preserving queues, coordinated pause/reset, clock monitoring and drift
+holds, and EOF draining on both devices. Off by default.
+
+diff --git a/audio/out/ao.h b/audio/out/ao.h
+index ce044fdc4..843b1bc1d 100644
+--- a/audio/out/ao.h
++++ b/audio/out/ao.h
+@@ -34,6 +34,8 @@ enum aocontrol {
+     AOCONTROL_SET_MUTE,
+     // Has char* as argument, which contains the desired stream title.
+     AOCONTROL_UPDATE_STREAM_TITLE,
++    // Allocated status string, caller owns it (talloc).
++    AOCONTROL_GET_DUAL_STATUS,
+ };
+ 
+ // If set, then the queued audio data is the last. Note that after a while, new
+diff --git a/audio/out/ao_wasapi.c b/audio/out/ao_wasapi.c
+index 7ad1e6427..3dbd59c2d 100644
+--- a/audio/out/ao_wasapi.c
++++ b/audio/out/ao_wasapi.c
+@@ -27,6 +27,7 @@
+ #include "osdep/io.h"
+ #include "misc/dispatch.h"
+ #include "ao_wasapi.h"
++#include "audio/format.h"
+ 
+ // naive av_rescale for unsigned
+ static UINT64 uint64_scale(UINT64 x, UINT64 num, UINT64 den)
+@@ -84,9 +85,13 @@ exit_label:
+     return hr;
+ }
+ 
++#include "ao_wasapi_dual.h"
++
+ static bool thread_feed(struct ao *ao)
+ {
+     struct wasapi_state *state = ao->priv;
++    if (state->dual)
++        return dual_feed(ao, 0);
+     HRESULT hr;
+ 
+     UINT32 frame_count = state->bufferFrameCount;
+@@ -153,6 +158,10 @@ exit_label:
+ static void thread_pause(struct ao *ao)
+ {
+     struct wasapi_state *state = ao->priv;
++    if (state->dual) {
++        dual_pause(ao);
++        return;
++    }
+     MP_DBG(state, "Thread Pause\n");
+     HRESULT hr = IAudioClient_Stop(state->pAudioClient);
+     if (FAILED(hr))
+@@ -162,6 +171,10 @@ static void thread_pause(struct ao *ao)
+ static void thread_unpause(struct ao *ao)
+ {
+     struct wasapi_state *state = ao->priv;
++    if (state->dual) {
++        dual_unpause(ao, false);
++        return;
++    }
+     MP_DBG(state, "Thread Unpause\n");
+     HRESULT hr = IAudioClient_Start(state->pAudioClient);
+     if (FAILED(hr)) {
+@@ -173,6 +186,10 @@ static void thread_unpause(struct ao *ao)
+ static void thread_reset(struct ao *ao)
+ {
+     struct wasapi_state *state = ao->priv;
++    if (state->dual) {
++        dual_reset(ao);
++        return;
++    }
+     HRESULT hr;
+     MP_DBG(state, "Thread Reset\n");
+     thread_pause(ao);
+@@ -189,6 +206,10 @@ static void thread_resume(struct ao *ao)
+     struct wasapi_state *state = ao->priv;
+     MP_DBG(state, "Thread Resume\n");
+     thread_reset(ao);
++    if (state->dual) {
++        dual_unpause(ao, true);
++        return;
++    }
+     thread_feed(ao);
+     thread_unpause(ao);
+ }
+@@ -216,21 +237,34 @@ static DWORD __stdcall AudioThread(void *lpParameter)
+     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+ 
+     state->init_ok = wasapi_thread_init(ao);
++    if (state->init_ok)
++        state->init_ok = dual_init(ao);
+     SetEvent(state->hInitDone);
+     if (!state->init_ok)
+         goto exit_label;
+ 
+     MP_DBG(ao, "Entering dispatch loop\n");
+     while (true) {
+-        HANDLE handles[] = {state->hWake, state->hUserWake};
+-        switch (WaitForMultipleObjects(MP_ARRAY_SIZE(handles), handles, FALSE, INFINITE)) {
++        // User state changes take priority over pending endpoint wakeups.
++        HANDLE handles[] = {state->hUserWake, state->hWake,
++                            state->dual ? state->dual->secondary.hWake : NULL};
++        if (state->dual)
++            dual_tick(ao);
++        switch (WaitForMultipleObjects(state->dual ? 3 : 2, handles, FALSE,
++                                      state->dual ? 5 : INFINITE)) {
+         case WAIT_OBJECT_0:
++            break;
++        case WAIT_OBJECT_0 + 1:
+             // fill twice on under-full buffer (see comment in thread_feed)
+             if (thread_feed(ao) && thread_feed(ao))
+                 MP_ERR(ao, "Unable to fill buffer fast enough\n");
+             continue;
+-        case WAIT_OBJECT_0 + 1:
+-            break;
++        case WAIT_OBJECT_0 + 2:
++            if (dual_feed(ao, 1))
++                dual_feed(ao, 1);
++            continue;
++        case WAIT_TIMEOUT:
++            continue;
+         default:
+             MP_ERR(ao, "Unexpected return value from WaitForMultipleObjects\n");
+             break;
+@@ -265,6 +299,7 @@ static DWORD __stdcall AudioThread(void *lpParameter)
+                                        WASAPI_THREAD_FEED);
+     }
+ exit_label:
++    dual_uninit(ao);
+     wasapi_thread_uninit(ao);
+ 
+     CoUninitialize();
+@@ -307,6 +342,13 @@ static int init(struct ao *ao)
+     struct wasapi_state *state = ao->priv;
+     state->log = ao->log;
+ 
++    state->strict_bitstream = state->opt_secondary_device && state->opt_secondary_device[0];
++    if (state->strict_bitstream && !af_fmt_is_spdif(ao->format)) {
++        MP_ERR(ao, "Dual bitstream is enabled but input is PCM. Disable dual output for PCM sources; no PCM fallback is allowed.\n");
++        uninit(ao);
++        return -1;
++    }
++
+     state->opt_exclusive |= ao->init_flags & AO_INIT_EXCLUSIVE;
+ 
+ #if !HAVE_UWP
+@@ -429,6 +471,15 @@ static int thread_control_shared(struct ao *ao, enum aocontrol cmd, void *arg)
+ static int thread_control(struct ao *ao, enum aocontrol cmd, void *arg)
+ {
+     struct wasapi_state *state = ao->priv;
++    if (cmd == AOCONTROL_GET_DUAL_STATUS) {
++        struct wasapi_dual *d = state->dual;
++        *(char **)arg = !d ? talloc_strdup(NULL, "Off") : d->failed ?
++            talloc_asprintf(NULL, "Error: %s", d->error) :
++            talloc_asprintf(NULL, "Bitstream to both devices; offset %+d ms; clock skew %+.1f ms%s",
++                            state->opt_secondary_delay, d->skew_ms,
++                            d->running ? "" : "; paused");
++        return CONTROL_OK;
++    }
+ 
+     // common to exclusive and shared
+     switch (cmd) {
+@@ -541,6 +592,8 @@ const struct ao_driver audio_out_wasapi = {
+     .options        = (const struct m_option[]) {
+         {"exclusive-buffer", OPT_CHOICE(opt_exclusive_buffer,
+             {"default", 0}, {"min", -1}), M_RANGE(1, 2000000)},
++        {"secondary-device", OPT_STRING(opt_secondary_device)},
++        {"secondary-delay", OPT_INT(opt_secondary_delay), M_RANGE(-1000, 1000)},
+         {0}
+     },
+ };
+diff --git a/audio/out/ao_wasapi.h b/audio/out/ao_wasapi.h
+index cbd4a3f93..bacc62a42 100644
+--- a/audio/out/ao_wasapi.h
++++ b/audio/out/ao_wasapi.h
+@@ -92,6 +92,10 @@ typedef struct wasapi_state {
+     // ao options
+     int opt_exclusive;
+     int opt_exclusive_buffer; // exclusive mode buffer duration in us
++    char *opt_secondary_device;
++    int opt_secondary_delay; // milliseconds, positive delays secondary
++    struct wasapi_dual *dual; // audio-thread owned; NULL for ordinary output
++    bool strict_bitstream;
+ 
+     // format info
+     WAVEFORMATEXTENSIBLE format;
+diff --git a/audio/out/ao_wasapi_utils.c b/audio/out/ao_wasapi_utils.c
+index a1e116b6c..ae7234a02 100644
+--- a/audio/out/ao_wasapi_utils.c
++++ b/audio/out/ao_wasapi_utils.c
+@@ -475,6 +475,10 @@ static bool find_formats_exclusive(struct ao *ao, WAVEFORMATEXTENSIBLE *wformat)
+         return true;
+ 
+     if (af_fmt_is_spdif(ao->format)) {
++        struct wasapi_state *state = ao->priv;
++        // Dual output must negotiate the real carrier on both endpoints.
++        if (state->strict_bitstream)
++            return false;
+         if (ao->format != AF_FORMAT_S_AC3) {
+             // If the requested format failed and it is passthrough, but not
+             // AC3, try lying and saying it is.
+diff --git a/audio/out/buffer.c b/audio/out/buffer.c
+index 277b52410..8a4b8d8c0 100644
+--- a/audio/out/buffer.c
++++ b/audio/out/buffer.c
+@@ -62,6 +62,7 @@ struct buffer_state {
+     bool hw_paused;             // driver->set_pause() was used successfully
+ 
+     int64_t end_time_ns;        // absolute output time of last played sample
++    bool driver_draining;      // additional pull-driver queues still audible
+     int64_t queued_time_ns;     // duration of samples that have been queued to
+                                 // the device but have not been played.
+                                 // This field is only set in ao_set_paused(),
+@@ -346,6 +347,7 @@ void ao_reset(struct ao *ao)
+     p->recover_pause = false;
+     p->hw_paused = false;
+     p->end_time_ns = 0;
++    p->driver_draining = false;
+ 
+     mp_mutex_unlock(&p->lock);
+ 
+@@ -417,7 +419,7 @@ void ao_set_paused(struct ao *ao, bool paused, bool eof)
+             }
+         }
+         wakeup = true;
+-    } else if (p->playing && p->paused && !paused) {
++    } else if ((p->playing || p->driver_draining) && p->paused && !paused) {
+         if (ao->driver->write) {
+             if (p->hw_paused)
+                 ao->driver->set_pause(ao, false);
+@@ -460,12 +462,23 @@ void ao_set_paused(struct ao *ao, bool paused, bool eof)
+ // and ao_start() was called. This returns true even if playback was logically
+ // paused. On false, EOF was reached, or an underrun happened, or ao_reset()
+ // was called.
++void ao_set_draining(struct ao *ao, bool draining)
++{
++    struct buffer_state *p = ao->buffer_state;
++    mp_mutex_lock(&p->lock);
++    p->driver_draining = draining;
++    mp_cond_broadcast(&p->wakeup);
++    mp_mutex_unlock(&p->lock);
++    if (!draining)
++        ao->wakeup_cb(ao->wakeup_ctx);
++}
++
+ bool ao_is_playing(struct ao *ao)
+ {
+     struct buffer_state *p = ao->buffer_state;
+ 
+     mp_mutex_lock(&p->lock);
+-    bool playing = p->playing;
++    bool playing = p->playing || p->driver_draining;
+     mp_mutex_unlock(&p->lock);
+ 
+     return playing;
+@@ -477,14 +490,14 @@ void ao_drain(struct ao *ao)
+     struct buffer_state *p = ao->buffer_state;
+ 
+     mp_mutex_lock(&p->lock);
+-    while (!p->paused && p->playing) {
++    while (!p->paused && (p->playing || p->driver_draining)) {
+         mp_mutex_unlock(&p->lock);
+         double delay = ao_get_delay(ao);
+         mp_mutex_lock(&p->lock);
+ 
+         // Wait for buffer + arbitrary ~250ms for EOF signal from AO.
+         if (mp_cond_timedwait(&p->wakeup, &p->lock,
+-                              MP_TIME_S_TO_NS(MPMAX(delay, 0) + 0.25)))
++                              MP_TIME_S_TO_NS(MPMAX(delay, p->driver_draining ? 10 : 0) + 0.25)))
+         {
+             MP_VERBOSE(ao, "drain timeout\n");
+             break;
+diff --git a/audio/out/internal.h b/audio/out/internal.h
+index 85fa77757..0aaa1d509 100644
+--- a/audio/out/internal.h
++++ b/audio/out/internal.h
+@@ -74,6 +74,8 @@ struct ao {
+ 
+ void init_buffer_pre(struct ao *ao);
+ bool init_buffer_post(struct ao *ao);
++// Pull drivers with additional queues defer EOF until all endpoints drain.
++void ao_set_draining(struct ao *ao, bool draining);
+ 
+ struct mp_pcm_state {
+     // Note: free_samples+queued_samples <= ao->device_buffer; the sum may be
+diff --git a/player/command.c b/player/command.c
+index e7671b7d6..31464ce34 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -1765,6 +1765,21 @@ static int mp_property_volume_gain(void *ctx, struct m_property *prop,
+     return mp_property_generic_option(mpctx, prop, action, arg);
+ }
+ 
++static int mp_property_audio_dual_status(void *ctx, struct m_property *prop,
++                                       int action, void *arg)
++{
++    MPContext *mpctx = ctx;
++    if (action == M_PROPERTY_GET_TYPE) {
++        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_STRING};
++        return M_PROPERTY_OK;
++    }
++    if (action != M_PROPERTY_GET)
++        return M_PROPERTY_NOT_IMPLEMENTED;
++    if (!mpctx->ao || ao_control(mpctx->ao, AOCONTROL_GET_DUAL_STATUS, arg) != CONTROL_OK)
++        return M_PROPERTY_UNAVAILABLE;
++    return M_PROPERTY_OK;
++}
++
+ static int mp_property_ao_volume(void *ctx, struct m_property *prop,
+                                  int action, void *arg)
+ {
+@@ -4858,6 +4873,7 @@ static const struct m_property mp_properties_base[] = {
+     M_PROPERTY_ALIAS("audio-codec", "current-tracks/audio/codec-desc"),
+     {"audio-params", mp_property_audio_params},
+     {"audio-out-params", mp_property_audio_out_params},
++    {"audio-dual-status", mp_property_audio_dual_status},
+     {"aid", mp_property_switch_track, .priv = (void *)(const int[]){0, STREAM_AUDIO}},
+     {"audio-device", mp_property_audio_device},
+     {"audio-device-list", mp_property_audio_devices},
+diff --git a/audio/out/ao_wasapi_dual.h b/audio/out/ao_wasapi_dual.h
+new file mode 100644
+--- /dev/null
++++ b/audio/out/ao_wasapi_dual.h
+@@ -0,0 +1,304 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later
++ * Optional two-endpoint IEC61937 output. Included only by ao_wasapi.c.
++ * All COM objects, stream cursors and scheduling state live on AudioThread.
++ * Never resample, discard or duplicate portions of a compressed burst.
++ */
++struct wasapi_dual {
++    struct ao secondary_ao;
++    struct wasapi_state secondary;
++    unsigned char *ring;
++    uint64_t produced, cursor[2];
++    size_t capacity, stride;
++    bool running, started[2], failed;
++    bool exhausted;
++    uint64_t valid_end;
++    int64_t start_at[2], paused_at, last_report;
++    double skew_ms;
++    const char *error;
++};
++
++static struct wasapi_state *dual_endpoint(struct ao *ao, int i)
++{
++    struct wasapi_state *s = ao->priv;
++    return i ? &s->dual->secondary : s;
++}
++
++static void dual_fail(struct ao *ao, const char *error)
++{
++    struct wasapi_state *s = ao->priv;
++    struct wasapi_dual *d = s->dual;
++    if (d->failed)
++        return;
++    d->failed = true;
++    d->error = error;
++    d->running = false;
++    ao_set_draining(ao, false);
++    for (int i = 0; i < 2; i++) {
++        struct wasapi_state *e = dual_endpoint(ao, i);
++        if (e->pAudioClient)
++            IAudioClient_Stop(e->pAudioClient);
++        d->started[i] = false;
++    }
++    MP_ERR(ao, "Dual bitstream stopped: %s. Fix the devices and reload audio.\n", error);
++}
++
++static bool dual_init(struct ao *ao)
++{
++    struct wasapi_state *s = ao->priv;
++    if (!s->opt_secondary_device || !s->opt_secondary_device[0])
++        return true;
++    struct wasapi_dual *d = s->dual = talloc_zero(s, struct wasapi_dual);
++    struct ao *other = &d->secondary_ao;
++    struct wasapi_state *e = &d->secondary;
++    // Only the format/device fields are used by wasapi_thread_init. This is
++    // deliberately NOT a second mpv AO or a second decoder/buffer_state.
++    other->priv = e;
++    other->log = e->log = ao->log;
++    other->format = ao->format;
++    other->samplerate = ao->samplerate;
++    other->channels = ao->channels;
++    other->client_name = ao->client_name;
++    other->device = s->opt_secondary_device;
++    if (strncmp(other->device, "wasapi/", 7) == 0)
++        other->device += 7;
++    e->strict_bitstream = true;
++    e->opt_exclusive = true;
++    e->opt_exclusive_buffer = s->opt_exclusive_buffer;
++    e->deviceID = wasapi_find_deviceID(other);
++    if (!e->deviceID || (s->deviceID && !wcscmp(s->deviceID, e->deviceID))) {
++        MP_ERR(ao, "Dual bitstream requires two different, available WASAPI devices.\n");
++        return false;
++    }
++    e->hWake = CreateEventW(NULL, FALSE, FALSE, NULL);
++    if (!e->hWake || !wasapi_thread_init(other)) {
++        MP_ERR(ao, "Secondary device cannot open this bitstream in exclusive mode.\n");
++        return false;
++    }
++    if (memcmp(&s->format, &e->format, sizeof(s->format)) != 0 ||
++        s->share_mode != AUDCLNT_SHAREMODE_EXCLUSIVE ||
++        e->share_mode != AUDCLNT_SHAREMODE_EXCLUSIVE ||
++        ao_need_conversion(&s->convert_format) ||
++        ao_need_conversion(&e->convert_format)) {
++        MP_ERR(ao, "Dual bitstream requires identical, unconverted carrier formats.\n");
++        return false;
++    }
++    d->stride = s->format.Format.nBlockAlign;
++    // The core must prebuffer enough for either endpoint, not just primary.
++    ao->device_buffer = MPMAX(s->bufferFrameCount, e->bufferFrameCount) +
++                        (int64_t)ao->samplerate * abs(s->opt_secondary_delay) / 1000;
++    // Bounded storage accommodates different driver periods and +/-1s delay.
++    d->capacity = 4ull * ao->samplerate +
++                  4ull * MPMAX(s->bufferFrameCount, e->bufferFrameCount);
++    d->ring = talloc_size(d, d->capacity * d->stride);
++    if (!d->ring)
++        return false;
++    MP_INFO(ao, "Dual bitstream ready: %s, %d Hz, buffers %u/%u frames, offset %+d ms.\n",
++            af_fmt_to_str(ao->format), ao->samplerate,
++            s->bufferFrameCount, e->bufferFrameCount, s->opt_secondary_delay);
++    return true;
++}
++
++static void dual_uninit(struct ao *ao)
++{
++    struct wasapi_state *s = ao->priv;
++    if (!s->dual)
++        return;
++    struct wasapi_dual *d = s->dual;
++    wasapi_thread_uninit(&d->secondary_ao);
++    SAFE_DESTROY(d->secondary.hWake, CloseHandle(d->secondary.hWake));
++    talloc_free(d->secondary.deviceID);
++    talloc_free(d);
++    s->dual = NULL;
++}
++
++static bool dual_copy(struct ao *ao, int i, BYTE *dst, UINT32 frames)
++{
++    struct wasapi_state *s = ao->priv;
++    struct wasapi_dual *d = s->dual;
++    uint64_t end = d->cursor[i] + frames;
++    uint64_t oldest = MPMIN(d->cursor[0], d->cursor[1]);
++    if (end - oldest > d->capacity) {
++        dual_fail(ao, "endpoint queues diverged beyond the safety limit");
++        return false;
++    }
++    while (d->produced < end) {
++        size_t offset = d->produced % d->capacity;
++        int n = MPMIN(end - d->produced, d->capacity - offset);
++        double delay_ns = 0;
++        // Forecast the primary playback time even if secondary asks ahead.
++        if (d->started[0]) {
++            if (FAILED(get_device_delay(s, &delay_ns))) {
++                dual_fail(ao, "primary audio clock unavailable");
++                return false;
++            }
++        } else {
++            delay_ns = atomic_load(&s->sample_count) * 1e9 / ao->samplerate;
++            delay_ns += MPMAX(0, d->start_at[0] - mp_time_ns());
++        }
++        int64_t ahead = (int64_t)(d->produced + n) -
++                        (int64_t)atomic_load(&s->sample_count);
++        delay_ns += ahead * 1e9 / ao->samplerate;
++        void *data[] = {d->ring + offset * d->stride};
++        if (d->exhausted) {
++            memset(data[0], 0, n * d->stride);
++        } else {
++            int got = ao_read_data(ao, data, n, mp_time_ns() + llrint(delay_ns), NULL, true, true);
++            d->valid_end = d->produced + got;
++            d->exhausted = got < n;
++        }
++        d->produced += n;
++    }
++    size_t offset = d->cursor[i] % d->capacity;
++    size_t first = MPMIN(frames, d->capacity - offset);
++    memcpy(dst, d->ring + offset * d->stride, first * d->stride);
++    memcpy(dst + first * d->stride, d->ring, (frames - first) * d->stride);
++    d->cursor[i] = end;
++    return true;
++}
++
++static bool dual_feed(struct ao *ao, int i)
++{
++    struct wasapi_state *s = ao->priv;
++    struct wasapi_dual *d = s->dual;
++    struct wasapi_state *e = dual_endpoint(ao, i);
++    if (d->failed || !d->running)
++        return false;
++    UINT32 padding;
++    HRESULT hr = IAudioClient_GetCurrentPadding(e->pAudioClient, &padding);
++    if (FAILED(hr)) {
++        dual_fail(ao, "device removed or padding query failed");
++        return false;
++    }
++    UINT32 frames = e->bufferFrameCount;
++    if (padding >= 2 * frames)
++        return false;
++    BYTE *data;
++    hr = IAudioRenderClient_GetBuffer(e->pRenderClient, frames, &data);
++    if (FAILED(hr)) {
++        dual_fail(ao, "cannot acquire endpoint buffer");
++        return false;
++    }
++    bool ok = dual_copy(ao, i, data, frames);
++    hr = IAudioRenderClient_ReleaseBuffer(e->pRenderClient, frames,
++                                         ok ? 0 : AUDCLNT_BUFFERFLAGS_SILENT);
++    if (FAILED(hr)) {
++        dual_fail(ao, "cannot submit endpoint buffer");
++        return false;
++    }
++    if (ok)
++        atomic_fetch_add(&e->sample_count, frames);
++    return ok && padding < frames;
++}
++
++static void dual_pause(struct ao *ao)
++{
++    struct wasapi_state *s = ao->priv;
++    struct wasapi_dual *d = s->dual;
++    if (!d->running)
++        return;
++    d->paused_at = mp_time_ns();
++    d->running = false;
++    for (int i = 0; i < 2; i++) {
++        if (d->started[i] && FAILED(IAudioClient_Stop(dual_endpoint(ao, i)->pAudioClient)))
++            dual_fail(ao, "cannot pause endpoint");
++        d->started[i] = false;
++    }
++}
++
++static void dual_reset(struct ao *ao)
++{
++    struct wasapi_state *s = ao->priv;
++    struct wasapi_dual *d = s->dual;
++    dual_pause(ao);
++    for (int i = 0; i < 2; i++) {
++        struct wasapi_state *e = dual_endpoint(ao, i);
++        if (FAILED(IAudioClient_Reset(e->pAudioClient)))
++            dual_fail(ao, "cannot reset endpoint");
++        atomic_store(&e->sample_count, 0);
++        d->cursor[i] = 0;
++        d->start_at[i] = 0;
++    }
++    d->produced = 0;
++    d->skew_ms = 0;
++    d->exhausted = false;
++    d->valid_end = 0;
++    ao_set_draining(ao, false);
++}
++
++static void dual_tick(struct ao *ao)
++{
++    struct wasapi_state *s = ao->priv;
++    struct wasapi_dual *d = s->dual;
++    if (!d->running || d->failed)
++        return;
++    int64_t now = mp_time_ns();
++    for (int i = 0; i < 2; i++) {
++        if (!d->started[i] && now >= d->start_at[i]) {
++            if (FAILED(IAudioClient_Start(dual_endpoint(ao, i)->pAudioClient))) {
++                dual_fail(ao, "cannot start endpoint");
++                return;
++            }
++            d->started[i] = true;
++        }
++    }
++    if (!d->started[0] || !d->started[1])
++        return;
++    double played[2];
++    for (int i = 0; i < 2; i++) {
++        struct wasapi_state *e = dual_endpoint(ao, i);
++        UINT64 pos, qpc;
++        if (FAILED(IAudioClock_GetPosition(e->pAudioClock, &pos, &qpc))) {
++            dual_fail(ao, "endpoint clock unavailable");
++            return;
++        }
++        played[i] = 1000.0 * pos / e->clock_frequency;
++    }
++    d->skew_ms = played[1] - played[0] + s->opt_secondary_delay;
++    if (d->exhausted && MPMIN(played[0], played[1]) * ao->samplerate / 1000.0 >= d->valid_end) {
++        dual_pause(ao);
++        ao_set_draining(ao, false);
++        return;
++    }
++    // Correct clock drift only by briefly stopping the leading transport.
++    // Queued bytes and burst alignment survive Stop/Start. This may cause a
++    // receiver re-lock; never corrupt compressed data to hide that possibility.
++    if (fabs(d->skew_ms) > 30) {
++        int lead = d->skew_ms > 0 ? 1 : 0;
++        if (FAILED(IAudioClient_Stop(dual_endpoint(ao, lead)->pAudioClient))) {
++            dual_fail(ao, "cannot correct endpoint clock drift");
++            return;
++        }
++        d->started[lead] = false;
++        d->start_at[lead] = now + (int64_t)((fabs(d->skew_ms) - 5) * 1e6);
++        MP_WARN(ao, "Dual bitstream clock correction: skew %+.1f ms, holding %s.\n",
++                d->skew_ms, lead ? "secondary" : "primary");
++    }
++    if (now - d->last_report >= MP_TIME_S_TO_NS(30)) {
++        d->last_report = now;
++        MP_VERBOSE(ao, "Dual bitstream clock skew %+.2f ms; queues %llu/%llu.\n",
++                   d->skew_ms, (unsigned long long)d->cursor[0],
++                   (unsigned long long)d->cursor[1]);
++    }
++}
++
++static void dual_unpause(struct ao *ao, bool fresh)
++{
++    struct wasapi_state *s = ao->priv;
++    struct wasapi_dual *d = s->dual;
++    if (d->failed)
++        return;
++    int64_t now = mp_time_ns();
++    if (fresh) {
++        d->start_at[0] = now + MPMAX(0, -s->opt_secondary_delay) * 1000000ll;
++        d->start_at[1] = now + MPMAX(0, s->opt_secondary_delay) * 1000000ll;
++    } else {
++        for (int i = 0; i < 2; i++)
++            d->start_at[i] = now + MPMAX(0, d->start_at[i] - d->paused_at);
++    }
++    d->running = true;
++    if (fresh)
++        ao_set_draining(ao, true);
++    for (int i = 0; i < 2; i++)
++        dual_feed(ao, i);
++    dual_tick(ao);
++}
