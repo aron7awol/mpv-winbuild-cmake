@@ -1,0 +1,618 @@
+From b3ef0eb4a49ddea3e1d4cc5481b5c3a2da69ee7a Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Mon, 7 Sep 2026 12:22:05 -0400
+Subject: [PATCH] gpu-next: add asynchronous Analyzer source/output telemetry
+
+---
+ player/command.c                   |  54 ++++++++
+ video/out/analyzer_async_bridge.h  | 195 +++++++++++++++++++++++++++++
+ video/out/analyzer_frame_bridge.h  |  90 +++++++++++++
+ video/out/analyzer_frame_math.h    |   2 +
+ video/out/analyzer_output_bridge.h |  68 ++++++++++
+ video/out/vo.c                     |   2 +
+ video/out/vo.h                     |  11 ++
+ video/out/vo_gpu_next.c            |  31 +++++
+ 8 files changed, 453 insertions(+)
+ create mode 100644 video/out/analyzer_async_bridge.h
+ create mode 100644 video/out/analyzer_frame_bridge.h
+ create mode 100644 video/out/analyzer_frame_math.h
+ create mode 100644 video/out/analyzer_output_bridge.h
+
+diff --git a/player/command.c b/player/command.c
+index e7671b7d6..859f65d64 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -2770,6 +2770,59 @@ static int mp_property_video_active_image(void *ctx, struct m_property *prop,
+                                image.active_w, image.active_h, ratio);
+     struct m_sub_property props[] = {
+         {"width",               SUB_PROP_INT(image.active_w)},
++static int mp_property_async_probe(void *ctx, struct m_property *prop, int action, void *arg)
++{
++    MPContext *mpctx = ctx;
++    struct voctrl_async_probe v = {0};
++    struct vo *vo = mpctx->video_out;
++    if (!vo) return M_PROPERTY_UNAVAILABLE;
++    mp_mutex_lock(&vo->async_probe_mutex);
++    v = vo->async_probe_snapshot;
++    mp_mutex_unlock(&vo->async_probe_mutex);
++    vo_wakeup(vo); // Request a future zero-timeout poll; never wait for the VO thread.
++    if (!v.sequence) return M_PROPERTY_UNAVAILABLE;
++    char *hist = talloc_strdup(NULL, "");
++    // Fixed upper bound avoids quadratic realloc/copy when Lua polls histograms.
++    char *frame = talloc_zero_size(NULL, 16384);
++    char *output_frame = talloc_zero_size(NULL, 16384);
++    if (v.mode==3 && v.stats_ns) for(int stage=0;stage<2;stage++) {
++        char *text=stage ? output_frame : frame;
++        int offset=stage ? 576 : 16;
++        size_t used=0;
++        for(int i=0;i<532;i++) {
++            int n=snprintf(text+used,16384-used,"%s%.9g",i?",":"",v.values[offset+i]);
++            if(n<0 || (size_t)n>=16384-used){text[0]=0;break;}
++            used+=n;
++        }
++    }
++    if (v.mode == 2) for (int i = 4; i < 260; i++)
++        hist = talloc_asprintf_append(hist, "%s%.0f", i == 4 ? "" : ",", v.values[i]);
++    struct m_sub_property props[] = {
++        {"sequence", SUB_PROP_INT64(v.sequence)}, {"skipped", SUB_PROP_INT64(v.skipped)},
++        {"x", SUB_PROP_INT(v.x)}, {"y", SUB_PROP_INT(v.y)}, {"mode", SUB_PROP_INT(v.mode)},
++        {"ready-ms", SUB_PROP_DOUBLE(v.ready_ms)},
++        {"age-ms", SUB_PROP_DOUBLE((mp_time_ns() - v.submitted_ns) / 1e6)},
++        {"r", SUB_PROP_DOUBLE(v.values[0])}, {"g", SUB_PROP_DOUBLE(v.values[1])},
++        {"b", SUB_PROP_DOUBLE(v.values[2])}, {"histogram", SUB_PROP_STR(hist)},
++        {"Y", SUB_PROP_DOUBLE(v.values[3])}, {"P", SUB_PROP_DOUBLE(v.values[4])},
++        {"cx", SUB_PROP_DOUBLE(v.values[5])}, {"cy", SUB_PROP_DOUBLE(v.values[6])},
++        {"gamut", SUB_PROP_INT((int)v.values[7])}, {"de", SUB_PROP_DOUBLE(v.values[8])},
++        {"sdr", SUB_PROP_BOOL(v.values[9] > .5f)}, {"chromatic", SUB_PROP_BOOL(v.values[10] > .5f)},
++        {"valid", SUB_PROP_BOOL(v.values[11] > .5f)},
++        {"output-r", SUB_PROP_DOUBLE(v.values[548])}, {"output-g", SUB_PROP_DOUBLE(v.values[549])},
++        {"output-b", SUB_PROP_DOUBLE(v.values[550])}, {"output-Y", SUB_PROP_DOUBLE(v.values[551])},
++        {"output-P", SUB_PROP_DOUBLE(v.values[552])}, {"output-valid", SUB_PROP_BOOL(v.values[553] > .5f)},
++        {"frame", SUB_PROP_STR(frame)}, {"frame-age-ms", SUB_PROP_DOUBLE(v.stats_ns ? (mp_time_ns()-v.stats_ns)/1e6 : -1)},
++        {"output-frame", SUB_PROP_STR(output_frame)},
++        {"frame-sequence", SUB_PROP_INT64(v.stats_ns)}, {0}
++    };
++    int ret = m_property_read_sub(props, action, arg);
++    talloc_free(hist);
++    talloc_free(frame);
++    talloc_free(output_frame);
++    return ret;
++}
++
+         {"height",              SUB_PROP_INT(image.active_h)},
+         {"ratio",               SUB_PROP_DOUBLE(ratio)},
+         {"source-width",        SUB_PROP_INT(image.source_w)},
+@@ -4884,6 +4937,7 @@ static const struct m_property mp_properties_base[] = {
+     {"current-vo", mp_property_vo},
+     {"current-gpu-context", mp_property_gpu_context},
+     {"container-fps", mp_property_fps},
++    {"analyzer-async-result", mp_property_async_probe},
+     {"estimated-vf-fps", mp_property_vf_fps},
+     {"video-aspect-override", mp_property_video_aspect_override},
+     {"vid", mp_property_switch_track, .priv = (void *)(const int[]){0, STREAM_VIDEO}},
+diff --git a/video/out/analyzer_async_bridge.h b/video/out/analyzer_async_bridge.h
+new file mode 100644
+index 000000000..7222c179f
+--- /dev/null
++++ b/video/out/analyzer_async_bridge.h
+@@ -0,0 +1,195 @@
++/* Experimental, included by vo_gpu_next.c after gl_next_opts. Not a release patch. */
++struct async_probe_slot {
++    pl_buf buf;
++    pl_buf scratch;
++    pl_buf output_scratch;
++    pl_tex output_linear;
++    bool pending;
++    struct voctrl_async_probe meta;
++};
++struct async_probe {
++    struct pl_hook hook;
++    struct pl_hook_params output;
++    bool output_valid;
++    uint64_t render_revision, last_render_revision;
++    struct pl_color_space last_output_color;
++    pl_rect2df last_output_rect;
++    struct async_probe_slot slots[4];
++    struct voctrl_async_probe latest;
++    int64_t sequence, skipped;
++    uint64_t last_stats_revision, last_stats_parameters;
++    const struct pl_hook *last_stats_hook;
++};
++
++#include "analyzer_frame_bridge.h"
++#include "analyzer_output_bridge.h"
++
++static void async_probe_collect(struct priv *p)
++{
++    struct async_probe *a = p->async_probe;
++    if (!a) return;
++    for (int i = 0; i < 4; i++) {
++        struct async_probe_slot *s = &a->slots[i];
++        if (!s->pending || pl_buf_poll(p->gpu, s->buf, 0)) continue;
++        float values[1120] = {0};
++        size_t size = s->meta.mode == 3 ? sizeof(values) : s->meta.mode == 2 ? 260 * sizeof(float) : 4 * sizeof(float);
++        if (pl_buf_read(p->gpu, s->buf, 0, values, size) &&
++            s->meta.mode == p->next_opts->analyzer_async) {
++            // Frame and cursor snapshots have independent cadences. A newer
++            // cursor slot must not discard an older newly completed frame job.
++            if(s->meta.stats_ns > a->latest.stats_ns) {
++                memcpy(a->latest.values+16,values+16,(548-16)*sizeof(float));
++                memcpy(a->latest.values+576,values+576,532*sizeof(float));
++                a->latest.stats_ns=s->meta.stats_ns;
++            }
++            if(s->meta.sequence <= a->latest.sequence) {s->pending=false;continue;}
++            if (s->meta.mode==3 && !s->meta.stats_ns) {
++                memcpy(values+16,a->latest.values+16,(548-16)*sizeof(float));
++                memcpy(values+576,a->latest.values+576,532*sizeof(float));
++                s->meta.stats_ns=a->latest.stats_ns;
++            }
++            a->latest = s->meta;
++            memcpy(a->latest.values, values, sizeof(values));
++            a->latest.ready_ms = (mp_time_ns() - s->meta.submitted_ns) / 1e6;
++        }
++        s->pending = false;
++    }
++    a->latest.skipped = a->skipped;
++    struct vo *vo = a->hook.priv;
++    mp_mutex_lock(&vo->async_probe_mutex);
++    vo->async_probe_snapshot = p->next_opts->analyzer_async ? a->latest : (struct voctrl_async_probe){0};
++    mp_mutex_unlock(&vo->async_probe_mutex);
++}
++
++static struct pl_hook_res async_probe_hook(void *priv, const struct pl_hook_params *hp)
++{
++    struct vo *vo = priv;
++    struct priv *p = vo->priv;
++    struct async_probe *a = p->async_probe;
++    if (hp->stage == PL_HOOK_PRE_OUTPUT) {
++        // Borrowed only until OUTPUT in this same render; never between frames.
++        a->output = *hp;
++        a->output_valid = true;
++        return (struct pl_hook_res){0};
++    }
++    async_probe_collect(p);
++    int x, y, hover;
++    mp_input_get_mouse_pos(vo->input_ctx, &x, &y, &hover);
++    int w = mp_rect_w(p->dst), h = mp_rect_h(p->dst);
++    if (w<=0 || h<=0) return (struct pl_hook_res){0};
++    if (p->next_opts->analyzer_async!=3 && (!hover || x < p->dst.x0 || x >= p->dst.x1 ||
++        y < p->dst.y0 || y >= p->dst.y1)) return (struct pl_hook_res){0};
++    struct async_probe_slot *s = NULL;
++    for (int i = 0; i < 4; i++) if (!a->slots[i].pending) { s = &a->slots[i]; break; }
++    if (!s) { a->skipped++; return (struct pl_hook_res){0}; }
++    if (!s->buf) s->buf = pl_buf_create(p->gpu, pl_buf_params(
++        .size = 1120 * sizeof(float), .memory_type = PL_BUF_MEM_DEVICE,
++        .host_readable = true, .storable = true));
++    if (!s->buf) return (struct pl_hook_res){0};
++    float pos[] = {
++        (hp->rect.x0 + (x - p->dst.x0 + .5f) / w * (hp->rect.x1-hp->rect.x0)) / hp->tex->params.w,
++        (hp->rect.y0 + (y - p->dst.y0 + .5f) / h * (hp->rect.y1-hp->rect.y0)) / hp->tex->params.h};
++    struct pl_shader_var vars[] = {{.var = pl_var_vec2("probe_pos"), .data = pos, .dynamic = true}};
++    struct pl_buffer_var bv = {
++        .var = {.name = "samples", .type = PL_VAR_FLOAT, .dim_v = 4, .dim_m = 1, .dim_a = 140},
++        .layout = {.offset = 0, .stride = 16, .size = 2240},
++    };
++    pl_tex texture = hp->tex;
++    const struct pl_hook *source_hook=NULL;
++    if (p->next_opts->analyzer_async == 3) {
++        texture = NULL;
++        for (int i = 0; i < p->num_user_hooks && !texture; i++) {
++            bool active = false;
++            for (int j = 0; j < p->pars->params.num_hooks; j++)
++                active |= p->pars->params.hooks[j] == p->user_hooks[i].hook;
++            if (active) {
++                texture = pl_mpv_user_shader_saved_texture(p->user_hooks[i].hook, "ANALYZER_METRICS");
++                if (texture) source_hook=p->user_hooks[i].hook;
++            }
++        }
++        if (!texture) return (struct pl_hook_res){0};
++    }
++    struct pl_shader_desc desc[] = {
++        {.desc = {.name = "probe_tex", .type = PL_DESC_SAMPLED_TEX},
++         .binding = {.object = texture, .address_mode = PL_TEX_ADDRESS_CLAMP, .sample_mode = PL_TEX_SAMPLE_NEAREST}},
++        {.desc = {.name = "ProbeData", .type = PL_DESC_BUF_STORAGE, .access = PL_DESC_ACCESS_WRITEONLY},
++         .binding.object = s->buf, .buffer_vars = &bv, .num_buffer_vars = 1},
++    };
++    /* Single small invocation: deliberately simple transport benchmark, not production histogram code. */
++    const char *body = p->next_opts->analyzer_async == 3 ?
++        "for(int i=0;i<4;i++) samples[i]=vec4(0); for(int i=137;i<140;i++)samples[i]=vec4(0);"
++        "for(int i=0;i<12;i++){uvec4 b=uvec4(texelFetch(probe_tex,ivec2(i,0),0)+0.5);"
++        "samples[i/4][i%4]=uintBitsToFloat(b.x|(b.y<<8u)|(b.z<<16u)|(b.w<<24u));}" :
++        p->next_opts->analyzer_async == 2 ?
++        "float hist[256]; for(int i=0;i<256;i++) hist[i]=0.0;"
++        "for(int y=0;y<36;y++) for(int x=0;x<64;x++){"
++        "vec3 c=textureLod(probe_tex,(vec2(x,y)+0.5)/vec2(64,36),0.0).rgb;"
++        "int b=int(clamp(max(c.r,max(c.g,c.b)),0.0,1.0)*255.0); hist[b]+=1.0;}"
++        "for(int i=0;i<64;i++) samples[i+1]=vec4(hist[4*i],hist[4*i+1],hist[4*i+2],hist[4*i+3]);"
++        "samples[0]=textureLod(probe_tex,probe_pos,0.0);" :
++        "samples[0]=textureLod(probe_tex,probe_pos,0.0);";
++    pl_shader sh = pl_dispatch_begin(hp->dispatch);
++    int64_t submitted = mp_time_ns();
++    bool ok = pl_shader_custom(sh, &(struct pl_custom_shader){
++        .description = "experimental async Analyzer readback", .body = body,
++        .input = PL_SHADER_SIG_NONE, .output = PL_SHADER_SIG_NONE,
++        .variables = vars, .num_variables = 1,
++        .descriptors = desc, .num_descriptors = 2,
++        .compute = true, .compute_group_size = {1, 1},
++    }) && pl_dispatch_compute(hp->dispatch, pl_dispatch_compute_params(
++        .shader = &sh, .dispatch_size = {1, 1, 1}));
++    if (!ok) { pl_dispatch_abort(hp->dispatch, &sh); return (struct pl_hook_res){0}; }
++    if (source_hook && a->output_valid)
++        async_output_pixel(p, &a->output, s, x, y);
++    s->meta = (struct voctrl_async_probe){.sequence = ++a->sequence,
++        .submitted_ns = submitted, .x = x, .y = y, .mode = p->next_opts->analyzer_async};
++    if (source_hook) {
++        uint64_t revision=pl_mpv_user_shader_saved_revision(source_hook,"ANALYZER_LINEAR");
++        uint64_t parameters=1469598103934665603ULL;
++        for (int i=0;i<source_hook->num_parameters;i++) {
++            const struct pl_hook_par *param=&source_hook->parameters[i];
++            if (strncmp(param->name,"source_",7) && strcmp(param->name,"sdr_reference_peak")) continue;
++            uint32_t bits; memcpy(&bits,param->data,sizeof(bits));
++            parameters=(parameters^bits)*1099511628211ULL;
++        }
++        bool changed=revision!=a->last_stats_revision || parameters!=a->last_stats_parameters || source_hook!=a->last_stats_hook ||
++            a->render_revision!=a->last_render_revision || !pl_color_space_equal(&a->output.color,&a->last_output_color) ||
++            memcmp(&a->output.rect,&a->last_output_rect,sizeof(a->output.rect));
++        if (revision && changed && a->output_valid &&
++            async_frame_dispatch(p,hp,s,source_hook,NULL,0) &&
++            async_output_frame(p,&a->output,s,source_hook)) {
++            s->meta.stats_ns=submitted;
++            a->last_stats_revision=revision;
++            a->last_stats_parameters=parameters;
++            a->last_stats_hook=source_hook;
++            a->last_render_revision=a->render_revision;
++            a->last_output_color=a->output.color;
++            a->last_output_rect=a->output.rect;
++        }
++    }
++    a->output_valid = false;
++    s->pending = true;
++    return (struct pl_hook_res){0};
++}
++
++static const struct pl_hook *async_probe_init(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    if (!p->async_probe) {
++        p->async_probe = talloc_zero(p, struct async_probe);
++        p->async_probe->hook = (struct pl_hook){.stages = PL_HOOK_PRE_OUTPUT | PL_HOOK_OUTPUT,
++            .input = PL_HOOK_SIG_TEX, .priv = vo, .hook = async_probe_hook};
++    }
++    return &p->async_probe->hook;
++}
++
++static void async_probe_destroy(struct priv *p)
++{
++    if (!p->async_probe) return;
++    for (int i = 0; i < 4; i++) {
++        pl_buf_destroy(p->gpu, &p->async_probe->slots[i].buf);
++        pl_buf_destroy(p->gpu, &p->async_probe->slots[i].scratch);
++        pl_buf_destroy(p->gpu, &p->async_probe->slots[i].output_scratch);
++        pl_tex_destroy(p->gpu, &p->async_probe->slots[i].output_linear);
++    }
++}
+diff --git a/video/out/analyzer_frame_bridge.h b/video/out/analyzer_frame_bridge.h
+new file mode 100644
+index 000000000..e9cd6af03
+--- /dev/null
++++ b/video/out/analyzer_frame_bridge.h
+@@ -0,0 +1,90 @@
++/* GPU full-frame reductions. All dispatches and buffer ownership stay on VO thread. */
++#include "analyzer_frame_math.h"
++static float frame_parameter(const struct pl_hook *hook, const char *name)
++{
++    for (int i=0;i<hook->num_parameters;i++) {
++        const struct pl_hook_par *par=&hook->parameters[i];
++        if (!strcmp(par->name,name)) return par->type==PL_VAR_FLOAT ? par->data->f : par->data->i;
++    }
++    return 0;
++}
++
++static bool async_frame_dispatch(struct priv *p, const struct pl_hook_params *hp,
++                                 struct async_probe_slot *slot, const struct pl_hook *hook,
++                                 pl_tex output, int offset)
++{
++    pl_tex source=output ? output : pl_mpv_user_shader_saved_texture(hook,"ANALYZER_LINEAR");
++    if (!source) return false;
++    int w=source->params.w, h=source->params.h;
++    size_t scratch_size=2048+(size_t)h*48;
++    pl_buf *scratch=output ? &slot->output_scratch : &slot->scratch;
++    if (*scratch && (*scratch)->params.size!=scratch_size)
++        pl_buf_destroy(p->gpu,scratch);
++    if (!*scratch) *scratch=pl_buf_create(p->gpu,pl_buf_params(
++        .size=scratch_size,.memory_type=PL_BUF_MEM_DEVICE,.storable=true,.host_writable=true));
++    if (!*scratch) return false;
++    uint32_t zero[512]={0};
++    pl_buf_write(p->gpu,*scratch,0,zero,sizeof(zero));
++    float matrix[9], ycoeff[3];
++    for(int i=0;i<9;i++) { char name[40]; snprintf(name,sizeof(name),"source_to_bt2020_%d",i); matrix[i]=frame_parameter(hook,name); }
++    for(int i=0;i<3;i++) { char name[40]; snprintf(name,sizeof(name),"source_cie_y_%d",i); ycoeff[i]=frame_parameter(hook,name); }
++    float scale=frame_parameter(hook,"source_is_sdr") ? frame_parameter(hook,"sdr_reference_peak") :
++        (frame_parameter(hook,"source_is_absolute") || frame_parameter(hook,"source_is_hlg")) ? 203.f : 100.f;
++    if (output) {
++        const struct pl_raw_primaries *prim=pl_raw_primaries_get(hp->color.primaries);
++        pl_matrix3x3 xyz=pl_get_rgb2xyz_matrix(prim);
++        pl_matrix3x3 map=pl_get_color_mapping_matrix(prim,pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020),PL_INTENT_RELATIVE_COLORIMETRIC);
++        for(int i=0;i<3;i++){ycoeff[i]=xyz.m[1][i];for(int j=0;j<3;j++)matrix[3*j+i]=map.m[i][j];}
++        scale=203.f;
++    }
++    struct pl_shader_var vars[]={
++        {.var={.name="to2020",.type=PL_VAR_FLOAT,.dim_v=3,.dim_m=3,.dim_a=1},.data=matrix,.dynamic=true},
++        {.var=pl_var_vec3("ycoeff"),.data=ycoeff,.dynamic=true},
++        {.var=pl_var_float("nits_scale"),.data=&scale,.dynamic=true},
++    };
++    struct pl_buffer_var scratch_vars[]={
++        {.var={.name="bins",.type=PL_VAR_UINT,.dim_v=1,.dim_m=1,.dim_a=512},.layout={.offset=0,.stride=4,.size=2048}},
++        {.var={.name="rows",.type=PL_VAR_FLOAT,.dim_v=4,.dim_m=1,.dim_a=h*3},.layout={.offset=2048,.stride=16,.size=(size_t)h*48}},
++    };
++    struct pl_shader_desc desc[]={
++        {.desc={.name="frame_tex",.type=PL_DESC_SAMPLED_TEX},.binding={.object=source,.address_mode=PL_TEX_ADDRESS_CLAMP,.sample_mode=PL_TEX_SAMPLE_NEAREST}},
++        {.desc={.name="FrameScratch",.type=PL_DESC_BUF_STORAGE,.access=PL_DESC_ACCESS_READWRITE},.binding.object=*scratch,.buffer_vars=scratch_vars,.num_buffer_vars=2},
++    };
++    char *header=talloc_asprintf(NULL,"%s\nshared vec3 mn[64], mx[64], sm[64];\nshared uint hist[512];\n",frame_math);
++    const char *body=
++        "int lane=int(gl_LocalInvocationID.x), y=int(gl_WorkGroupID.y); ivec2 sz=textureSize(frame_tex,0);"
++        "for(int i=lane;i<512;i+=64) hist[i]=0u; barrier();"
++        "vec3 lo=vec3(1e30), hi=vec3(0), sum=vec3(0);"
++        "for(int x=lane;x<sz.x;x+=64){vec3 c=texelFetch(frame_tex,ivec2(x,y),0).rgb;"
++        "vec3 v=vec3(max(dot(ycoeff,c),0.0),max(perceptual_bt2020(to2020*c),0.0),max(max(c.r,c.g),max(c.b,0.0)))*nits_scale;"
++        "lo=min(lo,v); hi=max(hi,v); sum+=v;"
++        "int bp=int(clamp(pq_encode_nits(v.y)*256.0,0.0,255.0));"
++        "int br=int(clamp(pq_encode_nits(v.z)*256.0,0.0,255.0));"
++        "atomicAdd(hist[bp],1u); atomicAdd(hist[256+br],1u);}"
++        "mn[lane]=lo; mx[lane]=hi; sm[lane]=sum; barrier();"
++        "for(int step=32;step>0;step/=2){if(lane<step){mn[lane]=min(mn[lane],mn[lane+step]);mx[lane]=max(mx[lane],mx[lane+step]);sm[lane]+=sm[lane+step];}barrier();}"
++        "if(lane==0){rows[3*y]=vec4(mn[0],0);rows[3*y+1]=vec4(mx[0],0);rows[3*y+2]=vec4(sm[0],0);}"
++        "for(int i=lane;i<512;i+=64) atomicAdd(bins[i],hist[i]);";
++    pl_shader sh=pl_dispatch_begin(hp->dispatch);
++    bool ok=pl_shader_custom(sh,&(struct pl_custom_shader){.description="Analyzer full source frame reduction",.header=header,.body=body,
++        .input=PL_SHADER_SIG_NONE,.output=PL_SHADER_SIG_NONE,.variables=vars,.num_variables=3,.descriptors=desc,.num_descriptors=2,
++        .compute=true,.compute_group_size={64,1}}) && pl_dispatch_compute(hp->dispatch,pl_dispatch_compute_params(.shader=&sh,.dispatch_size={1,h,1}));
++    talloc_free(header);
++    if(!ok){pl_dispatch_abort(hp->dispatch,&sh);return false;}
++    struct pl_buffer_var result_var={.var={.name="samples",.type=PL_VAR_FLOAT,.dim_v=4,.dim_m=1,.dim_a=140},.layout={.offset=(size_t)offset*4,.stride=16,.size=2240}};
++    desc[0]=(struct pl_shader_desc){.desc={.name="FrameResults",.type=PL_DESC_BUF_STORAGE,.access=PL_DESC_ACCESS_WRITEONLY},.binding.object=slot->buf,.buffer_vars=&result_var,.num_buffer_vars=1};
++    char *finish=talloc_asprintf(NULL,
++        "int lane=int(gl_LocalInvocationID.x);vec3 lo=vec3(1e30),hi=vec3(0),sum=vec3(0),correction=vec3(0);for(int y=lane;y<%d;y+=64){lo=min(lo,rows[3*y].rgb);hi=max(hi,rows[3*y+1].rgb);vec3 add=rows[3*y+2].rgb-correction;vec3 next=sum+add;correction=(next-sum)-add;sum=next;}"
++        "mn[lane]=lo;mx[lane]=hi;sm[lane]=sum;barrier();"
++        "for(int step=32;step>0;step/=2){if(lane<step){mn[lane]=min(mn[lane],mn[lane+step]);mx[lane]=max(mx[lane],mx[lane+step]);sm[lane]+=sm[lane+step];}barrier();}"
++        "if(lane==0){samples[4]=vec4(mn[0],0);samples[5]=vec4(clamp(sm[0]/%.1f,mn[0],mx[0]),0);samples[6]=vec4(mx[0],0);samples[136]=vec4(%d,%d,1,0);}"
++        "for(int i=lane;i<128;i+=64)samples[8+i]=vec4(bins[4*i],bins[4*i+1],bins[4*i+2],bins[4*i+3]);",h,(double)w*h,w,h);
++    sh=pl_dispatch_begin(hp->dispatch);
++    ok=pl_shader_custom(sh,&(struct pl_custom_shader){.description="Analyzer compact frame result",.body=finish,
++        .header="shared vec3 mn[64],mx[64],sm[64];",
++        .input=PL_SHADER_SIG_NONE,.output=PL_SHADER_SIG_NONE,.descriptors=desc,.num_descriptors=2,
++        .compute=true,.compute_group_size={64,1}}) && pl_dispatch_compute(hp->dispatch,pl_dispatch_compute_params(.shader=&sh,.dispatch_size={1,1,1}));
++    talloc_free(finish);
++    if(!ok)pl_dispatch_abort(hp->dispatch,&sh);
++    return ok;
++}
+diff --git a/video/out/analyzer_frame_math.h b/video/out/analyzer_frame_math.h
+new file mode 100644
+index 000000000..5bc520fbb
+--- /dev/null
++++ b/video/out/analyzer_frame_math.h
+@@ -0,0 +1,2 @@
++/* Generated from shipping Inspector; do not hand edit. */
++static const char frame_math[] = "float perceptual_bt2020(vec3 rgb)\n{\n    vec3 c=max(rgb,vec3(0)); float total=c.r+c.g+c.b;\n    if(total<=1e-12) return 0.0;\n    vec3 n=c/total; float w=n.b, p=n.r*n.g;\n    float q0=(((((((14.5330356895*w-25.5682414785)*w-13.7465695335)*w+56.3828756991)*w-42.760790975)*w+13.1725257153)*w-2.51283511691)*w+1.0);\n    float q1=(((((-31.3753030053*w-16.6730639549)*w+125.654298402)*w-103.378434394)*w+22.7623461176)*w-1.53706708322);\n    float q2=((140.435403979*w+97.2794791377)*w-114.074511803)*w+7.67118553227;\n    float q3=73.1408564899*w-38.0916687975;\n    return total*(((q3*p+q2)*p+q1)*p+q0);\n}\n\nfloat pq_encode_nits(float nits)\n{\n    const float m1=2610.0/16384.0, m2=2523.0/32.0;\n    const float c1=3424.0/4096.0, c2=2413.0/128.0, c3=2392.0/128.0;\n    float sign_n=nits<0.0 ? -1.0 : 1.0;\n    float p=pow(abs(nits)/10000.0,m1);\n    return sign_n*pow((c1+c2*p)/(1.0+c3*p),m2);\n}\n\n";
+diff --git a/video/out/analyzer_output_bridge.h b/video/out/analyzer_output_bridge.h
+new file mode 100644
+index 000000000..728a70d33
+--- /dev/null
++++ b/video/out/analyzer_output_bridge.h
+@@ -0,0 +1,68 @@
++#include <libplacebo/shaders/colorspace.h>
++#include <libplacebo/shaders/sampling.h>
++static bool async_output_frame(struct priv *p,const struct pl_hook_params *hp,
++                                struct async_probe_slot *slot,const struct pl_hook *hook)
++{
++    int w=(int)fabsf(hp->rect.x1-hp->rect.x0),h=(int)fabsf(hp->rect.y1-hp->rect.y0);
++    if(w<1 || h<1)return false;
++    // Keep measurement precision: renderer scratch textures are usually FP16
++    // and would make the frame maximum disagree with the direct pixel decode.
++    pl_fmt fmt=pl_find_fmt(p->gpu,PL_FMT_FLOAT,4,32,0,PL_FMT_CAP_SAMPLEABLE|PL_FMT_CAP_RENDERABLE);
++    if(!fmt || !pl_tex_recreate(p->gpu,&slot->output_linear,pl_tex_params(
++        .w=w,.h=h,.format=fmt,.sampleable=true,.renderable=true,
++        .storable=!!(fmt->caps&PL_FMT_CAP_STORABLE))))return false;
++    pl_tex tex=slot->output_linear;
++    pl_shader sh=pl_dispatch_begin(hp->dispatch);
++    bool ok=pl_shader_sample_direct(sh,pl_sample_src(.tex=hp->tex,.rect=hp->rect,.new_w=w,.new_h=h));
++    struct pl_color_repr repr=hp->repr;
++    pl_shader_decode_color_ex(sh,pl_color_decode_args(.repr=&repr));
++    pl_shader_linearize(sh,&hp->color);
++    ok=ok && pl_dispatch_finish(hp->dispatch,pl_dispatch_params(.shader=&sh,.target=tex));
++    if(!ok){pl_dispatch_abort(hp->dispatch,&sh);return false;}
++    return async_frame_dispatch(p,hp,slot,hook,tex,560);
++}
++/* Decode the post-color-management signal, before overlays/rotation/dither.
++ * No mapping is applied here: use the effective TARGET EOTF and primaries. */
++static bool async_output_pixel(struct priv *p, const struct pl_hook_params *hp,
++                               struct async_probe_slot *slot, int x, int y)
++{
++    struct vo *vo=p->async_probe->hook.priv;
++    float u=(x-p->dst.x0+.5f)/mp_rect_w(p->dst),v=(y-p->dst.y0+.5f)/mp_rect_h(p->dst);
++    int rotation=vo->params ? (vo->params->rotate%360+360)%360 : 0;
++    float ox=u,oy=v;
++    if(rotation==90){ox=v;oy=1-u;}
++    if(rotation==180){ox=1-u;oy=1-v;}
++    if(rotation==270){ox=1-v;oy=u;}
++    float pos[2] = {
++        (hp->rect.x0+ox*(hp->rect.x1-hp->rect.x0))/hp->tex->params.w,
++        (hp->rect.y0+oy*(hp->rect.y1-hp->rect.y0))/hp->tex->params.h};
++    const struct pl_raw_primaries *prim=pl_raw_primaries_get(hp->color.primaries);
++    pl_matrix3x3 xyz=pl_get_rgb2xyz_matrix(prim);
++    pl_matrix3x3 map=pl_get_color_mapping_matrix(prim,pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020),PL_INTENT_RELATIVE_COLORIMETRIC);
++    float matrix[9], ym[3];
++    for(int i=0;i<3;i++) {ym[i]=xyz.m[1][i];for(int j=0;j<3;j++)matrix[3*j+i]=map.m[i][j];}
++    struct pl_shader_var vars[]={
++        {.var=pl_var_vec2("out_pos"),.data=pos,.dynamic=true},
++        {.var=pl_var_vec3("out_y"),.data=ym,.dynamic=true},
++        {.var={.name="out_2020",.type=PL_VAR_FLOAT,.dim_v=3,.dim_m=3,.dim_a=1},.data=matrix,.dynamic=true}};
++    struct pl_buffer_var bv={.var={.name="out_samples",.type=PL_VAR_FLOAT,.dim_v=4,.dim_m=1,.dim_a=140},.layout={.offset=0,.stride=16,.size=2240}};
++    struct pl_shader_desc desc[]={
++        {.desc={.name="out_tex",.type=PL_DESC_SAMPLED_TEX},.binding={.object=hp->tex,.address_mode=PL_TEX_ADDRESS_CLAMP,.sample_mode=PL_TEX_SAMPLE_NEAREST}},
++        {.desc={.name="OutputPixel",.type=PL_DESC_BUF_STORAGE,.access=PL_DESC_ACCESS_WRITEONLY},.binding.object=slot->buf,.buffer_vars=&bv,.num_buffer_vars=1}};
++    pl_shader sh=pl_dispatch_begin(hp->dispatch);
++    bool ok=pl_shader_custom(sh,&(struct pl_custom_shader){
++        .description="Analyzer output pixel decode",.body="color=textureLod(out_tex,out_pos,0.0);",
++        .input=PL_SHADER_SIG_NONE,.output=PL_SHADER_SIG_COLOR,
++        .compute=true,.compute_group_size={1,1},.variables=vars,.num_variables=3,.descriptors=desc,.num_descriptors=2});
++    struct pl_color_repr repr=hp->repr;
++    pl_shader_decode_color_ex(sh,pl_color_decode_args(.repr=&repr));
++    pl_shader_linearize(sh,&hp->color);
++    ok=ok && pl_shader_custom(sh,&(struct pl_custom_shader){
++        .header=frame_math,
++        .body="vec3 rgb=color.rgb*203.0; out_samples[137]=vec4(rgb,dot(out_y,rgb));"
++              "out_samples[138]=vec4(perceptual_bt2020(out_2020*rgb),1,0,0);out_samples[139]=vec4(0);",
++        .input=PL_SHADER_SIG_COLOR,.output=PL_SHADER_SIG_NONE}) &&
++        pl_dispatch_compute(hp->dispatch,pl_dispatch_compute_params(.shader=&sh,.dispatch_size={1,1,1}));
++    if(!ok)pl_dispatch_abort(hp->dispatch,&sh);
++    return ok;
++}
+diff --git a/video/out/vo.c b/video/out/vo.c
+index f93f6cf97..dfea9efc2 100644
+--- a/video/out/vo.c
++++ b/video/out/vo.c
+@@ -258,6 +258,7 @@ static void dealloc_vo(struct vo *vo)
+     // These must be free'd before vo->in->dispatch.
+     talloc_free(vo->opts_cache);
+     mp_mutex_destroy(&vo->params_mutex);
++    mp_mutex_destroy(&vo->async_probe_mutex);
+ 
+     mp_mutex_destroy(&vo->in->lock);
+     mp_cond_destroy(&vo->in->wakeup);
+@@ -290,6 +291,7 @@ static struct vo *vo_create(bool probing, struct mpv_global *global,
+         .in = talloc(vo, struct vo_internal),
+     };
+     mp_mutex_init(&vo->params_mutex);
++    mp_mutex_init(&vo->async_probe_mutex);
+     talloc_steal(vo, log);
+     *vo->in = (struct vo_internal) {
+         .dispatch = mp_dispatch_create(vo),
+diff --git a/video/out/vo.h b/video/out/vo.h
+index 466db79e9..c2add59f2 100644
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -90,6 +90,7 @@ enum mp_voctrl {
+ 
+     // Active image bounds measured inside an encoded video frame.
+     VOCTRL_GET_ACTIVE_IMAGE,            // struct voctrl_active_image*
++    VOCTRL_GET_ASYNC_PROBE,             // experimental struct voctrl_async_probe*
+ 
+     VOCTRL_SET_CURSOR_VISIBILITY,       // bool*
+ 
+@@ -149,6 +150,14 @@ struct voctrl_render_formats {
+     char output[VO_RENDER_FORMAT_NAME_MAX];
+ };
+ 
++struct voctrl_async_probe {
++    int64_t sequence, skipped, submitted_ns;
++    int x, y, mode;
++    double ready_ms;
++    int64_t stats_ns;
++    float values[1120];
++};
++
+ struct voctrl_active_image {
+     bool available;
+     bool automatic_effective;
+@@ -488,6 +497,8 @@ struct vo_driver {
+ 
+ struct vo {
+     const struct vo_driver *driver;
++    mp_mutex async_probe_mutex;
++    struct voctrl_async_probe async_probe_snapshot;
+     struct mp_log *log; // Using e.g. "[vo/vdpau]" as prefix
+     void *priv;
+     struct mpv_global *global;
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 9377054f5..fcc525ad2 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -174,6 +174,7 @@ struct priv {
+     pl_gpu gpu;
+     pl_renderer rr;
+     pl_queue queue;
++    struct async_probe *async_probe;
+     pl_dispatch bar_dispatch;
+     pl_timer bar_timer;
+     struct bar_analysis_slot bar_slots[BAR_ANALYSIS_SLOTS];
+@@ -250,6 +251,7 @@ static void update_lut(struct priv *p, struct user_lut *lut);
+ 
+ struct gl_next_opts {
+     bool delayed_peak;
++    int analyzer_async;
+     bool dovi_enhancement_layer;
+     bool causal_scene_diagnostics;
+     bool causal_scene_acceleration;
+@@ -298,6 +300,7 @@ const struct m_sub_options gl_next_conf = {
+         {"hdr-authored-scene-reset", OPT_BOOL(authored_scene_reset)},
+         {"active-image-detection", OPT_BOOL(active_image_detection)},
+         {"automatic-aspect-ratio", OPT_BOOL(automatic_aspect_ratio)},
++        {"analyzer-async", OPT_INT(analyzer_async), M_RANGE(0, 3)},
+         {"automatic-aspect-ratio-crop", OPT_BOOL(automatic_aspect_ratio_crop)},
+         {"automatic-aspect-ratio-canvas",
+             OPT_FLOAT(automatic_aspect_ratio_canvas), M_RANGE(0, 10)},
+@@ -341,6 +344,8 @@ const struct m_sub_options gl_next_conf = {
+ };
+ 
+ static pl_buf get_dr_buf(struct priv *p, const uint8_t *ptr)
++#include "analyzer_async_bridge.h"
++
+ {
+     mp_mutex_lock(&p->dr_lock);
+ 
+@@ -3802,6 +3807,9 @@ static void wait_events(struct vo *vo, int64_t until_time_ns)
+         p->ra_ctx->fns->wait_events(p->ra_ctx, until_time_ns);
+     } else {
+         vo_wait_default(vo, until_time_ns);
++    case VOCTRL_CHECK_EVENTS:
++        async_probe_collect(p);
++        break;
+     }
+ }
+ 
+@@ -4095,6 +4103,7 @@ static int preinit(struct vo *vo)
+         .log = p->log,
+         .global = p->global,
+         .ra_ctx = p->ra_ctx,
++    async_probe_destroy(p);
+     };
+ 
+     vo->hwdec_devs = hwdec_devices_create();
+@@ -4406,6 +4415,23 @@ static void update_hook_opts(struct priv *p, char **opts, const char *shaderpath
+                 break;
+             case PL_VAR_SINT:
+                 opt.type = &m_option_type_int;
++    if (bstrcmp0(name, "analyzer_lua") == 0) {
++        *out = p->next_opts->analyzer_async == 3;
++        return true;
++    }
++    if (bstrcmp0(name, "analyzer_source_x") == 0 || bstrcmp0(name, "analyzer_source_y") == 0) {
++        double u=w>0 ? (x-p->dst.x0+.5)/w : .5;
++        double v=h>0 ? (y-p->dst.y0+.5)/h : .5;
++        // MAIN's saved texture already covers the effective source crop.
++        // Undo display rotation only; applying p->src again double-crops it.
++        int rotation=vo->params ? (vo->params->rotate%360+360)%360 : 0;
++        double tx=u,ty=v;
++        if(rotation==90){tx=v;ty=1-u;}
++        if(rotation==180){tx=1-u;ty=1-v;}
++        if(rotation==270){tx=1-v;ty=u;}
++        *out=MPCLAMP(bstrcmp0(name,"analyzer_source_x")==0 ? tx : ty,0.0,1.0);
++        return true;
++    }
+                 opt.min = hp->minimum.i;
+                 opt.max = hp->maximum.i;
+                 break;
+@@ -4634,3 +4660,8 @@ const struct vo_driver video_out_gpu_next = {
+     .uninit = uninit,
+     .priv_size = sizeof(struct priv),
+ };
++    if (p->next_opts->analyzer_async) {
++        hook = async_probe_init(vo);
++        p->async_probe->render_revision++;
++        MP_TARRAY_APPEND(p, p->hooks, pars->params.num_hooks, hook);
++    }
+-- 
+2.54.0.windows.1
+

@@ -1,0 +1,82 @@
+From da6dc5c6bcb4c1b0466ee120a4ae0e1df8641d12 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Mon, 7 Sep 2026 12:22:09 -0400
+Subject: [PATCH] custom shaders: expose saved textures and revisions for
+ Analyzer
+
+---
+ src/include/libplacebo/shaders/custom.h |  3 +++
+ src/shaders/custom_mpv.c                | 22 ++++++++++++++++++++++
+ 2 files changed, 25 insertions(+)
+
+diff --git a/src/include/libplacebo/shaders/custom.h b/src/include/libplacebo/shaders/custom.h
+index 19e870de..f72ada33 100644
+--- a/src/include/libplacebo/shaders/custom.h
++++ b/src/include/libplacebo/shaders/custom.h
+@@ -343,6 +343,9 @@ PL_API const struct pl_hook *
+ pl_mpv_user_shader_parse(pl_gpu gpu, const char *shader_text, size_t shader_len);
+ 
+ PL_API void pl_mpv_user_shader_destroy(const struct pl_hook **hook);
++// Experimental borrowed saved texture; caller must stay on the rendering thread.
++PL_API pl_tex pl_mpv_user_shader_saved_texture(const struct pl_hook *hook, const char *name);
++PL_API uint64_t pl_mpv_user_shader_saved_revision(const struct pl_hook *hook, const char *name);
+ 
+ PL_API_END
+ 
+diff --git a/src/shaders/custom_mpv.c b/src/shaders/custom_mpv.c
+index bdac4fc3..98f5feee 100644
+--- a/src/shaders/custom_mpv.c
++++ b/src/shaders/custom_mpv.c
+@@ -923,6 +923,7 @@ struct hook_pass {
+ };
+ 
+ struct pass_tex {
++    uint64_t revision;
+     pl_str name;
+     pl_tex tex;
+     bool persistent;
+@@ -935,6 +936,7 @@ struct pass_tex {
+ };
+ 
+ struct hook_priv {
++    uint64_t save_revision;
+     pl_log log;
+     pl_gpu gpu;
+     void *alloc;
+@@ -955,6 +957,25 @@ struct hook_priv {
+     uint64_t prng_state[4];
+ };
+ 
++pl_tex pl_mpv_user_shader_saved_texture(const struct pl_hook *hook, const char *name)
++{
++    if (!hook || !name) return NULL;
++    struct hook_priv *p = hook->priv;
++    for (int i = 0; i < p->pass_textures.num; i++)
++        if (pl_str_equals0(p->pass_textures.elem[i].name, name))
++            return p->pass_textures.elem[i].tex;
++    return NULL;
++}
++
++uint64_t pl_mpv_user_shader_saved_revision(const struct pl_hook *hook, const char *name)
++{
++    if (!hook || !name) return 0;
++    struct hook_priv *p=hook->priv;
++    for (int i=0;i<p->pass_textures.num;i++)
++        if (pl_str_equals0(p->pass_textures.elem[i].name,name)) return p->pass_textures.elem[i].revision;
++    return 0;
++}
++
+ static void hook_reset(void *priv)
+ {
+     struct hook_priv *p = priv;
+@@ -1586,6 +1607,7 @@ static struct pl_hook_res hook_hook(void *priv, const struct pl_hook_params *par
+ 
+         // Save the result of this shader invocation
+         struct pass_tex ptex = {
++            .revision = ++p->save_revision,
+             .name  = hook->save_tex.len ? hook->save_tex : stage,
+             .tex   = fbo,
+             .persistent = hook->persist,
+-- 
+2.54.0.windows.1
+
