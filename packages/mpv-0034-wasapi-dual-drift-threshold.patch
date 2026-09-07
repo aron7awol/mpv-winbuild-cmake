@@ -1,0 +1,119 @@
+From 88f03586b7b8d6cadcb4a7a52d9d75135451bb02 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Mon, 7 Sep 2026 16:34:25 -0400
+Subject: [PATCH] wasapi: configure drift correction and align endpoint clock
+ samples
+
+---
+ audio/out/ao_wasapi.c      |  9 ++++++++-
+ audio/out/ao_wasapi.h      |  1 +
+ audio/out/ao_wasapi_dual.h | 23 +++++++++++++++++++----
+ 3 files changed, 28 insertions(+), 5 deletions(-)
+
+diff --git a/audio/out/ao_wasapi.c b/audio/out/ao_wasapi.c
+index c96542dab..16d826e09 100644
+--- a/audio/out/ao_wasapi.c
++++ b/audio/out/ao_wasapi.c
+@@ -481,10 +481,14 @@ static int thread_control(struct ao *ao, enum aocontrol cmd, void *arg)
+     struct wasapi_state *state = ao->priv;
+     if (cmd == AOCONTROL_GET_DUAL_STATUS) {
+         struct wasapi_dual *d = state->dual;
++        char correction[32] = "Off";
++        if (state->opt_secondary_drift)
++            snprintf(correction, sizeof(correction), "threshold %d ms", state->opt_secondary_drift);
+         *(char **)arg = !d ? talloc_strdup(NULL, "Off") : d->failed ?
+             talloc_asprintf(NULL, "Error: %s", d->error) :
+-            talloc_asprintf(NULL, "Bitstream to both devices; offset %+d ms; clock skew %+.1f ms%s",
++            talloc_asprintf(NULL, "Bitstream to both devices; offset %+d ms; clock skew %+.1f ms; correction %s%s",
+                             state->opt_secondary_delay, d->skew_ms,
++                            correction,
+                             d->running ? "" : "; paused");
+         return CONTROL_OK;
+     }
+@@ -596,12 +600,15 @@ const struct ao_driver audio_out_wasapi = {
+     .hotplug_init   = hotplug_init,
+     .hotplug_uninit = hotplug_uninit,
+     .priv_size      = sizeof(wasapi_state),
++    .priv_defaults  = &(const struct wasapi_state){.opt_secondary_drift = 0},
+     .options_prefix = "wasapi",
+     .options        = (const struct m_option[]) {
+         {"exclusive-buffer", OPT_CHOICE(opt_exclusive_buffer,
+             {"default", 0}, {"min", -1}), M_RANGE(1, 2000000)},
+         {"secondary-device", OPT_STRING(opt_secondary_device)},
+         {"secondary-delay", OPT_INT(opt_secondary_delay), M_RANGE(-1000, 1000)},
++        {"secondary-drift-threshold", OPT_CHOICE(opt_secondary_drift,
++            {"off", 0}), M_RANGE(1, 1000)},
+         {0}
+     },
+ };
+diff --git a/audio/out/ao_wasapi.h b/audio/out/ao_wasapi.h
+index bacc62a42..4e7a808ca 100644
+--- a/audio/out/ao_wasapi.h
++++ b/audio/out/ao_wasapi.h
+@@ -94,6 +94,7 @@ typedef struct wasapi_state {
+     int opt_exclusive_buffer; // exclusive mode buffer duration in us
+     char *opt_secondary_device;
+     int opt_secondary_delay; // milliseconds, positive delays secondary
++    int opt_secondary_drift; // milliseconds, 0 disables corrective holds
+     struct wasapi_dual *dual; // audio-thread owned; NULL for ordinary output
+     bool strict_bitstream;
+ 
+diff --git a/audio/out/ao_wasapi_dual.h b/audio/out/ao_wasapi_dual.h
+index 6b718dfb3..b7d619192 100644
+--- a/audio/out/ao_wasapi_dual.h
++++ b/audio/out/ao_wasapi_dual.h
+@@ -244,32 +244,47 @@ static void dual_tick(struct ao *ao)
+     if (!d->started[0] || !d->started[1])
+         return;
+     double played[2];
++    UINT64 sampled_at[2];
++    bool accurate = true;
+     for (int i = 0; i < 2; i++) {
+         struct wasapi_state *e = dual_endpoint(ao, i);
+         UINT64 pos, qpc;
+-        if (FAILED(IAudioClock_GetPosition(e->pAudioClock, &pos, &qpc))) {
++        HRESULT hr = IAudioClock_GetPosition(e->pAudioClock, &pos, &qpc);
++        if (FAILED(hr)) {
+             dual_fail(ao, "endpoint clock unavailable");
+             return;
+         }
+         played[i] = 1000.0 * pos / e->clock_frequency;
++        sampled_at[i] = qpc;
++        // S_FALSE means imprecise timing; zero position can mean startup latency.
++        accurate &= hr == S_OK && pos > 0 && qpc > 0;
+     }
+-    d->skew_ms = played[1] - played[0] + s->opt_secondary_delay;
+     if (d->exhausted && MPMIN(played[0], played[1]) * ao->samplerate / 1000.0 >= d->valid_end) {
+         dual_pause(ao);
+         ao_set_draining(ao, false);
+         return;
+     }
++    // GetPosition timestamps are already in 100 ns units (not raw QPC ticks).
++    // Project both running clocks to the later sample time before comparing.
++    UINT64 common = MPMAX(sampled_at[0], sampled_at[1]);
++    UINT64 separation = common - MPMIN(sampled_at[0], sampled_at[1]);
++    if (!accurate || separation > 1000000) // >100 ms: skip this stale pair
++        return;
++    d->skew_ms = played[1] + (common - sampled_at[1]) / 10000.0
++               - played[0] - (common - sampled_at[0]) / 10000.0
++               + s->opt_secondary_delay;
+     // Correct clock drift only by briefly stopping the leading transport.
+     // Queued bytes and burst alignment survive Stop/Start. This may cause a
+     // receiver re-lock; never corrupt compressed data to hide that possibility.
+-    if (fabs(d->skew_ms) > 30) {
++    if (s->opt_secondary_drift > 0 && fabs(d->skew_ms) > s->opt_secondary_drift) {
+         int lead = d->skew_ms > 0 ? 1 : 0;
+         if (FAILED(IAudioClient_Stop(dual_endpoint(ao, lead)->pAudioClient))) {
+             dual_fail(ao, "cannot correct endpoint clock drift");
+             return;
+         }
+         d->started[lead] = false;
+-        d->start_at[lead] = now + (int64_t)((fabs(d->skew_ms) - 5) * 1e6);
++        double target = MPMIN(5.0, s->opt_secondary_drift / 2.0);
++        d->start_at[lead] = now + (int64_t)((fabs(d->skew_ms) - target) * 1e6);
+         MP_WARN(ao, "Dual bitstream clock correction: skew %+.1f ms, holding %s.\n",
+                 d->skew_ms, lead ? "secondary" : "primary");
+     }
+-- 
+2.54.0.windows.1
+
