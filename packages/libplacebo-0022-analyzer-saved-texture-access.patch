@@ -1,6 +1,6 @@
-From da6dc5c6bcb4c1b0466ee120a4ae0e1df8641d12 Mon Sep 17 00:00:00 2001
+From e08f80328be0afe4d5475ed5a669238d4e87113c Mon Sep 17 00:00:00 2001
 From: Codex <codex@local>
-Date: Mon, 7 Sep 2026 12:22:09 -0400
+Date: Mon, 7 Sep 2026 12:48:35 -0400
 Subject: [PATCH] custom shaders: expose saved textures and revisions for
  Analyzer
 

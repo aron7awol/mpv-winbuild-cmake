@@ -1,6 +1,6 @@
-From b3ef0eb4a49ddea3e1d4cc5481b5c3a2da69ee7a Mon Sep 17 00:00:00 2001
+From 938ea5fbbaaf23139450088b59ef690669fced78 Mon Sep 17 00:00:00 2001
 From: Codex <codex@local>
-Date: Mon, 7 Sep 2026 12:22:05 -0400
+Date: Mon, 7 Sep 2026 12:48:30 -0400
 Subject: [PATCH] gpu-next: add asynchronous Analyzer source/output telemetry
 
 ---
@@ -19,13 +19,13 @@ Subject: [PATCH] gpu-next: add asynchronous Analyzer source/output telemetry
  create mode 100644 video/out/analyzer_output_bridge.h
 
 diff --git a/player/command.c b/player/command.c
-index e7671b7d6..859f65d64 100644
+index e7671b7d6..7ab197192 100644
 --- a/player/command.c
 +++ b/player/command.c
-@@ -2770,6 +2770,59 @@ static int mp_property_video_active_image(void *ctx, struct m_property *prop,
-                                image.active_w, image.active_h, ratio);
-     struct m_sub_property props[] = {
-         {"width",               SUB_PROP_INT(image.active_w)},
+@@ -2755,6 +2755,59 @@ static int mp_property_gpu_render_formats(void *ctx, struct m_property *prop,
+     return m_property_read_sub(props, action, arg);
+ }
+ 
 +static int mp_property_async_probe(void *ctx, struct m_property *prop, int action, void *arg)
 +{
 +    MPContext *mpctx = ctx;
@@ -79,17 +79,17 @@ index e7671b7d6..859f65d64 100644
 +    return ret;
 +}
 +
-         {"height",              SUB_PROP_INT(image.active_h)},
-         {"ratio",               SUB_PROP_DOUBLE(ratio)},
-         {"source-width",        SUB_PROP_INT(image.source_w)},
-@@ -4884,6 +4937,7 @@ static const struct m_property mp_properties_base[] = {
-     {"current-vo", mp_property_vo},
-     {"current-gpu-context", mp_property_gpu_context},
-     {"container-fps", mp_property_fps},
+ static int mp_property_video_active_image(void *ctx, struct m_property *prop,
+                                           int action, void *arg)
+ {
+@@ -4868,6 +4921,7 @@ static const struct m_property mp_properties_base[] = {
+     {"video-out-params", mp_property_vo_imgparams},
+     {"gpu-render-formats", mp_property_gpu_render_formats},
+     {"video-active-image", mp_property_video_active_image},
 +    {"analyzer-async-result", mp_property_async_probe},
-     {"estimated-vf-fps", mp_property_vf_fps},
-     {"video-aspect-override", mp_property_video_aspect_override},
-     {"vid", mp_property_switch_track, .priv = (void *)(const int[]){0, STREAM_VIDEO}},
+     {"video-dec-params", mp_property_dec_imgparams},
+     {"video-params", mp_property_vd_imgparams},
+     {"video-frame-info", mp_property_video_frame_info},
 diff --git a/video/out/analyzer_async_bridge.h b/video/out/analyzer_async_bridge.h
 new file mode 100644
 index 000000000..7222c179f
@@ -490,7 +490,7 @@ index f93f6cf97..dfea9efc2 100644
      *vo->in = (struct vo_internal) {
          .dispatch = mp_dispatch_create(vo),
 diff --git a/video/out/vo.h b/video/out/vo.h
-index 466db79e9..c2add59f2 100644
+index 466db79e9..6ed9a6164 100644
 --- a/video/out/vo.h
 +++ b/video/out/vo.h
 @@ -90,6 +90,7 @@ enum mp_voctrl {
@@ -516,17 +516,17 @@ index 466db79e9..c2add59f2 100644
  struct voctrl_active_image {
      bool available;
      bool automatic_effective;
-@@ -488,6 +497,8 @@ struct vo_driver {
+@@ -487,6 +496,8 @@ struct vo_driver {
+ };
  
  struct vo {
-     const struct vo_driver *driver;
 +    mp_mutex async_probe_mutex;
 +    struct voctrl_async_probe async_probe_snapshot;
+     const struct vo_driver *driver;
      struct mp_log *log; // Using e.g. "[vo/vdpau]" as prefix
      void *priv;
-     struct mpv_global *global;
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index 9377054f5..fcc525ad2 100644
+index 9377054f5..cbad6970d 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
 @@ -174,6 +174,7 @@ struct priv {
@@ -537,53 +537,53 @@ index 9377054f5..fcc525ad2 100644
      pl_dispatch bar_dispatch;
      pl_timer bar_timer;
      struct bar_analysis_slot bar_slots[BAR_ANALYSIS_SLOTS];
-@@ -250,6 +251,7 @@ static void update_lut(struct priv *p, struct user_lut *lut);
+@@ -249,6 +250,7 @@ static void update_render_options(struct vo *vo);
+ static void update_lut(struct priv *p, struct user_lut *lut);
  
  struct gl_next_opts {
-     bool delayed_peak;
 +    int analyzer_async;
+     bool delayed_peak;
      bool dovi_enhancement_layer;
      bool causal_scene_diagnostics;
-     bool causal_scene_acceleration;
-@@ -298,6 +300,7 @@ const struct m_sub_options gl_next_conf = {
+@@ -297,6 +299,7 @@ const struct m_sub_options gl_next_conf = {
+         {"hdr-causal-scene-acceleration", OPT_BOOL(causal_scene_acceleration), M_OPT_NOCFG},
          {"hdr-authored-scene-reset", OPT_BOOL(authored_scene_reset)},
          {"active-image-detection", OPT_BOOL(active_image_detection)},
-         {"automatic-aspect-ratio", OPT_BOOL(automatic_aspect_ratio)},
 +        {"analyzer-async", OPT_INT(analyzer_async), M_RANGE(0, 3)},
+         {"automatic-aspect-ratio", OPT_BOOL(automatic_aspect_ratio)},
          {"automatic-aspect-ratio-crop", OPT_BOOL(automatic_aspect_ratio_crop)},
          {"automatic-aspect-ratio-canvas",
-             OPT_FLOAT(automatic_aspect_ratio_canvas), M_RANGE(0, 10)},
-@@ -341,6 +344,8 @@ const struct m_sub_options gl_next_conf = {
+@@ -340,6 +343,8 @@ const struct m_sub_options gl_next_conf = {
+     .change_flags = UPDATE_VIDEO,
  };
  
- static pl_buf get_dr_buf(struct priv *p, const uint8_t *ptr)
 +#include "analyzer_async_bridge.h"
 +
+ static pl_buf get_dr_buf(struct priv *p, const uint8_t *ptr)
  {
      mp_mutex_lock(&p->dr_lock);
+@@ -3722,6 +3727,9 @@ static int control(struct vo *vo, uint32_t request, void *data)
+         return VO_TRUE;
+     }
  
-@@ -3802,6 +3807,9 @@ static void wait_events(struct vo *vo, int64_t until_time_ns)
-         p->ra_ctx->fns->wait_events(p->ra_ctx, until_time_ns);
-     } else {
-         vo_wait_default(vo, until_time_ns);
 +    case VOCTRL_CHECK_EVENTS:
 +        async_probe_collect(p);
 +        break;
-     }
- }
- 
-@@ -4095,6 +4103,7 @@ static int preinit(struct vo *vo)
-         .log = p->log,
-         .global = p->global,
-         .ra_ctx = p->ra_ctx,
+     case VOCTRL_GET_ACTIVE_IMAGE: {
+         struct voctrl_active_image *out = data;
+         consume_bar_analysis(p);
+@@ -4013,6 +4021,7 @@ static void uninit(struct vo *vo)
+     pl_queue_destroy(&p->queue); // destroy this first
+     for (int i = 0; i < BAR_ANALYSIS_SLOTS; i++)
+         pl_buf_destroy(p->gpu, &p->bar_slots[i].buf);
 +    async_probe_destroy(p);
-     };
+     pl_timer_destroy(p->gpu, &p->bar_timer);
+     pl_dispatch_destroy(&p->bar_dispatch);
+     for (int i = 0; i < MP_ARRAY_SIZE(p->osd_state.entries); i++)
+@@ -4323,6 +4332,23 @@ static bool get_analyzer_auto_param(struct vo *vo, struct priv *p,
+                         x >= p->dst.x0 && x < p->dst.x1 &&
+                         y >= p->dst.y0 && y < p->dst.y1;
  
-     vo->hwdec_devs = hwdec_devices_create();
-@@ -4406,6 +4415,23 @@ static void update_hook_opts(struct priv *p, char **opts, const char *shaderpath
-                 break;
-             case PL_VAR_SINT:
-                 opt.type = &m_option_type_int;
 +    if (bstrcmp0(name, "analyzer_lua") == 0) {
 +        *out = p->next_opts->analyzer_async == 3;
 +        return true;
@@ -601,18 +601,21 @@ index 9377054f5..fcc525ad2 100644
 +        *out=MPCLAMP(bstrcmp0(name,"analyzer_source_x")==0 ? tx : ty,0.0,1.0);
 +        return true;
 +    }
-                 opt.min = hp->minimum.i;
-                 opt.max = hp->maximum.i;
-                 break;
-@@ -4634,3 +4660,8 @@ const struct vo_driver video_out_gpu_next = {
-     .uninit = uninit,
-     .priv_size = sizeof(struct priv),
- };
+     if (bstrcmp0(name, "analyzer_cursor_x") == 0) {
+         *out = w > 0 ? MPCLAMP((x - p->dst.x0 + 0.5) / w, 0.0, 1.0) : 0.5;
+         return true;
+@@ -4608,6 +4634,11 @@ AV_NOWARN_DEPRECATED(
+         }
+     }
+ 
 +    if (p->next_opts->analyzer_async) {
 +        hook = async_probe_init(vo);
 +        p->async_probe->render_revision++;
 +        MP_TARRAY_APPEND(p, p->hooks, pars->params.num_hooks, hook);
 +    }
+     pars->params.hooks = p->hooks;
+ 
+     MP_DBG(p, "Render options updated, flushing renderer cache.\n");
 -- 
 2.54.0.windows.1
 
