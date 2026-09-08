@@ -1,15 +1,15 @@
-From ec0f2c9abef2d8a60d9c1351d7f7876c60f04d9c Mon Sep 17 00:00:00 2001
+From 47629778a19f1d85e939f3df7b16e70066ddaa09 Mon Sep 17 00:00:00 2001
 From: Codex <codex@local>
-Date: Mon, 7 Sep 2026 21:00:46 -0400
+Date: Tue, 8 Sep 2026 11:26:51 -0400
 Subject: [PATCH] gpu-next: add full-width RGB overlay waveform
 
 ---
- video/out/analyzer_waveform_bridge.h | 32 +++++++++++++++++-----------
+ video/out/analyzer_waveform_bridge.h | 42 ++++++++++++++++++----------
  video/out/vo_gpu_next.c              |  2 +-
- 2 files changed, 20 insertions(+), 14 deletions(-)
+ 2 files changed, 28 insertions(+), 16 deletions(-)
 
 diff --git a/video/out/analyzer_waveform_bridge.h b/video/out/analyzer_waveform_bridge.h
-index f73e9456e..0ba4596ad 100644
+index f73e9456e..702ecf6db 100644
 --- a/video/out/analyzer_waveform_bridge.h
 +++ b/video/out/analyzer_waveform_bridge.h
 @@ -5,6 +5,8 @@ static bool analyzer_waveform_reduce(struct priv *p, const struct pl_hook_params
@@ -86,10 +86,27 @@ index f73e9456e..0ba4596ad 100644
 -        "vec3 c=max(vec3(.18,.78,1)*s,vec3(1,.72,.32)*o)*tint;"
 -        "color=vec4(c,.86);",p->next_opts->analyzer_waveform_layers,p->next_opts->analyzer_waveform_layers,width*256);
 +        "if(%d==3)c[ch]=max(s,o);else c=max(vec3(.18,.78,1)*s,vec3(1,.72,.32)*o);}"
-+        "color=vec4(c*tint,.86);",channels,stride,p->next_opts->analyzer_waveform_layers,p->next_opts->analyzer_waveform_layers,width*stride,channels);
++        "color=vec4(c*tint,1.0);",channels,stride,p->next_opts->analyzer_waveform_layers,p->next_opts->analyzer_waveform_layers,width*stride,channels);
      pl_shader sh=pl_dispatch_begin(hp->dispatch);
      bool ok=pl_shader_custom(sh,&(struct pl_custom_shader){.description="Analyzer waveform density texture",.body=body,
          .input=PL_SHADER_SIG_NONE,.output=PL_SHADER_SIG_COLOR,.variables=&var,.num_variables=1,.descriptors=&desc,.num_descriptors=1}) &&
+@@ -109,8 +115,14 @@ static void analyzer_waveform_prepare(struct priv *p, struct pl_frame *target,
+     a->wave_dst=target->crop;a->wave_rotation=rotation;
+     pl_fmt fmt=pl_find_fmt(p->gpu,PL_FMT_UNORM,4,8,0,PL_FMT_CAP_SAMPLEABLE|PL_FMT_CAP_RENDERABLE);
+     bool recreate=!a->wave_tex || a->wave_tex->params.w!=width;
+-    if(!fmt || !pl_tex_recreate(p->gpu,&a->wave_tex,pl_tex_params(.w=width,.h=256,.format=fmt,.sampleable=true,.renderable=true,.blit_dst=true)))return;
+-    if(recreate)pl_tex_clear(p->gpu,a->wave_tex,(float[4]){0});
++    if(!fmt)return;
++    // pl_tex_recreate invalidates even a matching texture. Redraws may reuse
++    // cached analysis, so retain its pixels until a real allocation change.
++    if(recreate){
++        if(!pl_tex_recreate(p->gpu,&a->wave_tex,pl_tex_params(.w=width,.h=256,.format=fmt,.sampleable=true,.renderable=true,.blit_dst=true)))return;
++        pl_tex_clear(p->gpu,a->wave_tex,(float[4]){0,0,0,1});
++        a->last_stats_revision=0;
++    }
+     a->wave_part=(struct pl_overlay_part){.src={0,0,width,256},.dst={x,y,right,y+height}};
+     MP_TARRAY_GROW(p,a->wave_overlays,target->num_overlays);
+     memcpy(a->wave_overlays+1,target->overlays,target->num_overlays*sizeof(*target->overlays));
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
 index 49ff7d157..444d0d67b 100644
 --- a/video/out/vo_gpu_next.c

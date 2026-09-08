@@ -1,16 +1,16 @@
-From 0e93a2e68ab068db6e882ac4850ccb897a17808e Mon Sep 17 00:00:00 2001
+From af5c029874038a100a167d24f939ed2d70d1781e Mon Sep 17 00:00:00 2001
 From: Codex <codex@local>
-Date: Tue, 8 Sep 2026 07:52:33 -0400
+Date: Tue, 8 Sep 2026 11:26:52 -0400
 Subject: [PATCH] gpu-next: plot coherent brightest-P xy colors at OSD
  brightness
 
 ---
  player/command.c                         |  11 +-
  video/out/analyzer_async_bridge.h        |  21 +++-
- video/out/analyzer_chromaticity_bridge.h | 123 +++++++++++++++++++++++
+ video/out/analyzer_chromaticity_bridge.h | 131 +++++++++++++++++++++++
  video/out/vo.h                           |   2 +-
  video/out/vo_gpu_next.c                  |  10 ++
- 5 files changed, 160 insertions(+), 7 deletions(-)
+ 5 files changed, 168 insertions(+), 7 deletions(-)
  create mode 100644 video/out/analyzer_chromaticity_bridge.h
 
 diff --git a/player/command.c b/player/command.c
@@ -133,10 +133,10 @@ index dc70809e1..7a98dc104 100644
      for (int i = 0; i < 4; i++) {
 diff --git a/video/out/analyzer_chromaticity_bridge.h b/video/out/analyzer_chromaticity_bridge.h
 new file mode 100644
-index 000000000..b8111394c
+index 000000000..9ff5e33b7
 --- /dev/null
 +++ b/video/out/analyzer_chromaticity_bridge.h
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,131 @@
 +/* Brightest-P source pixel per xy cell. Two ordered reductions select an
 + * indivisible RGB triplet; equal-P ties select the first raster-order pixel.
 + * No float atomics, 64-bit atomics, locks, or GPU -> CPU waits are required. */
@@ -202,7 +202,7 @@ index 000000000..b8111394c
 +    desc[2]=(struct pl_shader_desc){.desc={.name="XYColors",.type=PL_DESC_BUF_STORAGE,.access=PL_DESC_ACCESS_WRITEONLY},.binding.object=slot->buf,.buffer_vars=&result,.num_buffer_vars=1};
 +    pl_shader sh=pl_dispatch_begin(hp->dispatch);
 +    ok=pl_shader_custom(sh,&(struct pl_custom_shader){.description="Analyzer opaque xy color texture",.header=frame_math,
-+        .body="ivec2 q=ivec2(gl_FragCoord.xy);int b=(79-q.y)*80+q.x;uint id=keys[6400+b];color=vec4(vec3(background),215./255.);xy_colors[b]=vec4(0);"
++        .body="ivec2 q=ivec2(gl_FragCoord.xy);int b=(79-q.y)*80+q.x;uint id=keys[6400+b];color=vec4(vec3(background),1.0);xy_colors[b]=vec4(0);"
 +              "if(id!=0xffffffffu){int w=textureSize(xy_source,0).x;vec3 c=to2020*texelFetch(xy_source,ivec2(int(id)%w,int(id)/w),0).rgb*nits;"
 +              "xy_colors[b]=vec4(c,uintBitsToFloat(keys[b])*nits);"
 +              "c*=min(1.,cap/max(max(c.r,c.g),max(c.b,1e-12)));"
@@ -233,22 +233,30 @@ index 000000000..b8111394c
 +    float code=p->next_opts->analyzer_xy_intensity/255.f;
 +    float light=code<=.04045f ? code/12.92f : powf((code+.055f)/1.055f,2.4f);
 +    float cap=fmaxf(.0001f,osd.hdr.max_luma*light);
-+    // Match the rest of the ASS card: #080808, alpha 215/255. Only plotted
-+    // cells replace that backing with fully opaque source color.
++    // Match the opaque ASS card backing: #080808, alpha 1. Plotted cells
++    // replace that backing with fully opaque source color.
 +    float background=(8.f/255.f/12.92f)*osd.hdr.max_luma/203.f;
 +    if(cap!=a->xy_cap || background!=a->xy_background){
 +        a->xy_cap=cap;a->xy_background=background;a->last_stats_revision=0;
 +    }
 +    pl_fmt fmt=pl_find_fmt(p->gpu,PL_FMT_FLOAT,4,32,0,PL_FMT_CAP_SAMPLEABLE|PL_FMT_CAP_RENDERABLE);
 +    bool fresh=!a->xy_tex;
-+    if(!fmt || !pl_tex_recreate(p->gpu,&a->xy_tex,pl_tex_params(.w=80,.h=80,.format=fmt,.sampleable=true,.renderable=true,.blit_dst=true)))return;
-+    if(fresh){pl_tex_clear(p->gpu,a->xy_tex,(float[4]){0});a->last_stats_revision=0;}
++    if(!fmt)return;
++    // Cached analysis must survive OSD-only redraws. pl_tex_recreate would
++    // invalidate the contents even when the existing allocation already fits.
++    if(fresh){
++        if(!pl_tex_recreate(p->gpu,&a->xy_tex,pl_tex_params(.w=80,.h=80,.format=fmt,.sampleable=true,.renderable=true,.blit_dst=true)))return;
++        pl_tex_clear(p->gpu,a->xy_tex,(float[4]){background,background,background,1});
++        a->last_stats_revision=0;
++    }
 +    int size=p->next_opts->analyzer_xy_size;
 +    int raster=MPMAX(size,80);
 +    bool resized=!a->xy_display || a->xy_display->params.w!=raster;
-+    if(resized)a->last_stats_revision=0;
-+    if(!pl_tex_recreate(p->gpu,&a->xy_display,pl_tex_params(.w=raster,.h=raster,.format=fmt,.sampleable=true,.renderable=true,.blit_dst=true)))return;
-+    if(resized)pl_tex_clear(p->gpu,a->xy_display,(float[4]){0});
++    if(resized){
++        if(!pl_tex_recreate(p->gpu,&a->xy_display,pl_tex_params(.w=raster,.h=raster,.format=fmt,.sampleable=true,.renderable=true,.blit_dst=true)))return;
++        pl_tex_clear(p->gpu,a->xy_display,(float[4]){background,background,background,1});
++        a->last_stats_revision=0;
++    }
 +    if(size<=0)return;
 +    int x=p->next_opts->analyzer_xy_x,y=p->next_opts->analyzer_xy_y;
 +    a->xy_part=(struct pl_overlay_part){.src={0,0,raster,raster},.dst={x,y,x+size,y+size}};
