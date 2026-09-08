@@ -1,0 +1,143 @@
+From 5fc79fb2180ac040d54789cf184c58f55a37a0d8 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Tue, 8 Sep 2026 13:20:40 -0400
+Subject: [PATCH] gpu-next: separate Analyzer SDR display assumptions and
+ waveform range
+
+---
+ video/out/analyzer_output_bridge.h   | 30 +++++++++++++++++++++++++---
+ video/out/analyzer_waveform_bridge.h |  6 ++++--
+ video/out/vo_gpu_next.c              |  8 ++++++++
+ 3 files changed, 39 insertions(+), 5 deletions(-)
+
+diff --git a/video/out/analyzer_output_bridge.h b/video/out/analyzer_output_bridge.h
+index 4556e8b0f..38371498c 100644
+--- a/video/out/analyzer_output_bridge.h
++++ b/video/out/analyzer_output_bridge.h
+@@ -1,5 +1,28 @@
+ #include <libplacebo/shaders/colorspace.h>
+ #include <libplacebo/shaders/sampling.h>
++/* Interpret decoded SDR signal values as a hypothetical display response.
++ * This private analysis pass never replaces playback pixels. Keep HDR on the
++ * effective renderer EOTF (PQ absolute / HLG renderer interpretation).
++ * Store all output linear samples in libplacebo's 203-nit units, so pixel,
++ * frame and waveform consumers share exactly the same conversion to nits. */
++static void analyzer_output_linearize(struct priv *p, pl_shader sh,
++                                     const struct pl_color_space *color)
++{
++    if (pl_color_transfer_is_hdr(color->transfer)) {
++        pl_shader_linearize(sh, color);
++        return;
++    }
++    float gamma=p->next_opts->analyzer_sdr_output_gamma;
++    float peak=p->next_opts->analyzer_sdr_output_peak / 203.f;
++    struct pl_shader_var vars[]={
++        {.var=pl_var_float("display_gamma"),.data=&gamma,.dynamic=true},
++        {.var=pl_var_float("display_scale"),.data=&peak,.dynamic=true},
++    };
++    pl_shader_custom(sh,&(struct pl_custom_shader){
++        .body="color.rgb=pow(max(color.rgb,vec3(0.0)),vec3(display_gamma))*display_scale;",
++        .input=PL_SHADER_SIG_COLOR,.output=PL_SHADER_SIG_COLOR,
++        .variables=vars,.num_variables=2});
++}
+ static bool async_output_frame(struct priv *p,const struct pl_hook_params *hp,
+                                 struct async_probe_slot *slot,const struct pl_hook *hook)
+ {
+@@ -16,13 +39,14 @@ static bool async_output_frame(struct priv *p,const struct pl_hook_params *hp,
+     bool ok=pl_shader_sample_direct(sh,pl_sample_src(.tex=hp->tex,.rect=hp->rect,.new_w=w,.new_h=h));
+     struct pl_color_repr repr=hp->repr;
+     pl_shader_decode_color_ex(sh,pl_color_decode_args(.repr=&repr));
+-    pl_shader_linearize(sh,&hp->color);
++    analyzer_output_linearize(p,sh,&hp->color);
+     ok=ok && pl_dispatch_finish(hp->dispatch,pl_dispatch_params(.shader=&sh,.target=tex));
+     if(!ok){pl_dispatch_abort(hp->dispatch,&sh);return false;}
+     return async_frame_dispatch(p,hp,slot,hook,tex,560);
+ }
+ /* Decode the post-color-management signal, before overlays/rotation/dither.
+- * No mapping is applied here: use the effective TARGET EOTF and primaries. */
++ * SDR uses the user's display assumption; HDR uses the effective TARGET EOTF.
++ * Both retain effective target primaries. */
+ static bool async_output_pixel(struct priv *p, const struct pl_hook_params *hp,
+                                struct async_probe_slot *slot, int x, int y)
+ {
+@@ -56,7 +80,7 @@ static bool async_output_pixel(struct priv *p, const struct pl_hook_params *hp,
+         .compute=true,.compute_group_size={1,1},.variables=vars,.num_variables=3,.descriptors=desc,.num_descriptors=2});
+     struct pl_color_repr repr=hp->repr;
+     pl_shader_decode_color_ex(sh,pl_color_decode_args(.repr=&repr));
+-    pl_shader_linearize(sh,&hp->color);
++    analyzer_output_linearize(p,sh,&hp->color);
+     ok=ok && pl_shader_custom(sh,&(struct pl_custom_shader){
+         .header=frame_math,
+         .body="vec3 rgb=color.rgb*203.0; out_samples[137]=vec4(rgb,dot(out_y,rgb));"
+diff --git a/video/out/analyzer_waveform_bridge.h b/video/out/analyzer_waveform_bridge.h
+index 702ecf6db..6429fa19e 100644
+--- a/video/out/analyzer_waveform_bridge.h
++++ b/video/out/analyzer_waveform_bridge.h
+@@ -26,11 +26,13 @@ static bool analyzer_waveform_reduce(struct priv *p, const struct pl_hook_params
+     if(!a->wave_buf) a->wave_buf=pl_buf_create(p->gpu,pl_buf_params(.size=bytes,.storable=true,.memory_type=PL_BUF_MEM_DEVICE));
+     if(!a->wave_buf) return false;
+     float range[2]={(a->wave_x-a->wave_dst.x0)/pl_rect_w(a->wave_dst),1.f/pl_rect_w(a->wave_dst)};
++    float peak=p->next_opts->analyzer_waveform_peak;
+     struct pl_shader_var vars[]={
+         {.var={.name="to2020",.type=PL_VAR_FLOAT,.dim_v=3,.dim_m=3,.dim_a=1},.data=matrix,.dynamic=true},
+         {.var=pl_var_vec3("yc"),.data=yc,.dynamic=true},
+         {.var=pl_var_float("nits"),.data=&scale,.dynamic=true},
+         {.var=pl_var_vec2("xrange"),.data=range,.dynamic=true},
++        {.var=pl_var_float("plot_peak"),.data=&peak,.dynamic=true},
+     };
+     struct pl_buffer_var bv={.var={.name="counts",.type=PL_VAR_UINT,.dim_v=1,.dim_m=1,.dim_a=width*bins*2},.layout={.offset=0,.stride=4,.size=bytes}};
+     struct pl_shader_desc desc[]={
+@@ -51,7 +53,7 @@ static bool analyzer_waveform_reduce(struct priv *p, const struct pl_hook_params
+         "vec3 c=texelFetch(wave_source,xy,0).rgb;"
+         "float v=%d==1 ? perceptual_bt2020(to2020*c) : %d==2 ? dot(yc,c) : max(c.r,max(c.g,c.b));"
+         "for(int ch=0;ch<%d;ch++){float value=%d==3?c[ch]:v;"
+-        "int bin=int(clamp(pq_encode_nits(max(value*nits,0.0))*256.0,0.0,255.0));atomicAdd(bins[ch*256+bin],1u);}}barrier();"
++        "int bin=int(clamp(pq_encode_nits(max(value*nits,0.0))/pq_encode_nits(plot_peak)*256.0,0.0,255.0));atomicAdd(bins[ch*256+bin],1u);}}barrier();"
+         "for(int i=lane;i<%d;i+=64)counts[%d+col*%d+i]=bins[i];",
+         bins,columns,columns-1,columns,columns,rows,rows,rows,
+         rotation,rotation,rotation,p->next_opts->analyzer_waveform,p->next_opts->analyzer_waveform,
+@@ -59,7 +61,7 @@ static bool analyzer_waveform_reduce(struct priv *p, const struct pl_hook_params
+     pl_shader sh=pl_dispatch_begin(hp->dispatch);
+     bool ok=pl_shader_custom(sh,&(struct pl_custom_shader){.description=output?"Analyzer output waveform":"Analyzer source waveform",
+         .header=header,.body=body,.input=PL_SHADER_SIG_NONE,.output=PL_SHADER_SIG_NONE,
+-        .variables=vars,.num_variables=4,.descriptors=desc,.num_descriptors=2,
++        .variables=vars,.num_variables=5,.descriptors=desc,.num_descriptors=2,
+         .compute=true,.compute_group_size={64,1}}) &&
+         pl_dispatch_compute(hp->dispatch,pl_dispatch_compute_params(.shader=&sh,.dispatch_size={width,1,1}));
+     talloc_free(header);talloc_free(body);
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index b9b2c22fd..fe4bdbd86 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -257,6 +257,8 @@ struct gl_next_opts {
+     int analyzer_async;
+     int analyzer_waveform, analyzer_waveform_y, analyzer_waveform_height;
+     int analyzer_waveform_layers, analyzer_waveform_tint;
++    float analyzer_sdr_output_peak, analyzer_sdr_output_gamma;
++    float analyzer_waveform_peak;
+     int analyzer_xy_x, analyzer_xy_y, analyzer_xy_size, analyzer_xy_intensity;
+     bool delayed_peak;
+     bool dovi_enhancement_layer;
+@@ -308,6 +310,9 @@ const struct m_sub_options gl_next_conf = {
+         {"active-image-detection", OPT_BOOL(active_image_detection)},
+         {"analyzer-async", OPT_INT(analyzer_async), M_RANGE(0, 3)},
+         {"analyzer-waveform", OPT_INT(analyzer_waveform), M_RANGE(0, 4)},
++        {"analyzer-sdr-output-peak", OPT_FLOAT(analyzer_sdr_output_peak), M_RANGE(1, 10000)},
++        {"analyzer-sdr-output-gamma", OPT_FLOAT(analyzer_sdr_output_gamma), M_RANGE(1, 4)},
++        {"analyzer-waveform-peak", OPT_FLOAT(analyzer_waveform_peak), M_RANGE(1, 10000)},
+         {"analyzer-xy-x", OPT_INT(analyzer_xy_x), M_RANGE(0, 32768)},
+         {"analyzer-xy-y", OPT_INT(analyzer_xy_y), M_RANGE(0, 32768)},
+         {"analyzer-xy-size", OPT_INT(analyzer_xy_size), M_RANGE(0, 4096)},
+@@ -344,6 +349,9 @@ const struct m_sub_options gl_next_conf = {
+     },
+     .defaults = &(struct gl_next_opts) {
+         .analyzer_waveform_layers = 3,
++        .analyzer_sdr_output_peak = 100,
++        .analyzer_sdr_output_gamma = 2.4,
++        .analyzer_waveform_peak = 10000,
+         .analyzer_waveform_tint = 16777215,
+         .analyzer_xy_intensity = 255,
+         .active_image_detection = true,
+-- 
+2.54.0.windows.1
+

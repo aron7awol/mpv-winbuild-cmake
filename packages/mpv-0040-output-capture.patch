@@ -1,0 +1,381 @@
+From fba46554623396982e24244069b549668606f1cc Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Tue, 8 Sep 2026 12:33:28 -0400
+Subject: [PATCH] gpu-next: capture live output without rerendering
+
+---
+ DOCS/man/input.rst         |  31 ++++++++
+ player/command.c           |  42 +++++++++++
+ video/out/output_capture.h | 145 +++++++++++++++++++++++++++++++++++++
+ video/out/vo.h             |  15 ++++
+ video/out/vo_gpu_next.c    |  21 ++++++
+ 5 files changed, 254 insertions(+)
+ create mode 100644 video/out/output_capture.h
+
+diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
+index 77500750a..da12a7fa6 100644
+--- a/DOCS/man/input.rst
++++ b/DOCS/man/input.rst
+@@ -1525,6 +1525,37 @@ Screenshot Commands
+         MPV_FORMAT_NODE_MAP
+             "filename"    MPV_FORMAT_STRING
+ 
++``capture-output <filename> [<redraw>]`` (mpv-ht, gpu-next/D3D11)
++    Arm a one-shot, lossless capture of the next live backbuffer before Present.
++    Unlike ``screenshot``, this does not render a separate image, change output
++    precision, or bypass the normal frame cache. All video and OSD already drawn
++    into that buffer are included. Windows composition and display processing
++    happen later and are not captured.
++
++    The result is an accepted request sequence, not completion. Poll the
++    ``output-capture`` property for the same sequence and state ``complete`` or
++    ``error``. Only one request may be pending. The path must be writable and
++    must not already exist; it is not expanded as a screenshot filename template.
++    An empty filename cancels a pending request and removes its partial file.
++    Seek/reset and VO teardown also cancel pending requests. Unsupported output
++    backends reject the command; there is no fallback to rerendered screenshots.
++
++    ``redraw`` defaults to ``yes`` and requests an ordinary cached redraw, so
++    paused content can be captured. ``no`` waits for the next naturally rendered
++    frame; a paused/minimized output may remain pending until cancelled. There
++    is no continuous capture or readback while inactive. A requested capture can
++    stall the VO for GPU synchronization and disk writing; use for diagnostics,
++    not frame-by-frame recording.
++
++    The file contains ``MPVCAP1`` and a newline, a UTF-8 JSON metadata line, then
++    tightly packed native framebuffer rows. It is not a PNG. Metadata describes
++    dimensions, row length, native format/type, little-endian component bits and
++    sample order, row orientation, color primaries/transfer, frame ID, PTS and
++    request sequence. No quantization or color conversion is performed.
++    Captures are bounded to 512 MiB of pixel data. The mpv-ht
++    ``analysis/read-output-capture.js`` reader supports native UNORM and float
++    output for automated pixel assertions.
++
+ ``screenshot-to-file <filename> [<flags>]``
+     Take a screenshot and save it to a given file. The format of the file will
+     be guessed by the extension (and ``--screenshot-format`` is ignored - the
+diff --git a/player/command.c b/player/command.c
+index 9d6286b5e..001123ee1 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -2774,6 +2774,26 @@ static int mp_property_gpu_render_formats(void *ctx, struct m_property *prop,
+     return m_property_read_sub(props, action, arg);
+ }
+ 
++static int mp_property_output_capture(void *ctx, struct m_property *prop,
++                                      int action, void *arg)
++{
++    MPContext *mpctx = ctx;
++    struct voctrl_output_capture v = {0};
++    if (!mpctx->video_out || vo_control(mpctx->video_out,
++            VOCTRL_GET_OUTPUT_CAPTURE, &v) != VO_TRUE)
++        return M_PROPERTY_UNAVAILABLE;
++    const char *states[] = {"idle", "pending", "complete", "error", "cancelled"};
++    struct m_sub_property props[] = {
++        {"state", SUB_PROP_STR(states[MPCLAMP(v.state, 0, 4)])},
++        {"sequence", SUB_PROP_INT64(v.sequence)},
++        {"width", SUB_PROP_INT(v.width)},
++        {"height", SUB_PROP_INT(v.height)},
++        {"error", SUB_PROP_STR(v.error)},
++        {0}
++    };
++    return m_property_read_sub(props, action, arg);
++}
++
+ static int mp_property_async_probe(void *ctx, struct m_property *prop, int action, void *arg)
+ {
+     MPContext *mpctx = ctx;
+@@ -4986,6 +5006,7 @@ static const struct m_property mp_properties_base[] = {
+     {"video-out-params", mp_property_vo_imgparams},
+     {"gpu-render-formats", mp_property_gpu_render_formats},
+     {"video-active-image", mp_property_video_active_image},
++    {"output-capture", mp_property_output_capture},
+     {"analyzer-async-result", mp_property_async_probe},
+     {"analyzer-chromaticity", mp_property_analyzer_chromaticity},
+     {"video-dec-params", mp_property_dec_imgparams},
+@@ -7727,6 +7748,21 @@ static void cmd_flush_status_line(void *p)
+     mp_msg_flush_status_line(mpctx->log, cmd->args[0].v.b);
+ }
+ 
++static void cmd_capture_output(void *p)
++{
++    struct mp_cmd_ctx *cmd = p;
++    struct voctrl_capture_output_request request = {
++        .path = cmd->args[0].v.s,
++        .redraw = cmd->args[1].v.b,
++    };
++    struct vo *vo = cmd->mpctx->video_out;
++    cmd->success = vo && vo_control(vo, VOCTRL_CAPTURE_OUTPUT, &request) == VO_TRUE;
++    if (cmd->success) {
++        cmd->result = (mpv_node){.format = MPV_FORMAT_INT64,
++                                .u.int64 = request.sequence};
++    }
++}
++
+ static void cmd_notify_property(void *p)
+ {
+     struct mp_cmd_ctx *cmd = p;
+@@ -7995,6 +8031,12 @@ const struct mp_cmd_def mp_cmds[] = {
+         },
+         .spawn_thread = true,
+     },
++    { "capture-output", cmd_capture_output,
++        {
++            {"filename", OPT_STRING(v.s)},
++            {"redraw", OPT_BOOL(v.b), OPTDEF_INT(1)},
++        },
++    },
+     { "screenshot-to-file", cmd_screenshot_to_file,
+         {
+             {"filename", OPT_STRING(v.s)},
+diff --git a/video/out/output_capture.h b/video/out/output_capture.h
+new file mode 100644
+index 000000000..cfb8a324e
+--- /dev/null
++++ b/video/out/output_capture.h
+@@ -0,0 +1,145 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++// On-demand diagnostics: read the real D3D11 backbuffer after all live rendering,
++// before Present. No screenshot render, format conversion or persistent copy.
++// Kept on the VO thread so arming, cancellation and backend lifetime are ordered.
++
++static void output_capture_finish(struct priv *p, int state, const char *error)
++{
++    if (p->capture_file && fclose(p->capture_file) != 0 && state == 2) {
++        state = 3;
++        error = "Closing capture file failed";
++    }
++    p->capture_file = NULL;
++    if (state != 2 && p->capture_path)
++        unlink(p->capture_path); // only the file exclusively created by this request
++    TA_FREEP(&p->capture_path);
++    p->capture_status.state = state;
++    snprintf(p->capture_status.error, sizeof(p->capture_status.error), "%s", error);
++    if (state == 3)
++        MP_ERR(p, "Output capture failed: %s\n", error);
++}
++
++static int output_capture_request(struct vo *vo,
++                                  struct voctrl_capture_output_request *r)
++{
++    struct priv *p = vo->priv;
++    if (!r->path || !r->path[0]) {
++        if (p->capture_file)
++            output_capture_finish(p, 4, "Cancelled");
++        r->sequence = p->capture_status.sequence;
++        return VO_TRUE;
++    }
++    if (p->capture_file || !vo->params || !p->sw)
++        return VO_FALSE;
++#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
++    if (!ra_is_d3d11(p->ra_ctx->ra))
++        return VO_FALSE;
++#else
++    return VO_FALSE;
++#endif
++    // Never overwrite a previous capture or an unrelated file.
++    FILE *file = fopen(r->path, "wbx");
++    if (!file)
++        return VO_FALSE;
++    p->capture_file = file;
++    p->capture_path = talloc_strdup(p, r->path);
++    p->capture_status = (struct voctrl_output_capture){
++        .state = 1, .sequence = p->capture_status.sequence + 1,
++    };
++    r->sequence = p->capture_status.sequence;
++    if (r->redraw)
++        vo->want_redraw = true; // normal cache reuse, not screenshot rendering
++    return VO_TRUE;
++}
++
++static void output_capture_frame(struct priv *p,
++                                  const struct pl_swapchain_frame *swframe,
++                                  const struct pl_frame *target)
++{
++#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
++    IDXGISwapChain *swap = NULL;
++    ID3D11Texture2D *source = NULL, *staging = NULL;
++    ID3D11Device *device = NULL;
++    ID3D11DeviceContext *context = NULL;
++    D3D11_MAPPED_SUBRESOURCE mapped = {0};
++    bool is_mapped = false, success = false;
++    const char *error = "D3D11 backbuffer readback failed";
++    pl_fmt fmt = swframe->fbo->params.format;
++    if (fmt->opaque || !fmt->texel_size) {
++        output_capture_finish(p, 3, "Unsupported opaque framebuffer format");
++        return;
++    }
++    swap = pl_d3d11_swapchain_unwrap(p->sw);
++    if (!swap || FAILED(IDXGISwapChain_GetBuffer(swap, 0,
++                            &IID_ID3D11Texture2D, (void **)&source)))
++        goto done;
++    D3D11_TEXTURE2D_DESC desc;
++    ID3D11Texture2D_GetDesc(source, &desc);
++    size_t row = (size_t)desc.Width * fmt->texel_size;
++    if (!desc.Width || !desc.Height || row > (512u << 20) / desc.Height ||
++        desc.SampleDesc.Count != 1 || desc.ArraySize != 1 || desc.MipLevels != 1 ||
++        desc.Width != swframe->fbo->params.w || desc.Height != swframe->fbo->params.h) {
++        error = "Unsupported or oversized backbuffer";
++        goto done;
++    }
++    unsigned dxgi_format = desc.Format;
++    ID3D11Texture2D_GetDevice(source, &device);
++    ID3D11Device_GetImmediateContext(device, &context);
++    desc.Usage = D3D11_USAGE_STAGING;
++    desc.BindFlags = desc.MiscFlags = 0;
++    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++    if (FAILED(ID3D11Device_CreateTexture2D(device, &desc, NULL, &staging)))
++        goto done;
++    // Same format and dimensions: exact native bits, no sampling/color pass.
++    ID3D11DeviceContext_CopyResource(context, (ID3D11Resource *)staging,
++                                     (ID3D11Resource *)source);
++    if (FAILED(ID3D11DeviceContext_Map(context, (ID3D11Resource *)staging, 0,
++                                      D3D11_MAP_READ, 0, &mapped)))
++        goto done;
++    is_mapped = true;
++    if (mapped.RowPitch < row)
++        goto done;
++    FILE *file = p->capture_file;
++    // Format/CSP labels are libplacebo constants, not user-supplied strings.
++    int n = fprintf(file,
++        "MPVCAP1\n{\"sequence\":%"PRId64",\"width\":%u,\"height\":%u,"
++        "\"format\":\"%s\",\"dxgi_format\":%u,\"type\":%d,"
++        "\"texel_size\":%zu,\"row_bytes\":%zu,\"bytes\":%zu,"
++        "\"host_bits\":[%d,%d,%d,%d],\"sample_order\":[%d,%d,%d,%d],"
++        "\"flipped\":%s,\"primaries\":\"%s\",\"transfer\":\"%s\","
++        "\"min_luma\":%.9g,\"max_luma\":%.9g,\"levels\":%d,\"alpha\":%d,"
++        "\"capture_stage\":\"before-present\",\"frame_id\":%"PRIu64",\"pts\":%.17g}\n",
++        p->capture_status.sequence, desc.Width, desc.Height, fmt->name,
++        dxgi_format, fmt->type, fmt->texel_size, row, row * desc.Height,
++        fmt->host_bits[0], fmt->host_bits[1], fmt->host_bits[2], fmt->host_bits[3],
++        fmt->sample_order[0], fmt->sample_order[1], fmt->sample_order[2], fmt->sample_order[3],
++        swframe->flipped ? "true" : "false",
++        pl_color_primaries_name(target->color.primaries),
++        pl_color_transfer_name(target->color.transfer),
++        isfinite(target->color.hdr.min_luma) ? target->color.hdr.min_luma : 0.0,
++        isfinite(target->color.hdr.max_luma) ? target->color.hdr.max_luma : 0.0,
++        target->repr.levels, target->repr.alpha, p->last_id,
++        isfinite(p->last_pts) ? p->last_pts : 0.0);
++    error = "Writing capture file failed";
++    if (n < 0)
++        goto done;
++    for (unsigned y = 0; y < desc.Height; y++) {
++        const uint8_t *pixels = (const uint8_t *)mapped.pData + (size_t)y * mapped.RowPitch;
++        if (fwrite(pixels, 1, row, file) != row)
++            goto done;
++    }
++    p->capture_status.width = desc.Width;
++    p->capture_status.height = desc.Height;
++    success = true;
++done:
++    if (is_mapped) ID3D11DeviceContext_Unmap(context, (ID3D11Resource *)staging, 0);
++    if (context) ID3D11DeviceContext_Release(context);
++    if (device) ID3D11Device_Release(device);
++    if (staging) ID3D11Texture2D_Release(staging);
++    if (source) ID3D11Texture2D_Release(source);
++    if (swap) IDXGISwapChain_Release(swap);
++    output_capture_finish(p, success ? 2 : 3, success ? "" : error);
++#else
++    output_capture_finish(p, 3, "Output capture requires D3D11");
++#endif
++}
+diff --git a/video/out/vo.h b/video/out/vo.h
+index 51e63595e..d43bc660b 100644
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -91,6 +91,8 @@ enum mp_voctrl {
+     // Active image bounds measured inside an encoded video frame.
+     VOCTRL_GET_ACTIVE_IMAGE,            // struct voctrl_active_image*
+     VOCTRL_GET_ASYNC_PROBE,             // experimental struct voctrl_async_probe*
++    VOCTRL_CAPTURE_OUTPUT,             // struct voctrl_capture_output_request*
++    VOCTRL_GET_OUTPUT_CAPTURE,         // struct voctrl_output_capture*
+ 
+     VOCTRL_SET_CURSOR_VISIBILITY,       // bool*
+ 
+@@ -150,6 +152,19 @@ struct voctrl_render_formats {
+     char output[VO_RENDER_FORMAT_NAME_MAX];
+ };
+ 
++struct voctrl_capture_output_request {
++    const char *path;                  // empty cancels a pending request
++    bool redraw;                       // request ordinary cached redraw when paused
++    int64_t sequence;                  // accepted request ID
++};
++
++struct voctrl_output_capture {
++    int state;                        // idle, pending, complete, error, cancelled
++    int64_t sequence;
++    int width, height;
++    char error[128];
++};
++
+ struct voctrl_async_probe {
+     int wave_x, wave_y, wave_w, wave_h;
+     int64_t wave_sequence;
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 3359e5c37..b9b2c22fd 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -187,6 +187,9 @@ struct priv {
+     uint64_t bar_indeterminate_count;
+     uint64_t bar_generation;
+     pl_swapchain sw;
++    FILE *capture_file;
++    char *capture_path;
++    struct voctrl_output_capture capture_status;
+     pl_fmt osd_fmt[SUBBITMAP_COUNT];
+     pl_tex *sub_tex;
+     int num_sub_tex;
+@@ -2576,6 +2579,8 @@ static const char *causal_scene_withheld_reason_name(int reason)
+     }
+ }
+ 
++#include "output_capture.h"
++
+ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+ {
+     struct priv *p = vo->priv;
+@@ -3302,6 +3307,12 @@ done:
+         pl_tex_clear(gpu, swframe.fbo, (float[4]){ 0.5, 0.0, 1.0, 1.0 });
+ 
+     pl_gpu_flush(gpu);
++    if (p->capture_file) {
++        if (valid)
++            output_capture_frame(p, &swframe, &target);
++        else
++            output_capture_finish(p, 3, "Live frame rendering failed");
++    }
+     p->frame_pending = true;
+     return VO_TRUE;
+ }
+@@ -3787,10 +3798,18 @@ static int control(struct vo *vo, uint32_t request, void *data)
+     }
+ 
+     case VOCTRL_RESET:
++        if (p->capture_file)
++            output_capture_finish(p, 4, "Playback reset before capture");
+         // Defer until the first new frame (unique ID) actually arrives
+         p->want_reset = true;
+         return VO_TRUE;
+ 
++    case VOCTRL_CAPTURE_OUTPUT:
++        return output_capture_request(vo, data);
++    case VOCTRL_GET_OUTPUT_CAPTURE:
++        *(struct voctrl_output_capture *)data = p->capture_status;
++        return VO_TRUE;
++
+     case VOCTRL_PERFORMANCE_DATA: {
+         struct voctrl_performance_data *perf = data;
+         copy_frame_info_to_mp(&p->perf_fresh, &perf->fresh, &p->hwdec_perf, &p->sw_upload_perf);
+@@ -4114,6 +4133,8 @@ done:
+ static void uninit(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
++    if (p->capture_file)
++        output_capture_finish(p, 4, "Video output closed before capture");
+ 
+     if (p->bar_commit_count) {
+         MP_VERBOSE(p, "Active image coverage first=%" PRIu64 " last=%" PRIu64
+-- 
+2.54.0.windows.1
+
