@@ -1,0 +1,327 @@
+From 0e93a2e68ab068db6e882ac4850ccb897a17808e Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Tue, 8 Sep 2026 07:52:33 -0400
+Subject: [PATCH] gpu-next: plot coherent brightest-P xy colors at OSD
+ brightness
+
+---
+ player/command.c                         |  11 +-
+ video/out/analyzer_async_bridge.h        |  21 +++-
+ video/out/analyzer_chromaticity_bridge.h | 123 +++++++++++++++++++++++
+ video/out/vo.h                           |   2 +-
+ video/out/vo_gpu_next.c                  |  10 ++
+ 5 files changed, 160 insertions(+), 7 deletions(-)
+ create mode 100644 video/out/analyzer_chromaticity_bridge.h
+
+diff --git a/player/command.c b/player/command.c
+index 130982423..9d6286b5e 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -2840,23 +2840,32 @@ static int mp_property_analyzer_chromaticity(void *ctx, struct m_property *prop,
+     struct vo *vo = mpctx->video_out;
+     if (!vo) return M_PROPERTY_UNAVAILABLE;
+     float bins[6400];
++    float colors[25600];
+     int64_t sequence;
+     mp_mutex_lock(&vo->async_probe_mutex);
+     sequence = vo->async_probe_snapshot.stats_ns;
+     memcpy(bins, vo->async_probe_snapshot.values+1120, sizeof(bins));
++    memcpy(colors, vo->async_probe_snapshot.values+7520, sizeof(colors));
+     mp_mutex_unlock(&vo->async_probe_mutex);
+     if (!sequence) return M_PROPERTY_UNAVAILABLE;
+     char *text = talloc_zero_size(NULL, 131072);
++    char *rgb = talloc_zero_size(text, 1048576);
++    size_t rgb_used = 0;
+     size_t used = 0;
+     // Sparse index:count representation bounds transport and Lua parse work.
+     for (int i=0; i<6400; i++) if (bins[i]>0) {
+         int n=snprintf(text+used,131072-used,"%s%d:%.0f",used?",":"",i,bins[i]);
+         if (n<0 || (size_t)n>=131072-used) { talloc_free(text); return M_PROPERTY_ERROR; }
+         used+=n;
++        n=snprintf(rgb+rgb_used,1048576-rgb_used,"%s%d:%.9g:%.9g:%.9g:%.9g",rgb_used?",":"",i,
++            colors[4*i],colors[4*i+1],colors[4*i+2],colors[4*i+3]);
++        if(n<0 || (size_t)n>=1048576-rgb_used){talloc_free(text);return M_PROPERTY_ERROR;}
++        rgb_used+=n;
+     }
+     struct m_sub_property props[] = {
+         {"frame-sequence", SUB_PROP_INT64(sequence)}, {"size", SUB_PROP_INT(80)},
+-        {"bins", SUB_PROP_STR(text)}, {0}
++        {"bins", SUB_PROP_STR(text)}, {"colors", SUB_PROP_STR(rgb)},
++        {"color-space", SUB_PROP_STR("bt.2020-linear-nits")}, {0}
+     };
+     int ret=m_property_read_sub(props,action,arg);
+     talloc_free(text);
+diff --git a/video/out/analyzer_async_bridge.h b/video/out/analyzer_async_bridge.h
+index dc70809e1..7a98dc104 100644
+--- a/video/out/analyzer_async_bridge.h
++++ b/video/out/analyzer_async_bridge.h
+@@ -8,6 +8,12 @@ struct async_probe_slot {
+     struct voctrl_async_probe meta;
+ };
+ struct async_probe {
++    pl_buf xy_buf;
++    pl_tex xy_tex;
++    pl_tex xy_display;
++    struct pl_overlay_part xy_part;
++    struct pl_overlay *xy_overlays;
++    float xy_cap, xy_background;
+     pl_buf wave_buf;
+     pl_tex wave_tex;
+     struct pl_overlay_part wave_part;
+@@ -31,6 +37,7 @@ struct async_probe {
+ #include "analyzer_frame_bridge.h"
+ #include "analyzer_output_bridge.h"
+ #include "analyzer_waveform_bridge.h"
++#include "analyzer_chromaticity_bridge.h"
+ 
+ static void async_probe_collect(struct priv *p)
+ {
+@@ -39,7 +46,7 @@ static void async_probe_collect(struct priv *p)
+     for (int i = 0; i < 4; i++) {
+         struct async_probe_slot *s = &a->slots[i];
+         if (!s->pending || pl_buf_poll(p->gpu, s->buf, 0)) continue;
+-        float values[7520] = {0};
++        float values[33120] = {0};
+         size_t size = s->meta.mode == 3 ? sizeof(values) : s->meta.mode == 2 ? 260 * sizeof(float) : 4 * sizeof(float);
+         if (pl_buf_read(p->gpu, s->buf, 0, values, size) &&
+             s->meta.mode == p->next_opts->analyzer_async) {
+@@ -48,14 +55,14 @@ static void async_probe_collect(struct priv *p)
+             if(s->meta.stats_ns > a->latest.stats_ns) {
+                 memcpy(a->latest.values+16,values+16,(548-16)*sizeof(float));
+                 memcpy(a->latest.values+576,values+576,532*sizeof(float));
+-                memcpy(a->latest.values+1120,values+1120,6400*sizeof(float));
++                memcpy(a->latest.values+1120,values+1120,32000*sizeof(float));
+                 a->latest.stats_ns=s->meta.stats_ns;
+             }
+             if(s->meta.sequence <= a->latest.sequence) {s->pending=false;continue;}
+             if (s->meta.mode==3 && !s->meta.stats_ns) {
+                 memcpy(values+16,a->latest.values+16,(548-16)*sizeof(float));
+                 memcpy(values+576,a->latest.values+576,532*sizeof(float));
+-                memcpy(values+1120,a->latest.values+1120,6400*sizeof(float));
++                memcpy(values+1120,a->latest.values+1120,32000*sizeof(float));
+                 s->meta.stats_ns=a->latest.stats_ns;
+             }
+             a->latest = s->meta;
+@@ -96,7 +103,7 @@ static struct pl_hook_res async_probe_hook(void *priv, const struct pl_hook_para
+     for (int i = 0; i < 4; i++) if (!a->slots[i].pending) { s = &a->slots[i]; break; }
+     if (!s) { a->skipped++; return (struct pl_hook_res){0}; }
+     if (!s->buf) s->buf = pl_buf_create(p->gpu, pl_buf_params(
+-        .size = 7520 * sizeof(float), .memory_type = PL_BUF_MEM_DEVICE,
++        .size = 33120 * sizeof(float), .memory_type = PL_BUF_MEM_DEVICE,
+         .host_readable = true, .storable = true));
+     if (!s->buf) return (struct pl_hook_res){0};
+     float pos[] = {
+@@ -170,7 +177,8 @@ static struct pl_hook_res async_probe_hook(void *priv, const struct pl_hook_para
+             memcmp(&a->output.rect,&a->last_output_rect,sizeof(a->output.rect));
+         if (revision && changed && a->output_valid &&
+             async_frame_dispatch(p,hp,s,source_hook,NULL,0) &&
+-            async_output_frame(p,&a->output,s,source_hook)) {
++            async_output_frame(p,&a->output,s,source_hook) &&
++            analyzer_xy_update(p,hp,s,source_hook)) {
+             s->meta.stats_ns=submitted;
+             analyzer_waveform_update(p,hp,s,source_hook);
+             a->last_stats_revision=revision;
+@@ -200,6 +208,9 @@ static const struct pl_hook *async_probe_init(struct vo *vo)
+ static void async_probe_destroy(struct priv *p)
+ {
+     if (!p->async_probe) return;
++    pl_buf_destroy(p->gpu,&p->async_probe->xy_buf);
++    pl_tex_destroy(p->gpu,&p->async_probe->xy_tex);
++    pl_tex_destroy(p->gpu,&p->async_probe->xy_display);
+     pl_buf_destroy(p->gpu,&p->async_probe->wave_buf);
+     pl_tex_destroy(p->gpu,&p->async_probe->wave_tex);
+     for (int i = 0; i < 4; i++) {
+diff --git a/video/out/analyzer_chromaticity_bridge.h b/video/out/analyzer_chromaticity_bridge.h
+new file mode 100644
+index 000000000..b8111394c
+--- /dev/null
++++ b/video/out/analyzer_chromaticity_bridge.h
+@@ -0,0 +1,123 @@
++/* Brightest-P source pixel per xy cell. Two ordered reductions select an
++ * indivisible RGB triplet; equal-P ties select the first raster-order pixel.
++ * No float atomics, 64-bit atomics, locks, or GPU -> CPU waits are required. */
++static bool analyzer_xy_update(struct priv *p, const struct pl_hook_params *hp,
++                               struct async_probe_slot *slot, const struct pl_hook *hook)
++{
++    struct async_probe *a=p->async_probe;
++    pl_tex source=pl_mpv_user_shader_saved_texture(hook,"ANALYZER_LINEAR");
++    if(!source || !a->xy_tex) return false;
++    if(!a->xy_buf) a->xy_buf=pl_buf_create(p->gpu,pl_buf_params(
++        .size=12800*4,.storable=true,.host_writable=true,.memory_type=PL_BUF_MEM_DEVICE));
++    if(!a->xy_buf) return false;
++    uint32_t initial[12800]={0};
++    for(int i=6400;i<12800;i++) initial[i]=UINT32_MAX;
++    pl_buf_write(p->gpu,a->xy_buf,0,initial,sizeof(initial));
++    float matrix[9];
++    for(int i=0;i<9;i++){char n[40];snprintf(n,sizeof(n),"source_to_bt2020_%d",i);matrix[i]=frame_parameter(hook,n);}
++    float scale=frame_parameter(hook,"source_is_sdr") ? frame_parameter(hook,"sdr_reference_peak") :
++        (frame_parameter(hook,"source_is_absolute") || frame_parameter(hook,"source_is_hlg")) ? 203.f : 100.f;
++    struct pl_shader_var vars[]={
++        {.var={.name="to2020",.type=PL_VAR_FLOAT,.dim_v=3,.dim_m=3,.dim_a=1},.data=matrix,.dynamic=true},
++        {.var=pl_var_float("nits"),.data=&scale,.dynamic=true},
++        {.var=pl_var_float("cap"),.data=&a->xy_cap,.dynamic=true},
++        {.var=pl_var_float("background"),.data=&a->xy_background,.dynamic=true},
++    };
++    struct pl_buffer_var bv={.var={.name="keys",.type=PL_VAR_UINT,.dim_v=1,.dim_m=1,.dim_a=12800},.layout={.offset=0,.stride=4,.size=51200}};
++    struct pl_shader_desc desc[]={
++        {.desc={.name="xy_source",.type=PL_DESC_SAMPLED_TEX},.binding={.object=source,.sample_mode=PL_TEX_SAMPLE_NEAREST}},
++        {.desc={.name="XYWinners",.type=PL_DESC_BUF_STORAGE,.access=PL_DESC_ACCESS_READWRITE},.binding.object=a->xy_buf,.buffer_vars=&bv,.num_buffer_vars=1},
++        {0},
++    };
++    const char *bin_math=
++        "int xy_bin(vec3 rgb){vec3 xyz=mat3(.636958,.262700,0.,.144617,.677998,.028073,.168881,.059302,1.060985)*rgb;"
++        "float total=xyz.x+xyz.y+xyz.z;if(!(total>1e-12))return -1;vec2 xy=xyz.xy/total;"
++        "if(!all(greaterThanEqual(xy,vec2(0)))||!all(lessThan(xy,vec2(.8,.9))))return -1;"
++        "ivec2 b=ivec2(xy/vec2(.8,.9)*80.);return b.y*80+b.x;}";
++    char *header=talloc_asprintf(NULL,"%s\n%s\nshared uint local_keys[6400];",frame_math,bin_math);
++    bool ok=true;
++    for(int pass=0;pass<2 && ok;pass++) {
++        // Row-local atomics avoid millions of contending global atomics for a
++        // monochrome frame. Shared storage is 25 KiB on both passes (D3D11 safe).
++        char *body=talloc_asprintf(NULL,
++            "int lane=int(gl_LocalInvocationID.x),y=int(gl_WorkGroupID.y);ivec2 sz=textureSize(xy_source,0);"
++            "for(int i=lane;i<6400;i+=64)local_keys[i]=%s;barrier();"
++            "for(int x=lane;x<sz.x;x+=64){vec3 c=to2020*texelFetch(xy_source,ivec2(x,y),0).rgb;int b=xy_bin(c);"
++            "float value=max(perceptual_bt2020(c),0.);if(b<0||isnan(value)||isinf(value))continue;uint key=floatBitsToUint(value);%s}barrier();"
++            "for(int i=lane;i<6400;i+=64){%s}",
++            pass?"0xffffffffu":"0u",
++            pass?"if(key==keys[b])atomicMin(local_keys[b],uint(y*sz.x+x));":"atomicMax(local_keys[b],key);",
++            pass?"if(local_keys[i]!=0xffffffffu)atomicMin(keys[6400+i],local_keys[i]);":"if(local_keys[i]>0u)atomicMax(keys[i],local_keys[i]);");
++        pl_shader sh=pl_dispatch_begin(hp->dispatch);
++        ok=pl_shader_custom(sh,&(struct pl_custom_shader){.description=pass?"Analyzer xy winning pixel":"Analyzer xy peak P",.header=header,.body=body,
++            .input=PL_SHADER_SIG_NONE,.output=PL_SHADER_SIG_NONE,.variables=vars,.num_variables=3,.descriptors=desc,.num_descriptors=2,
++            .compute=true,.compute_group_size={64,1}}) &&
++            pl_dispatch_compute(hp->dispatch,pl_dispatch_compute_params(.shader=&sh,.dispatch_size={1,source->params.h,1}));
++        talloc_free(body);if(!ok)pl_dispatch_abort(hp->dispatch,&sh);
++    }
++    talloc_free(header);
++    if(!ok)return false;
++    // The async diagnostic payload contains uncapped BT.2020 RGB nits and P.
++    // Drawing uses the same triplet, with one shared scale, never channel clip.
++    struct pl_buffer_var result={.var={.name="xy_colors",.type=PL_VAR_FLOAT,.dim_v=4,.dim_m=1,.dim_a=6400},.layout={.offset=7520*4,.stride=16,.size=6400*16}};
++    desc[2]=(struct pl_shader_desc){.desc={.name="XYColors",.type=PL_DESC_BUF_STORAGE,.access=PL_DESC_ACCESS_WRITEONLY},.binding.object=slot->buf,.buffer_vars=&result,.num_buffer_vars=1};
++    pl_shader sh=pl_dispatch_begin(hp->dispatch);
++    ok=pl_shader_custom(sh,&(struct pl_custom_shader){.description="Analyzer opaque xy color texture",.header=frame_math,
++        .body="ivec2 q=ivec2(gl_FragCoord.xy);int b=(79-q.y)*80+q.x;uint id=keys[6400+b];color=vec4(vec3(background),215./255.);xy_colors[b]=vec4(0);"
++              "if(id!=0xffffffffu){int w=textureSize(xy_source,0).x;vec3 c=to2020*texelFetch(xy_source,ivec2(int(id)%w,int(id)/w),0).rgb*nits;"
++              "xy_colors[b]=vec4(c,uintBitsToFloat(keys[b])*nits);"
++              "c*=min(1.,cap/max(max(c.r,c.g),max(c.b,1e-12)));"
++              "color=vec4(c/203.,1.);}",
++        .input=PL_SHADER_SIG_NONE,.output=PL_SHADER_SIG_COLOR,.variables=vars,.num_variables=4,.descriptors=desc,.num_descriptors=3}) &&
++        pl_dispatch_finish(hp->dispatch,pl_dispatch_params(.shader=&sh,.target=a->xy_tex));
++    if(!ok){pl_dispatch_abort(hp->dispatch,&sh);return false;}
++    // libplacebo filters overlay textures. Expand with nearest-cell sampling
++    // first, then display 1:1 so occupied cells retain alpha=1 at every pixel.
++    struct pl_shader_desc image={.desc={.name="cells",.type=PL_DESC_SAMPLED_TEX},
++        .binding={.object=a->xy_tex,.sample_mode=PL_TEX_SAMPLE_NEAREST}};
++    float size=(float)a->xy_display->params.w;
++    struct pl_shader_var size_var={.var=pl_var_float("size"),.data=&size,.dynamic=true};
++    sh=pl_dispatch_begin(hp->dispatch);
++    ok=pl_shader_custom(sh,&(struct pl_custom_shader){.description="Analyzer xy nearest-cell expansion",
++        .body="color=texelFetch(cells,clamp(ivec2(gl_FragCoord.xy/size*80.),ivec2(0),ivec2(79)),0);",
++        .input=PL_SHADER_SIG_NONE,.output=PL_SHADER_SIG_COLOR,.variables=&size_var,.num_variables=1,.descriptors=&image,.num_descriptors=1}) &&
++        pl_dispatch_finish(hp->dispatch,pl_dispatch_params(.shader=&sh,.target=a->xy_display));
++    if(!ok)pl_dispatch_abort(hp->dispatch,&sh);
++    return ok;
++}
++
++static void analyzer_xy_prepare(struct priv *p, struct pl_frame *target, struct pl_color_space osd)
++{
++    struct async_probe *a=p->async_probe;
++    if(!a || p->next_opts->analyzer_async!=3)return;
++    pl_color_space_infer(&osd);
++    float code=p->next_opts->analyzer_xy_intensity/255.f;
++    float light=code<=.04045f ? code/12.92f : powf((code+.055f)/1.055f,2.4f);
++    float cap=fmaxf(.0001f,osd.hdr.max_luma*light);
++    // Match the rest of the ASS card: #080808, alpha 215/255. Only plotted
++    // cells replace that backing with fully opaque source color.
++    float background=(8.f/255.f/12.92f)*osd.hdr.max_luma/203.f;
++    if(cap!=a->xy_cap || background!=a->xy_background){
++        a->xy_cap=cap;a->xy_background=background;a->last_stats_revision=0;
++    }
++    pl_fmt fmt=pl_find_fmt(p->gpu,PL_FMT_FLOAT,4,32,0,PL_FMT_CAP_SAMPLEABLE|PL_FMT_CAP_RENDERABLE);
++    bool fresh=!a->xy_tex;
++    if(!fmt || !pl_tex_recreate(p->gpu,&a->xy_tex,pl_tex_params(.w=80,.h=80,.format=fmt,.sampleable=true,.renderable=true,.blit_dst=true)))return;
++    if(fresh){pl_tex_clear(p->gpu,a->xy_tex,(float[4]){0});a->last_stats_revision=0;}
++    int size=p->next_opts->analyzer_xy_size;
++    int raster=MPMAX(size,80);
++    bool resized=!a->xy_display || a->xy_display->params.w!=raster;
++    if(resized)a->last_stats_revision=0;
++    if(!pl_tex_recreate(p->gpu,&a->xy_display,pl_tex_params(.w=raster,.h=raster,.format=fmt,.sampleable=true,.renderable=true,.blit_dst=true)))return;
++    if(resized)pl_tex_clear(p->gpu,a->xy_display,(float[4]){0});
++    if(size<=0)return;
++    int x=p->next_opts->analyzer_xy_x,y=p->next_opts->analyzer_xy_y;
++    a->xy_part=(struct pl_overlay_part){.src={0,0,raster,raster},.dst={x,y,x+size,y+size}};
++    MP_TARRAY_GROW(p,a->xy_overlays,target->num_overlays);
++    memcpy(a->xy_overlays+1,target->overlays,target->num_overlays*sizeof(*target->overlays));
++    a->xy_overlays[0]=(struct pl_overlay){.tex=a->xy_display,.mode=PL_OVERLAY_NORMAL,
++        .repr={.alpha=PL_ALPHA_INDEPENDENT},
++        .color={.primaries=PL_COLOR_PRIM_BT_2020,.transfer=PL_COLOR_TRC_LINEAR,.hdr={.min_luma=0,.max_luma=cap}},
++        .coords=PL_OVERLAY_COORDS_DST_FRAME,.parts=&a->xy_part,.num_parts=1};
++    target->overlays=a->xy_overlays;target->num_overlays++;
++}
+diff --git a/video/out/vo.h b/video/out/vo.h
+index de759dad8..51e63595e 100644
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -157,7 +157,7 @@ struct voctrl_async_probe {
+     int x, y, mode;
+     double ready_ms;
+     int64_t stats_ns;
+-    float values[7520]; // Existing telemetry followed by 80x80 source xy counts.
++    float values[33120]; // Telemetry, xy counts, then 80x80 winning RGB nits/P.
+ };
+ 
+ struct voctrl_active_image {
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 444d0d67b..3359e5c37 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -254,6 +254,7 @@ struct gl_next_opts {
+     int analyzer_async;
+     int analyzer_waveform, analyzer_waveform_y, analyzer_waveform_height;
+     int analyzer_waveform_layers, analyzer_waveform_tint;
++    int analyzer_xy_x, analyzer_xy_y, analyzer_xy_size, analyzer_xy_intensity;
+     bool delayed_peak;
+     bool dovi_enhancement_layer;
+     bool causal_scene_diagnostics;
+@@ -304,6 +305,10 @@ const struct m_sub_options gl_next_conf = {
+         {"active-image-detection", OPT_BOOL(active_image_detection)},
+         {"analyzer-async", OPT_INT(analyzer_async), M_RANGE(0, 3)},
+         {"analyzer-waveform", OPT_INT(analyzer_waveform), M_RANGE(0, 4)},
++        {"analyzer-xy-x", OPT_INT(analyzer_xy_x), M_RANGE(0, 32768)},
++        {"analyzer-xy-y", OPT_INT(analyzer_xy_y), M_RANGE(0, 32768)},
++        {"analyzer-xy-size", OPT_INT(analyzer_xy_size), M_RANGE(0, 4096)},
++        {"analyzer-xy-intensity", OPT_INT(analyzer_xy_intensity), M_RANGE(0, 255)},
+         {"analyzer-waveform-y", OPT_INT(analyzer_waveform_y), M_RANGE(0, 32768)},
+         {"analyzer-waveform-height", OPT_INT(analyzer_waveform_height), M_RANGE(0, 4096)},
+         {"analyzer-waveform-layers", OPT_INT(analyzer_waveform_layers), M_RANGE(1, 3)},
+@@ -337,6 +342,7 @@ const struct m_sub_options gl_next_conf = {
+     .defaults = &(struct gl_next_opts) {
+         .analyzer_waveform_layers = 3,
+         .analyzer_waveform_tint = 16777215,
++        .analyzer_xy_intensity = 255,
+         .active_image_detection = true,
+         .border_background = BACKGROUND_COLOR,
+         .background_blur_radius = 16.0f,
+@@ -3109,6 +3115,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+     analyzer_waveform_prepare(p,&target,
+         libass_overlay_color(p,&(struct sub_bitmaps){0},frame->current,get_ref_luma(p)),
+         vo->params ? (vo->params->rotate%360+360)%360 : 0);
++    analyzer_xy_prepare(p,&target,
++        libass_overlay_color(p,&(struct sub_bitmaps){0},frame->current,get_ref_luma(p)));
+ 
+     // Render frame
+     stats_time_start(p->stats, "render");
+@@ -3648,6 +3656,8 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
+     if (args->osd) analyzer_waveform_prepare(p,&target,
+         libass_overlay_color(p,&(struct sub_bitmaps){0},mpi,get_ref_luma(p)),
+         vo->params ? (vo->params->rotate%360+360)%360 : 0);
++    if (args->osd) analyzer_xy_prepare(p,&target,
++        libass_overlay_color(p,&(struct sub_bitmaps){0},mpi,get_ref_luma(p)));
+     if (!pl_render_image(p->rr, &image, &target, &params)) {
+         MP_ERR(vo, "Failed rendering frame!\n");
+         goto done;
+-- 
+2.54.0.windows.1
+
