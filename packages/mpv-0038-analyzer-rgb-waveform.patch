@@ -1,0 +1,108 @@
+From ec0f2c9abef2d8a60d9c1351d7f7876c60f04d9c Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Mon, 7 Sep 2026 21:00:46 -0400
+Subject: [PATCH] gpu-next: add full-width RGB overlay waveform
+
+---
+ video/out/analyzer_waveform_bridge.h | 32 +++++++++++++++++-----------
+ video/out/vo_gpu_next.c              |  2 +-
+ 2 files changed, 20 insertions(+), 14 deletions(-)
+
+diff --git a/video/out/analyzer_waveform_bridge.h b/video/out/analyzer_waveform_bridge.h
+index f73e9456e..0ba4596ad 100644
+--- a/video/out/analyzer_waveform_bridge.h
++++ b/video/out/analyzer_waveform_bridge.h
+@@ -5,6 +5,8 @@ static bool analyzer_waveform_reduce(struct priv *p, const struct pl_hook_params
+     struct async_probe *a=p->async_probe;
+     if (!tex || !a->wave_tex || a->wave_w<1) return false;
+     int width=a->wave_w, rotation=a->wave_rotation;
++    int channels=p->next_opts->analyzer_waveform==4 ? 3 : 1;
++    int bins=256*channels;
+     int columns=(rotation==90 || rotation==270) ? tex->params.h : tex->params.w;
+     int rows=(rotation==90 || rotation==270) ? tex->params.w : tex->params.h;
+     float matrix[9], yc[3];
+@@ -19,7 +21,7 @@ static bool analyzer_waveform_reduce(struct priv *p, const struct pl_hook_params
+         for(int i=0;i<3;i++){yc[i]=xyz.m[1][i];for(int j=0;j<3;j++)matrix[3*j+i]=map.m[i][j];}
+         scale=203.f;
+     }
+-    size_t bytes=(size_t)width*256*2*4;
++    size_t bytes=(size_t)width*bins*2*4;
+     if(a->wave_buf && a->wave_buf->params.size!=bytes) pl_buf_destroy(p->gpu,&a->wave_buf);
+     if(!a->wave_buf) a->wave_buf=pl_buf_create(p->gpu,pl_buf_params(.size=bytes,.storable=true,.memory_type=PL_BUF_MEM_DEVICE));
+     if(!a->wave_buf) return false;
+@@ -30,15 +32,15 @@ static bool analyzer_waveform_reduce(struct priv *p, const struct pl_hook_params
+         {.var=pl_var_float("nits"),.data=&scale,.dynamic=true},
+         {.var=pl_var_vec2("xrange"),.data=range,.dynamic=true},
+     };
+-    struct pl_buffer_var bv={.var={.name="counts",.type=PL_VAR_UINT,.dim_v=1,.dim_m=1,.dim_a=width*256*2},.layout={.offset=0,.stride=4,.size=bytes}};
++    struct pl_buffer_var bv={.var={.name="counts",.type=PL_VAR_UINT,.dim_v=1,.dim_m=1,.dim_a=width*bins*2},.layout={.offset=0,.stride=4,.size=bytes}};
+     struct pl_shader_desc desc[]={
+         {.desc={.name="wave_source",.type=PL_DESC_SAMPLED_TEX},.binding={.object=tex,.sample_mode=PL_TEX_SAMPLE_NEAREST}},
+         {.desc={.name="WaveCounts",.type=PL_DESC_BUF_STORAGE,.access=PL_DESC_ACCESS_WRITEONLY},.binding.object=a->wave_buf,.buffer_vars=&bv,.num_buffer_vars=1},
+     };
+-    char *header=talloc_asprintf(NULL,"%s\nshared uint bins[256];\n",frame_math);
++    char *header=talloc_asprintf(NULL,"%s\nshared uint bins[%d];\n",frame_math,bins);
+     char *body=talloc_asprintf(NULL,
+         "int lane=int(gl_LocalInvocationID.x), col=int(gl_WorkGroupID.x);"
+-        "for(int i=lane;i<256;i+=64)bins[i]=0u;barrier();"
++        "for(int i=lane;i<%d;i+=64)bins[i]=0u;barrier();"
+         "int lo=clamp(int(floor((xrange.x+col*xrange.y)*%d.0)),0,%d);"
+         "int hi=clamp(int(floor((xrange.x+(col+1)*xrange.y)*%d.0)),lo+1,%d);"
+         "for(int n=lane;n<(hi-lo)*%d;n+=64){int sx=lo+n/%d, sy=n%%%d;"
+@@ -48,10 +50,12 @@ static bool analyzer_waveform_reduce(struct priv *p, const struct pl_hook_params
+         "if(%d==270)xy=ivec2(sz.x-1-sy,sx);"
+         "vec3 c=texelFetch(wave_source,xy,0).rgb;"
+         "float v=%d==1 ? perceptual_bt2020(to2020*c) : %d==2 ? dot(yc,c) : max(c.r,max(c.g,c.b));"
+-        "int bin=int(clamp(pq_encode_nits(max(v*nits,0.0))*256.0,0.0,255.0));atomicAdd(bins[bin],1u);}barrier();"
+-        "for(int i=lane;i<256;i+=64)counts[%d+col*256+i]=bins[i];",
+-        columns,columns-1,columns,columns,rows,rows,rows,
+-        rotation,rotation,rotation,p->next_opts->analyzer_waveform,p->next_opts->analyzer_waveform,output?width*256:0);
++        "for(int ch=0;ch<%d;ch++){float value=%d==3?c[ch]:v;"
++        "int bin=int(clamp(pq_encode_nits(max(value*nits,0.0))*256.0,0.0,255.0));atomicAdd(bins[ch*256+bin],1u);}}barrier();"
++        "for(int i=lane;i<%d;i+=64)counts[%d+col*%d+i]=bins[i];",
++        bins,columns,columns-1,columns,columns,rows,rows,rows,
++        rotation,rotation,rotation,p->next_opts->analyzer_waveform,p->next_opts->analyzer_waveform,
++        channels,channels,bins,output?width*bins:0,bins);
+     pl_shader sh=pl_dispatch_begin(hp->dispatch);
+     bool ok=pl_shader_custom(sh,&(struct pl_custom_shader){.description=output?"Analyzer output waveform":"Analyzer source waveform",
+         .header=header,.body=body,.input=PL_SHADER_SIG_NONE,.output=PL_SHADER_SIG_NONE,
+@@ -72,16 +76,18 @@ static void analyzer_waveform_update(struct priv *p,const struct pl_hook_params
+     if(!analyzer_waveform_reduce(p,hp,hook,source,false) ||
+        !analyzer_waveform_reduce(p,&a->output,hook,slot->output_linear,true)) return;
+     int width=a->wave_w, tint=p->next_opts->analyzer_waveform_tint;
++    int channels=p->next_opts->analyzer_waveform==4 ? 3 : 1, stride=256*channels;
+     float rgb[3]={((tint>>16)&255)/255.f,((tint>>8)&255)/255.f,(tint&255)/255.f};
+     struct pl_shader_var var={.var=pl_var_vec3("tint"),.data=rgb,.dynamic=true};
+-    struct pl_buffer_var bv={.var={.name="counts",.type=PL_VAR_UINT,.dim_v=1,.dim_m=1,.dim_a=width*512},.layout={.offset=0,.stride=4,.size=(size_t)width*512*4}};
++    struct pl_buffer_var bv={.var={.name="counts",.type=PL_VAR_UINT,.dim_v=1,.dim_m=1,.dim_a=width*stride*2},.layout={.offset=0,.stride=4,.size=(size_t)width*stride*2*4}};
+     struct pl_shader_desc desc={.desc={.name="WaveCounts",.type=PL_DESC_BUF_STORAGE,.access=PL_DESC_ACCESS_READONLY},.binding.object=a->wave_buf,.buffer_vars=&bv,.num_buffer_vars=1};
+     char *body=talloc_asprintf(NULL,
+-        "ivec2 q=ivec2(gl_FragCoord.xy);int bin=255-q.y;"
+-        "float s=%d==2?0.0:float(counts[q.x*256+bin]);float o=%d==1?0.0:float(counts[%d+q.x*256+bin]);"
++        "ivec2 q=ivec2(gl_FragCoord.xy);int bin=255-q.y;vec3 c=vec3(0);"
++        "for(int ch=0;ch<%d;ch++){int idx=q.x*%d+ch*256+bin;"
++        "float s=%d==2?0.0:float(counts[idx]);float o=%d==1?0.0:float(counts[%d+idx]);"
+         "s=s>0.0?clamp(.20+.13*log(1.0+s),0.0,1.0):0.0;o=o>0.0?clamp(.20+.13*log(1.0+o),0.0,1.0):0.0;"
+-        "vec3 c=max(vec3(.18,.78,1)*s,vec3(1,.72,.32)*o)*tint;"
+-        "color=vec4(c,.86);",p->next_opts->analyzer_waveform_layers,p->next_opts->analyzer_waveform_layers,width*256);
++        "if(%d==3)c[ch]=max(s,o);else c=max(vec3(.18,.78,1)*s,vec3(1,.72,.32)*o);}"
++        "color=vec4(c*tint,.86);",channels,stride,p->next_opts->analyzer_waveform_layers,p->next_opts->analyzer_waveform_layers,width*stride,channels);
+     pl_shader sh=pl_dispatch_begin(hp->dispatch);
+     bool ok=pl_shader_custom(sh,&(struct pl_custom_shader){.description="Analyzer waveform density texture",.body=body,
+         .input=PL_SHADER_SIG_NONE,.output=PL_SHADER_SIG_COLOR,.variables=&var,.num_variables=1,.descriptors=&desc,.num_descriptors=1}) &&
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 49ff7d157..444d0d67b 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -303,7 +303,7 @@ const struct m_sub_options gl_next_conf = {
+         {"hdr-authored-scene-reset", OPT_BOOL(authored_scene_reset)},
+         {"active-image-detection", OPT_BOOL(active_image_detection)},
+         {"analyzer-async", OPT_INT(analyzer_async), M_RANGE(0, 3)},
+-        {"analyzer-waveform", OPT_INT(analyzer_waveform), M_RANGE(0, 3)},
++        {"analyzer-waveform", OPT_INT(analyzer_waveform), M_RANGE(0, 4)},
+         {"analyzer-waveform-y", OPT_INT(analyzer_waveform_y), M_RANGE(0, 32768)},
+         {"analyzer-waveform-height", OPT_INT(analyzer_waveform_height), M_RANGE(0, 4096)},
+         {"analyzer-waveform-layers", OPT_INT(analyzer_waveform_layers), M_RANGE(1, 3)},
+-- 
+2.54.0.windows.1
+
