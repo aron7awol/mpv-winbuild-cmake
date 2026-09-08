@@ -1,0 +1,220 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Mon, 7 Sep 2026 18:00:00 -0400
+Subject: [PATCH] gpu-next: accumulate source chromaticity density asynchronously
+
+Source-only 80x80 xy population, sparse frame-cadence readback property,
+and target-primary-aware output pixel xy. No waits under queue pressure.
+
+---
+diff --git a/player/command.c b/player/command.c
+index 8f4018ba0..7c3ee4830 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -2812,6 +2812,8 @@ static int mp_property_async_probe(void *ctx, struct m_property *prop, int actio
+         {"output-r", SUB_PROP_DOUBLE(v.values[548])}, {"output-g", SUB_PROP_DOUBLE(v.values[549])},
+         {"output-b", SUB_PROP_DOUBLE(v.values[550])}, {"output-Y", SUB_PROP_DOUBLE(v.values[551])},
+         {"output-P", SUB_PROP_DOUBLE(v.values[552])}, {"output-valid", SUB_PROP_BOOL(v.values[553] > .5f)},
++        {"output-cx", SUB_PROP_DOUBLE(v.values[554])}, {"output-cy", SUB_PROP_DOUBLE(v.values[555])},
++        {"output-chromatic", SUB_PROP_BOOL(v.values[556] > .5f)},
+         {"frame", SUB_PROP_STR(frame)}, {"frame-age-ms", SUB_PROP_DOUBLE(v.stats_ns ? (mp_time_ns()-v.stats_ns)/1e6 : -1)},
+         {"output-frame", SUB_PROP_STR(output_frame)},
+         {"frame-sequence", SUB_PROP_INT64(v.stats_ns)}, {0}
+@@ -2823,6 +2825,37 @@ static int mp_property_async_probe(void *ctx, struct m_property *prop, int actio
+     return ret;
+ }
+ 
++// Queried only when frame-sequence changes, not for every cursor update.
++static int mp_property_analyzer_chromaticity(void *ctx, struct m_property *prop,
++                                            int action, void *arg)
++{
++    MPContext *mpctx = ctx;
++    struct vo *vo = mpctx->video_out;
++    if (!vo) return M_PROPERTY_UNAVAILABLE;
++    float bins[6400];
++    int64_t sequence;
++    mp_mutex_lock(&vo->async_probe_mutex);
++    sequence = vo->async_probe_snapshot.stats_ns;
++    memcpy(bins, vo->async_probe_snapshot.values+1120, sizeof(bins));
++    mp_mutex_unlock(&vo->async_probe_mutex);
++    if (!sequence) return M_PROPERTY_UNAVAILABLE;
++    char *text = talloc_zero_size(NULL, 131072);
++    size_t used = 0;
++    // Sparse index:count representation bounds transport and Lua parse work.
++    for (int i=0; i<6400; i++) if (bins[i]>0) {
++        int n=snprintf(text+used,131072-used,"%s%d:%.0f",used?",":"",i,bins[i]);
++        if (n<0 || (size_t)n>=131072-used) { talloc_free(text); return M_PROPERTY_ERROR; }
++        used+=n;
++    }
++    struct m_sub_property props[] = {
++        {"frame-sequence", SUB_PROP_INT64(sequence)}, {"size", SUB_PROP_INT(80)},
++        {"bins", SUB_PROP_STR(text)}, {0}
++    };
++    int ret=m_property_read_sub(props,action,arg);
++    talloc_free(text);
++    return ret;
++}
++
+ static int mp_property_video_active_image(void *ctx, struct m_property *prop,
+                                           int action, void *arg)
+ {
+@@ -4938,6 +4971,7 @@ static const struct m_property mp_properties_base[] = {
+     {"gpu-render-formats", mp_property_gpu_render_formats},
+     {"video-active-image", mp_property_video_active_image},
+     {"analyzer-async-result", mp_property_async_probe},
++    {"analyzer-chromaticity", mp_property_analyzer_chromaticity},
+     {"video-dec-params", mp_property_dec_imgparams},
+     {"video-params", mp_property_vd_imgparams},
+     {"video-frame-info", mp_property_video_frame_info},
+diff --git a/video/out/analyzer_async_bridge.h b/video/out/analyzer_async_bridge.h
+index 7222c179f..ff1a92c76 100644
+--- a/video/out/analyzer_async_bridge.h
++++ b/video/out/analyzer_async_bridge.h
+@@ -31,7 +31,7 @@ static void async_probe_collect(struct priv *p)
+     for (int i = 0; i < 4; i++) {
+         struct async_probe_slot *s = &a->slots[i];
+         if (!s->pending || pl_buf_poll(p->gpu, s->buf, 0)) continue;
+-        float values[1120] = {0};
++        float values[7520] = {0};
+         size_t size = s->meta.mode == 3 ? sizeof(values) : s->meta.mode == 2 ? 260 * sizeof(float) : 4 * sizeof(float);
+         if (pl_buf_read(p->gpu, s->buf, 0, values, size) &&
+             s->meta.mode == p->next_opts->analyzer_async) {
+@@ -40,12 +40,14 @@ static void async_probe_collect(struct priv *p)
+             if(s->meta.stats_ns > a->latest.stats_ns) {
+                 memcpy(a->latest.values+16,values+16,(548-16)*sizeof(float));
+                 memcpy(a->latest.values+576,values+576,532*sizeof(float));
++                memcpy(a->latest.values+1120,values+1120,6400*sizeof(float));
+                 a->latest.stats_ns=s->meta.stats_ns;
+             }
+             if(s->meta.sequence <= a->latest.sequence) {s->pending=false;continue;}
+             if (s->meta.mode==3 && !s->meta.stats_ns) {
+                 memcpy(values+16,a->latest.values+16,(548-16)*sizeof(float));
+                 memcpy(values+576,a->latest.values+576,532*sizeof(float));
++                memcpy(values+1120,a->latest.values+1120,6400*sizeof(float));
+                 s->meta.stats_ns=a->latest.stats_ns;
+             }
+             a->latest = s->meta;
+@@ -83,7 +85,7 @@ static struct pl_hook_res async_probe_hook(void *priv, const struct pl_hook_para
+     for (int i = 0; i < 4; i++) if (!a->slots[i].pending) { s = &a->slots[i]; break; }
+     if (!s) { a->skipped++; return (struct pl_hook_res){0}; }
+     if (!s->buf) s->buf = pl_buf_create(p->gpu, pl_buf_params(
+-        .size = 1120 * sizeof(float), .memory_type = PL_BUF_MEM_DEVICE,
++        .size = 7520 * sizeof(float), .memory_type = PL_BUF_MEM_DEVICE,
+         .host_readable = true, .storable = true));
+     if (!s->buf) return (struct pl_hook_res){0};
+     float pos[] = {
+diff --git a/video/out/analyzer_frame_bridge.h b/video/out/analyzer_frame_bridge.h
+index e9cd6af03..421791704 100644
+--- a/video/out/analyzer_frame_bridge.h
++++ b/video/out/analyzer_frame_bridge.h
+@@ -16,15 +16,19 @@ static bool async_frame_dispatch(struct priv *p, const struct pl_hook_params *hp
+     pl_tex source=output ? output : pl_mpv_user_shader_saved_texture(hook,"ANALYZER_LINEAR");
+     if (!source) return false;
+     int w=source->params.w, h=source->params.h;
+-    size_t scratch_size=2048+(size_t)h*48;
++    // 80x80 source xy density, in addition to the two 256-bin histograms.
++    // Shared storage stays below D3D11's 32 KiB limit (29,952 bytes).
++    int bins=output ? 512 : 6912;
++    size_t bins_size=(size_t)bins*4;
++    size_t scratch_size=bins_size+(size_t)h*48;
+     pl_buf *scratch=output ? &slot->output_scratch : &slot->scratch;
+     if (*scratch && (*scratch)->params.size!=scratch_size)
+         pl_buf_destroy(p->gpu,scratch);
+     if (!*scratch) *scratch=pl_buf_create(p->gpu,pl_buf_params(
+         .size=scratch_size,.memory_type=PL_BUF_MEM_DEVICE,.storable=true,.host_writable=true));
+     if (!*scratch) return false;
+-    uint32_t zero[512]={0};
+-    pl_buf_write(p->gpu,*scratch,0,zero,sizeof(zero));
++    uint32_t zero[6912]={0};
++    pl_buf_write(p->gpu,*scratch,0,zero,bins_size);
+     float matrix[9], ycoeff[3];
+     for(int i=0;i<9;i++) { char name[40]; snprintf(name,sizeof(name),"source_to_bt2020_%d",i); matrix[i]=frame_parameter(hook,name); }
+     for(int i=0;i<3;i++) { char name[40]; snprintf(name,sizeof(name),"source_cie_y_%d",i); ycoeff[i]=frame_parameter(hook,name); }
+@@ -43,35 +47,43 @@ static bool async_frame_dispatch(struct priv *p, const struct pl_hook_params *hp
+         {.var=pl_var_float("nits_scale"),.data=&scale,.dynamic=true},
+     };
+     struct pl_buffer_var scratch_vars[]={
+-        {.var={.name="bins",.type=PL_VAR_UINT,.dim_v=1,.dim_m=1,.dim_a=512},.layout={.offset=0,.stride=4,.size=2048}},
+-        {.var={.name="rows",.type=PL_VAR_FLOAT,.dim_v=4,.dim_m=1,.dim_a=h*3},.layout={.offset=2048,.stride=16,.size=(size_t)h*48}},
++        {.var={.name="bins",.type=PL_VAR_UINT,.dim_v=1,.dim_m=1,.dim_a=bins},.layout={.offset=0,.stride=4,.size=bins_size}},
++        {.var={.name="rows",.type=PL_VAR_FLOAT,.dim_v=4,.dim_m=1,.dim_a=h*3},.layout={.offset=bins_size,.stride=16,.size=(size_t)h*48}},
+     };
+     struct pl_shader_desc desc[]={
+         {.desc={.name="frame_tex",.type=PL_DESC_SAMPLED_TEX},.binding={.object=source,.address_mode=PL_TEX_ADDRESS_CLAMP,.sample_mode=PL_TEX_SAMPLE_NEAREST}},
+         {.desc={.name="FrameScratch",.type=PL_DESC_BUF_STORAGE,.access=PL_DESC_ACCESS_READWRITE},.binding.object=*scratch,.buffer_vars=scratch_vars,.num_buffer_vars=2},
+     };
+-    char *header=talloc_asprintf(NULL,"%s\nshared vec3 mn[64], mx[64], sm[64];\nshared uint hist[512];\n",frame_math);
++    char *header=talloc_asprintf(NULL,"%s\n#define BINS %d\n#define SOURCE_DENSITY %d\nshared vec3 mn[64], mx[64], sm[64];\nshared uint hist[BINS];\n",frame_math,bins,!output);
+     const char *body=
+         "int lane=int(gl_LocalInvocationID.x), y=int(gl_WorkGroupID.y); ivec2 sz=textureSize(frame_tex,0);"
+-        "for(int i=lane;i<512;i+=64) hist[i]=0u; barrier();"
++        "for(int i=lane;i<BINS;i+=64) hist[i]=0u; barrier();"
+         "vec3 lo=vec3(1e30), hi=vec3(0), sum=vec3(0);"
+         "for(int x=lane;x<sz.x;x+=64){vec3 c=texelFetch(frame_tex,ivec2(x,y),0).rgb;"
+         "vec3 v=vec3(max(dot(ycoeff,c),0.0),max(perceptual_bt2020(to2020*c),0.0),max(max(c.r,c.g),max(c.b,0.0)))*nits_scale;"
+         "lo=min(lo,v); hi=max(hi,v); sum+=v;"
+         "int bp=int(clamp(pq_encode_nits(v.y)*256.0,0.0,255.0));"
+         "int br=int(clamp(pq_encode_nits(v.z)*256.0,0.0,255.0));"
+-        "atomicAdd(hist[bp],1u); atomicAdd(hist[256+br],1u);}"
++        "atomicAdd(hist[bp],1u); atomicAdd(hist[256+br],1u);"
++        "\n#if SOURCE_DENSITY\n"
++        "vec3 rgb=to2020*c; vec3 xyz=mat3(.636958,.262700,0.0,.144617,.677998,.028073,.168881,.059302,1.060985)*rgb;"
++        "float total=xyz.x+xyz.y+xyz.z;"
++        "if(total>1e-12){vec2 xy=xyz.xy/total;"
++        "if(all(greaterThanEqual(xy,vec2(0))) && all(lessThan(xy,vec2(.8,.9)))){"
++        "ivec2 bin=ivec2(xy/vec2(.8,.9)*80.0);atomicAdd(hist[512+bin.y*80+bin.x],1u);}}"
++        "\n#endif\n}"
+         "mn[lane]=lo; mx[lane]=hi; sm[lane]=sum; barrier();"
+         "for(int step=32;step>0;step/=2){if(lane<step){mn[lane]=min(mn[lane],mn[lane+step]);mx[lane]=max(mx[lane],mx[lane+step]);sm[lane]+=sm[lane+step];}barrier();}"
+         "if(lane==0){rows[3*y]=vec4(mn[0],0);rows[3*y+1]=vec4(mx[0],0);rows[3*y+2]=vec4(sm[0],0);}"
+-        "for(int i=lane;i<512;i+=64) atomicAdd(bins[i],hist[i]);";
++        "for(int i=lane;i<BINS;i+=64) if(hist[i]>0u) atomicAdd(bins[i],hist[i]);";
+     pl_shader sh=pl_dispatch_begin(hp->dispatch);
+     bool ok=pl_shader_custom(sh,&(struct pl_custom_shader){.description="Analyzer full source frame reduction",.header=header,.body=body,
+         .input=PL_SHADER_SIG_NONE,.output=PL_SHADER_SIG_NONE,.variables=vars,.num_variables=3,.descriptors=desc,.num_descriptors=2,
+         .compute=true,.compute_group_size={64,1}}) && pl_dispatch_compute(hp->dispatch,pl_dispatch_compute_params(.shader=&sh,.dispatch_size={1,h,1}));
+     talloc_free(header);
+     if(!ok){pl_dispatch_abort(hp->dispatch,&sh);return false;}
+-    struct pl_buffer_var result_var={.var={.name="samples",.type=PL_VAR_FLOAT,.dim_v=4,.dim_m=1,.dim_a=140},.layout={.offset=(size_t)offset*4,.stride=16,.size=2240}};
++    int result_count=output ? 140 : 1880;
++    struct pl_buffer_var result_var={.var={.name="samples",.type=PL_VAR_FLOAT,.dim_v=4,.dim_m=1,.dim_a=result_count},.layout={.offset=(size_t)offset*4,.stride=16,.size=(size_t)result_count*16}};
+     desc[0]=(struct pl_shader_desc){.desc={.name="FrameResults",.type=PL_DESC_BUF_STORAGE,.access=PL_DESC_ACCESS_WRITEONLY},.binding.object=slot->buf,.buffer_vars=&result_var,.num_buffer_vars=1};
+     char *finish=talloc_asprintf(NULL,
+         "int lane=int(gl_LocalInvocationID.x);vec3 lo=vec3(1e30),hi=vec3(0),sum=vec3(0),correction=vec3(0);for(int y=lane;y<%d;y+=64){lo=min(lo,rows[3*y].rgb);hi=max(hi,rows[3*y+1].rgb);vec3 add=rows[3*y+2].rgb-correction;vec3 next=sum+add;correction=(next-sum)-add;sum=next;}"
+@@ -79,6 +91,8 @@ static bool async_frame_dispatch(struct priv *p, const struct pl_hook_params *hp
+         "for(int step=32;step>0;step/=2){if(lane<step){mn[lane]=min(mn[lane],mn[lane+step]);mx[lane]=max(mx[lane],mx[lane+step]);sm[lane]+=sm[lane+step];}barrier();}"
+         "if(lane==0){samples[4]=vec4(mn[0],0);samples[5]=vec4(clamp(sm[0]/%.1f,mn[0],mx[0]),0);samples[6]=vec4(mx[0],0);samples[136]=vec4(%d,%d,1,0);}"
+         "for(int i=lane;i<128;i+=64)samples[8+i]=vec4(bins[4*i],bins[4*i+1],bins[4*i+2],bins[4*i+3]);",h,(double)w*h,w,h);
++    if (!output) finish=talloc_asprintf_append(finish,
++        "for(int i=lane;i<1600;i+=64)samples[280+i]=vec4(bins[512+4*i],bins[513+4*i],bins[514+4*i],bins[515+4*i]);");
+     sh=pl_dispatch_begin(hp->dispatch);
+     ok=pl_shader_custom(sh,&(struct pl_custom_shader){.description="Analyzer compact frame result",.body=finish,
+         .header="shared vec3 mn[64],mx[64],sm[64];",
+diff --git a/video/out/analyzer_output_bridge.h b/video/out/analyzer_output_bridge.h
+index 728a70d33..4556e8b0f 100644
+--- a/video/out/analyzer_output_bridge.h
++++ b/video/out/analyzer_output_bridge.h
+@@ -60,7 +60,9 @@ static bool async_output_pixel(struct priv *p, const struct pl_hook_params *hp,
+     ok=ok && pl_shader_custom(sh,&(struct pl_custom_shader){
+         .header=frame_math,
+         .body="vec3 rgb=color.rgb*203.0; out_samples[137]=vec4(rgb,dot(out_y,rgb));"
+-              "out_samples[138]=vec4(perceptual_bt2020(out_2020*rgb),1,0,0);out_samples[139]=vec4(0);",
++              "vec3 xyz=mat3(.636958,.262700,0.0,.144617,.677998,.028073,.168881,.059302,1.060985)*(out_2020*rgb);"
++              "float total=xyz.x+xyz.y+xyz.z;vec2 xy=total>1e-12 ? xyz.xy/total : vec2(0);"
++              "out_samples[138]=vec4(perceptual_bt2020(out_2020*rgb),1,xy);out_samples[139]=vec4(total>1e-12 ? 1 : 0,0,0,0);",
+         .input=PL_SHADER_SIG_COLOR,.output=PL_SHADER_SIG_NONE}) &&
+         pl_dispatch_compute(hp->dispatch,pl_dispatch_compute_params(.shader=&sh,.dispatch_size={1,1,1}));
+     if(!ok)pl_dispatch_abort(hp->dispatch,&sh);
+diff --git a/video/out/vo.h b/video/out/vo.h
+index e3cfe3978..4ce4cbeb7 100644
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -155,7 +155,7 @@ struct voctrl_async_probe {
+     int x, y, mode;
+     double ready_ms;
+     int64_t stats_ns;
+-    float values[1120];
++    float values[7520]; // Existing telemetry followed by 80x80 source xy counts.
+ };
+ 
+ struct voctrl_active_image {

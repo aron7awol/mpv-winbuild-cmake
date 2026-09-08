@@ -1,0 +1,790 @@
+From 1eff79403879b3c3f448e4f2ae0b509e95718c8f Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Mon, 7 Sep 2026 19:44:39 -0400
+Subject: [PATCH] audio: simultaneous decoding and independently synchronized
+ PCM output
+
+---
+ audio/out/ao.c              |  26 +++
+ audio/out/ao.h              |   4 +
+ audio/out/ao_wasapi.c       |   2 +
+ filters/f_decoder_wrapper.c |  41 +++++
+ filters/f_decoder_wrapper.h |   2 +
+ meson.build                 |   1 +
+ options/options.c           |   2 +
+ options/options.h           |   2 +
+ player/audio.c              |  18 +-
+ player/audio_secondary.c    | 349 ++++++++++++++++++++++++++++++++++++
+ player/command.c            |   8 +
+ player/core.h               |   9 +
+ player/playloop.c           |   6 +
+ 13 files changed, 469 insertions(+), 1 deletion(-)
+ create mode 100644 player/audio_secondary.c
+
+diff --git a/audio/out/ao.c b/audio/out/ao.c
+index 5cb24bda0..be3678e58 100644
+--- a/audio/out/ao.c
++++ b/audio/out/ao.c
+@@ -213,6 +213,15 @@ static struct ao *ao_init(bool probing, struct mpv_global *global,
+     ao->format = format;
+     ao->encode_lavc_ctx = encode_lavc_ctx;
+     ao->init_flags = flags;
++    struct MPOpts *main_opts = mp_get_config_group(ao, global, &mp_opt_root);
++    if (!(flags & AO_INIT_SECONDARY_PCM) && main_opts->audio_pcm_device &&
++        main_opts->audio_pcm_device[0])
++    {
++        // A negative PCM offset starts it before the carrier. Keep sufficient
++        // primary headroom so the packet tee does not starve that head start.
++        ao->def_buffer += MPMAX(0, -main_opts->audio_pcm_delay);
++    }
++    talloc_free(main_opts);
+     if (ao->driver->encode != !!ao->encode_lavc_ctx)
+         goto fail;
+ 
+@@ -288,6 +297,23 @@ static void split_ao_device(void *tmp, char *opt, char **out_ao, char **out_dev)
+     *out_ao = bstrto0(tmp, b_ao);
+ }
+ 
++struct ao *ao_init_pcm(struct mpv_global *global, const char *device,
++                      void (*wakeup_cb)(void *), void *ctx,
++                      int rate, int format, struct mp_chmap channels)
++{
++    void *tmp = talloc_new(NULL);
++    char *name, *dev;
++    split_ao_device(tmp, (char *)device, &name, &dev);
++    struct ao *ao = NULL;
++    // Explicit endpoints only. "null" is useful for deterministic engine tests.
++    if (name && (!strcmp(name, "wasapi") || !strcmp(name, "null")))
++        ao = ao_init(false, global, wakeup_cb, ctx, NULL,
++                     AO_INIT_SECONDARY_PCM | AO_INIT_EXCLUSIVE,
++                     rate, format, channels, dev, name);
++    talloc_free(tmp);
++    return ao;
++}
++
+ struct ao *ao_init_best(struct mpv_global *global,
+                         int init_flags,
+                         void (*wakeup_cb)(void *ctx), void *wakeup_ctx,
+diff --git a/audio/out/ao.h b/audio/out/ao.h
+index 7f37ef519..eaaff4ce0 100644
+--- a/audio/out/ao.h
++++ b/audio/out/ao.h
+@@ -60,6 +60,7 @@ enum {
+     AO_INIT_EXCLUSIVE = 1 << 3,
+     // Initialize with music role.
+     AO_INIT_MEDIA_ROLE_MUSIC = 1 << 4,
++    AO_INIT_SECONDARY_PCM = 1 << 5,
+ };
+ 
+ struct ao_device_desc {
+@@ -91,6 +92,9 @@ struct ao *ao_init_best(struct mpv_global *global,
+                         struct encode_lavc_context *encode_lavc_ctx,
+                         int samplerate, int format, struct mp_chmap channels);
+ void ao_uninit(struct ao *ao);
++struct ao *ao_init_pcm(struct mpv_global *global, const char *device,
++                      void (*wakeup_cb)(void *), void *ctx,
++                      int rate, int format, struct mp_chmap channels);
+ void ao_get_format(struct ao *ao,
+                    int *samplerate, int *format, struct mp_chmap *channels);
+ const char *ao_get_name(struct ao *ao);
+diff --git a/audio/out/ao_wasapi.c b/audio/out/ao_wasapi.c
+index 16d826e09..1f00ec7ba 100644
+--- a/audio/out/ao_wasapi.c
++++ b/audio/out/ao_wasapi.c
+@@ -350,6 +350,8 @@ static int init(struct ao *ao)
+     struct wasapi_state *state = ao->priv;
+     state->log = ao->log;
+ 
++    if (ao->init_flags & AO_INIT_SECONDARY_PCM)
++        state->opt_secondary_device = NULL;
+     state->strict_bitstream = state->opt_secondary_device && state->opt_secondary_device[0];
+     if (state->strict_bitstream && !af_fmt_is_spdif(ao->format)) {
+         MP_ERR(ao, "Dual bitstream is enabled but input is PCM. Disable dual output for PCM sources; no PCM fallback is allowed.\n");
+diff --git a/filters/f_decoder_wrapper.c b/filters/f_decoder_wrapper.c
+index b0f046119..fb917cb54 100644
+--- a/filters/f_decoder_wrapper.c
++++ b/filters/f_decoder_wrapper.c
+@@ -167,6 +167,7 @@ struct priv {
+ 
+     struct mp_codec_params *codec;
+     struct mp_decoder *decoder;
++    struct mp_filter *pcm_writer;
+ 
+     // Demuxer output.
+     struct mp_pin *demux;
+@@ -458,6 +459,11 @@ static bool reinit_decoder(struct priv *p)
+         }
+     }
+ 
++    if (p->public.pcm_packets && driver != &ad_spdif) {
++        MP_ERR(p, "Simultaneous PCM requires passthrough for the selected codec.\n");
++        talloc_free(list);
++        return false;
++    }
+     if (!driver)
+         return false;
+ 
+@@ -945,6 +951,8 @@ static bool is_new_segment(struct priv *p, struct mp_frame frame)
+ 
+ static void feed_packet(struct priv *p)
+ {
++    if (p->pcm_writer && !mp_pin_in_needs_data(p->pcm_writer->pins[0]))
++        return;
+     if (!p->decoder || !mp_pin_in_needs_data(p->decoder->f->pins[0]))
+         return;
+ 
+@@ -968,6 +976,12 @@ static void feed_packet(struct priv *p)
+ 
+     // Flush current data if the packet is a new segment.
+     if (is_new_segment(p, p->packet)) {
++        if (p->public.pcm_packets) {
++            MP_ERR(p, "Simultaneous PCM does not support segmented audio.\n");
++            mp_frame_unref(&p->packet);
++            mp_filter_internal_mark_failed(p->decf);
++            return;
++        }
+         mp_assert(!p->new_segment);
+         p->new_segment = p->packet.data;
+         p->packet = MP_EOF_FRAME;
+@@ -1019,6 +1033,8 @@ static void feed_packet(struct priv *p)
+         packet->pts = packet->dts = MP_NOPTS_VALUE;
+     }
+ 
++    if (p->pcm_writer)
++        mp_pin_in_write(p->pcm_writer->pins[0], mp_frame_ref(p->packet));
+     mp_pin_in_write(p->decoder->f->pins[0], p->packet);
+     p->packet_fed = true;
+     p->packet = MP_NO_FRAME;
+@@ -1212,6 +1228,9 @@ static void public_f_reset(struct mp_filter *f)
+     struct priv *p = f->priv;
+     mp_assert(p->public.f == f);
+ 
++    if (p->public.pcm_packets)
++        mp_async_queue_reset(p->public.pcm_packets);
++
+     if (p->queue) {
+         mp_async_queue_reset(p->queue);
+         thread_lock(p);
+@@ -1220,6 +1239,8 @@ static void public_f_reset(struct mp_filter *f)
+         thread_unlock(p);
+         mp_async_queue_resume(p->queue);
+     }
++    if (p->public.pcm_packets)
++        mp_async_queue_resume(p->public.pcm_packets);
+ }
+ 
+ static void public_f_destroy(struct mp_filter *f)
+@@ -1241,6 +1262,7 @@ static void public_f_destroy(struct mp_filter *f)
+ 
+     talloc_free(p->dec_root_filter);
+     talloc_free(p->queue);
++    talloc_free(p->public.pcm_packets);
+     mp_mutex_destroy(&p->cache_lock);
+ }
+ 
+@@ -1365,7 +1387,16 @@ struct mp_decoder_wrapper *mp_decoder_wrapper_create(struct mp_filter *parent,
+     p->play_dir = 1;
+     mp_filter_add_pin(public_f, MP_PIN_OUT, "out");
+ 
++    struct MPOpts *main_opts = mp_get_config_group(p, public_f->global, &mp_opt_root);
++    bool want_pcm = src->type == STREAM_AUDIO && main_opts->audio_pcm_device &&
++                    main_opts->audio_pcm_device[0];
++    talloc_free(main_opts);
++
+     if (src->group && src->group->lavfi_graph) {
++        if (want_pcm) {
++            MP_ERR(public_f, "Simultaneous PCM does not support grouped audio.\n");
++            goto error;
++        }
+         const char *tag = src->type == STREAM_AUDIO ? "!ad" : "!vd";
+         p->log = mp_log_new(p, parent->global->log, tag);
+         public_f->log = p->log;
+@@ -1428,6 +1459,16 @@ struct mp_decoder_wrapper *mp_decoder_wrapper_create(struct mp_filter *parent,
+         goto error;
+     p->demux = demux->pins[0];
+ 
++    if (want_pcm)
++    {
++        p->public.pcm_packets = mp_async_queue_create();
++        mp_async_queue_set_config(p->public.pcm_packets,
++            (struct mp_async_queue_config){.max_bytes = 16 * 1024 * 1024,
++                .max_samples = 8192, .max_duration = 3});
++        p->pcm_writer = mp_async_queue_create_filter(p->decf, MP_PIN_IN,
++                                                    p->public.pcm_packets);
++    }
++
+     decf_reset(p->decf);
+ 
+     struct mp_pin *out_pin;
+diff --git a/filters/f_decoder_wrapper.h b/filters/f_decoder_wrapper.h
+index c2ad95a64..88a9349a3 100644
+--- a/filters/f_decoder_wrapper.h
++++ b/filters/f_decoder_wrapper.h
+@@ -35,6 +35,8 @@ struct mp_decoder_wrapper {
+ 
+     // Can be set by user.
+     struct mp_recorder_sink *recorder_sink;
++    // Optional bounded packet tee, owned by this wrapper. Only one consumer.
++    struct mp_async_queue *pcm_packets;
+ };
+ 
+ // Create the decoder wrapper for the given stream, plus underlying decoder.
+diff --git a/meson.build b/meson.build
+index 84a660275..afb5cb79f 100644
+--- a/meson.build
++++ b/meson.build
+@@ -167,6 +167,7 @@ sources = files(
+ 
+     ## Player
+     'player/audio.c',
++    'player/audio_secondary.c',
+     'player/client.c',
+     'player/command.c',
+     'player/configfiles.c',
+diff --git a/options/options.c b/options/options.c
+index cb2e145d5..3d7c3dc7a 100644
+--- a/options/options.c
++++ b/options/options.c
+@@ -769,6 +769,8 @@ static const m_option_t mp_opts[] = {
+ //---------------------- libao/libvo options ------------------------
+     {"", OPT_SUBSTRUCT(ao_opts, ao_conf)},
+     {"audio-exclusive", OPT_BOOL(audio_exclusive), .flags = UPDATE_AUDIO},
++    {"audio-pcm-device", OPT_STRING(audio_pcm_device), .flags = UPDATE_AD},
++    {"audio-pcm-delay", OPT_DOUBLE(audio_pcm_delay), M_RANGE(-1, 1)},
+     {"audio-fallback-to-null", OPT_BOOL(ao_null_fallback)},
+     {"audio-stream-silence", OPT_BOOL(audio_stream_silence)},
+     {"audio-wait-open", OPT_FLOAT(audio_wait_open), M_RANGE(0, 60)},
+diff --git a/options/options.h b/options/options.h
+index 7934fa4f0..fa48bc7c6 100644
+--- a/options/options.h
++++ b/options/options.h
+@@ -200,6 +200,8 @@ typedef struct MPOpts {
+     bool auto_load_scripts;
+ 
+     bool audio_exclusive;
++    char *audio_pcm_device;
++    double audio_pcm_delay;
+     bool ao_null_fallback;
+     bool audio_stream_silence;
+     float audio_wait_open;
+diff --git a/player/audio.c b/player/audio.c
+index 87cc427cc..64e5326f4 100644
+--- a/player/audio.c
++++ b/player/audio.c
+@@ -229,6 +229,7 @@ static void ao_chain_reset_state(struct ao_chain *ao_c)
+ 
+ void reset_audio_state(struct MPContext *mpctx)
+ {
++    secondary_audio_reset(mpctx);
+     if (mpctx->ao_chain) {
+         ao_chain_reset_state(mpctx->ao_chain);
+         struct track *t = mpctx->ao_chain->track;
+@@ -242,6 +243,8 @@ void reset_audio_state(struct MPContext *mpctx)
+ 
+ void uninit_audio_out(struct MPContext *mpctx)
+ {
++    if (mpctx->ao)
++        secondary_audio_close(mpctx);
+     struct ao_chain *ao_c = mpctx->ao_chain;
+     if (ao_c) {
+         ao_c->ao_queue = NULL;
+@@ -286,6 +289,7 @@ static void ao_chain_uninit(struct ao_chain *ao_c)
+ 
+ void uninit_audio_chain(struct MPContext *mpctx)
+ {
++    secondary_audio_close(mpctx);
+     if (mpctx->ao_chain) {
+         ao_chain_uninit(mpctx->ao_chain);
+         mpctx->ao_chain = NULL;
+@@ -799,6 +803,8 @@ void reload_audio_output(struct MPContext *mpctx)
+         }
+     }
+ 
++    if (mpctx->opts->audio_pcm_device && mpctx->opts->audio_pcm_device[0])
++        issue_refresh_seek(mpctx, MPSEEK_EXACT);
+     mp_wakeup_core(mpctx);
+ }
+ 
+@@ -858,6 +864,8 @@ void audio_start_ao(struct MPContext *mpctx)
+         return;
+     }
+ 
++    if (!secondary_audio_start(mpctx))
++        return;
+     MP_VERBOSE(mpctx, "starting audio playback\n");
+     ao_c->delaying_audio_start = false;
+     ao_start(ao_c->ao);
+@@ -951,6 +959,8 @@ void fill_audio_out_buffers(struct MPContext *mpctx)
+         }
+     }
+ 
++    secondary_audio_update(mpctx);
++
+     if (ao_c->ao && !ao_is_playing(ao_c->ao) && !ao_c->underrun &&
+         (mpctx->audio_status == STATUS_PLAYING ||
+          mpctx->audio_status == STATUS_DRAINING))
+@@ -958,6 +968,8 @@ void fill_audio_out_buffers(struct MPContext *mpctx)
+         // Should be playing, but somehow isn't.
+ 
+         if (ao_c->out_eof && !mp_async_queue_get_frames(ao_c->ao_queue)) {
++            if (!secondary_audio_drained(mpctx))
++                return;
+             MP_VERBOSE(mpctx, "AO signaled EOF (while in state %s)\n",
+                        mp_status_str(mpctx->audio_status));
+             mpctx->audio_status = STATUS_EOF;
+@@ -992,7 +1004,10 @@ void fill_audio_out_buffers(struct MPContext *mpctx)
+     if (mpctx->audio_status == STATUS_DRAINING) {
+         // Wait until the AO has played all queued data. In the gapless case,
+         // we trigger EOF immediately, and let it play asynchronously.
+-        if (!ao_c->ao || (!ao_is_playing(ao_c->ao) || opts->gapless_audio))
++        bool gapless = opts->gapless_audio &&
++                       !(opts->audio_pcm_device && opts->audio_pcm_device[0]);
++        if ((!ao_c->ao || (!ao_is_playing(ao_c->ao) || gapless)) &&
++            secondary_audio_drained(mpctx))
+         {
+             MP_VERBOSE(mpctx, "audio EOF reached\n");
+             mpctx->audio_status = STATUS_EOF;
+@@ -1007,6 +1022,7 @@ void fill_audio_out_buffers(struct MPContext *mpctx)
+ // Drop data queued for output, or which the AO is currently outputting.
+ void clear_audio_output_buffers(struct MPContext *mpctx)
+ {
++    secondary_audio_reset(mpctx);
+     if (mpctx->ao)
+         ao_reset(mpctx->ao);
+ }
+diff --git a/player/audio_secondary.c b/player/audio_secondary.c
+new file mode 100644
+index 000000000..e11a4f132
+--- /dev/null
++++ b/player/audio_secondary.c
+@@ -0,0 +1,349 @@
++/* Simultaneous passthrough + PCM. LGPL-2.1-or-later. */
++#include <math.h>
++#include <string.h>
++#include <libavcodec/avcodec.h>
++#include "common/av_common.h"
++#include "common/msg.h"
++#include "audio/aframe.h"
++#include "audio/format.h"
++#include "audio/out/ao.h"
++#include "demux/stheader.h"
++#include "filters/f_async_queue.h"
++#include "filters/f_decoder_wrapper.h"
++#include "filters/f_output_chain.h"
++#include "filters/filter_internal.h"
++#include "options/options.h"
++#include "osdep/timer.h"
++#include "core.h"
++
++struct secondary_audio {
++    struct MPContext *mpctx;
++    struct mp_filter *f, *reader, *writer;
++    struct mp_decoder *decoder;
++    struct mp_output_chain *chain;
++    struct ao *ao;
++    struct mp_codec_params codec;
++    double last_pts, first_pts, speed, drift;
++    double pcm_start, primary_start, video_start;
++    double paused_at;
++    double next_clock;
++    bool planned, started, eof, failed, primary_start_known;
++    const char *error;
++};
++
++static bool enabled(struct MPContext *mpctx)
++{
++    return mpctx->opts->audio_pcm_device && mpctx->opts->audio_pcm_device[0];
++}
++
++static void fail(struct secondary_audio *s, const char *reason)
++{
++    if (s->failed)
++        return;
++    s->failed = true;
++    s->error = reason;
++    MP_ERR(s->mpctx, "Secondary PCM: %s; playback paused.\n", reason);
++    set_pause_state(s->mpctx, true);
++}
++
++static void process(struct mp_filter *f)
++{
++    struct secondary_audio *s = f->priv;
++    struct MPContext *mpctx = s->mpctx;
++    struct ao_chain *primary = mpctx->ao_chain;
++    if (s->failed || !primary)
++        return;
++    struct mp_pin *out = s->chain->f->pins[1];
++    if (!s->writer) {
++        mp_pin_out_request_data(out);
++        if (s->chain->got_output_eof)
++            s->eof = true;
++        mp_wakeup_core(mpctx);
++        return;
++    }
++    if (!primary->start_pts_known)
++        return;
++    if (s->eof || !mp_pin_can_transfer_data(s->writer->pins[0], out))
++        return;
++    struct mp_frame frame = mp_pin_out_read(out);
++    if (frame.type == MP_FRAME_AUDIO) {
++        struct mp_aframe *af = frame.data;
++        double end = get_play_end_pts(mpctx);
++        double start = s->first_pts == MP_NOPTS_VALUE ? primary->start_pts :
++                       MP_NOPTS_VALUE;
++        mp_aframe_clip_timestamps(af, start, end);
++        if (mp_aframe_get_pts(af) == MP_NOPTS_VALUE) {
++            mp_frame_unref(&frame);
++            fail(s, "decoded audio has no synchronization timestamp");
++            return;
++        }
++        if (!mp_aframe_get_size(af)) {
++            bool at_end = end != MP_NOPTS_VALUE && mp_aframe_get_pts(af) >= end;
++            mp_frame_unref(&frame);
++            if (at_end) {
++                s->eof = true;
++                mp_pin_in_write(s->writer->pins[0], MP_EOF_FRAME);
++            }
++            mp_filter_internal_mark_progress(f);
++            return;
++        }
++        if (s->first_pts == MP_NOPTS_VALUE)
++            s->first_pts = mp_aframe_get_pts(af);
++        s->last_pts = mp_aframe_end_pts(af);
++    } else if (frame.type == MP_FRAME_EOF) {
++        s->eof = true;
++    } else {
++        mp_frame_unref(&frame);
++        return;
++    }
++    mp_pin_in_write(s->writer->pins[0], frame);
++    mp_wakeup_core(mpctx);
++}
++
++static void reset(struct mp_filter *f)
++{
++    struct secondary_audio *s = f->priv;
++    if (s->ao)
++        ao_reset(s->ao);
++    s->last_pts = s->first_pts = MP_NOPTS_VALUE;
++    s->planned = s->started = s->eof = false;
++    s->primary_start_known = false;
++    s->speed = 1;
++    s->drift = 0;
++    s->paused_at = 0;
++    s->next_clock = 0;
++    if (s->chain)
++        mp_output_chain_set_audio_speed(s->chain, 1, 1, 1);
++}
++
++static void destroy(struct mp_filter *f)
++{
++    struct secondary_audio *s = f->priv;
++    // Queue accessors and conversion chain must release AO references first.
++    mp_filter_free_children(f);
++    if (s->ao)
++        ao_uninit(s->ao);
++}
++
++static const struct mp_filter_info info = {
++    .name = "secondary-pcm", .priv_size = sizeof(struct secondary_audio),
++    .process = process, .reset = reset, .destroy = destroy,
++};
++
++void secondary_audio_close(struct MPContext *mpctx)
++{
++    if (mpctx->secondary_audio)
++        talloc_free(mpctx->secondary_audio->f);
++    mpctx->secondary_audio = NULL;
++}
++
++void secondary_audio_reset(struct MPContext *mpctx)
++{
++    if (mpctx->secondary_audio)
++        mp_filter_reset(mpctx->secondary_audio->f);
++}
++
++void secondary_audio_pause(struct MPContext *mpctx, bool paused)
++{
++    struct secondary_audio *s = mpctx->secondary_audio;
++    if (!s || !s->ao)
++        return;
++    ao_set_paused(s->ao, paused, s->eof && !ao_is_playing(s->ao));
++    if (paused) {
++        s->paused_at = mp_time_sec();
++    } else if (s->paused_at) {
++        double elapsed = mp_time_sec() - s->paused_at;
++        s->pcm_start += elapsed;
++        s->primary_start += elapsed;
++        s->video_start += elapsed;
++        s->paused_at = 0;
++    }
++}
++
++static bool create(struct MPContext *mpctx)
++{
++    struct track *t = mpctx->ao_chain->track;
++    if (!t || !t->dec || !t->dec->pcm_packets)
++        return false;
++    struct mp_filter *f = mp_filter_create(mpctx->filter_root, &info);
++    struct secondary_audio *s = f->priv;
++    *s = (struct secondary_audio){.mpctx = mpctx, .f = f,
++        .last_pts = MP_NOPTS_VALUE, .first_pts = MP_NOPTS_VALUE, .speed = 1};
++    mpctx->secondary_audio = s;
++    // ad_lavc updates codec metadata; do not modify the primary decoder's copy.
++    s->codec = *t->stream->codec;
++    const AVCodec *impl = avcodec_find_decoder(mp_codec_to_av_codec_id(s->codec.codec));
++    s->decoder = impl ? ad_lavc.create(f, &s->codec, impl->name) : NULL;
++    if (!s->decoder) {
++        fail(s, "no PCM decoder for this track");
++        return false;
++    }
++    s->reader = mp_async_queue_create_filter(f, MP_PIN_OUT, t->dec->pcm_packets);
++    s->chain = mp_output_chain_create(f, MP_OUTPUT_CHAIN_AUDIO);
++    mp_pin_connect(s->decoder->f->pins[0], s->reader->pins[0]);
++    mp_pin_connect(s->chain->f->pins[0], s->decoder->f->pins[1]);
++    mp_pin_set_manual_connection_for(s->chain->f->pins[1], f);
++    mp_filter_wakeup(f);
++    return true;
++}
++
++// Called at the primary's start boundary. Negative offsets start PCM first;
++// positive offsets start primary first. Neither path discards program samples.
++bool secondary_audio_start(struct MPContext *mpctx)
++{
++    struct secondary_audio *s = mpctx->secondary_audio;
++    if (!enabled(mpctx))
++        return true;
++    if (s && s->eof && !s->ao)
++        return true;
++    if (!s || s->failed || !s->ao || s->last_pts == MP_NOPTS_VALUE)
++        return false;
++    if (get_internal_paused(mpctx))
++        return false;
++    double now = mp_time_sec();
++    if (!s->planned) {
++        double primary = playing_audio_pts(mpctx);
++        if (primary == MP_NOPTS_VALUE)
++            return false;
++        double delta = s->first_pts - primary + mpctx->opts->audio_pcm_delay;
++        double late = 0;
++        if (mpctx->vo_chain && mpctx->video_status != STATUS_EOF &&
++            mpctx->video_pts != MP_NOPTS_VALUE)
++            late = MPMAX(0, primary - (mpctx->video_pts - mpctx->opts->audio_delay));
++        s->video_start = now + MPMAX(0, -(late + delta));
++        s->primary_start = s->video_start + late;
++        s->pcm_start = s->primary_start + delta;
++        s->planned = true;
++        MP_VERBOSE(mpctx, "Secondary PCM start offset %.3f ms\n", delta * 1000);
++    }
++    if (!s->started && now >= s->pcm_start) {
++        ao_start(s->ao);
++        s->started = true;
++    }
++    if (now < s->primary_start) {
++        mp_set_timeout(mpctx, s->primary_start - now);
++        return false;
++    }
++    if (!s->started)
++        mp_set_timeout(mpctx, s->pcm_start - now);
++    return true;
++}
++
++bool secondary_audio_video_ready(struct MPContext *mpctx)
++{
++    if (!enabled(mpctx) || get_internal_paused(mpctx))
++        return true;
++    secondary_audio_start(mpctx);
++    struct secondary_audio *s = mpctx->secondary_audio;
++    return s && ((s->planned && mp_time_sec() >= s->video_start) ||
++                 (s->eof && !s->ao));
++}
++
++void secondary_audio_update(struct MPContext *mpctx)
++{
++    if (!enabled(mpctx) || !mpctx->ao_chain)
++        return;
++    if (!mpctx->secondary_audio && !create(mpctx))
++        return;
++    struct secondary_audio *s = mpctx->secondary_audio;
++    if (s->failed)
++        return;
++    mp_set_timeout(mpctx, 0.02);
++    if (mpctx->play_dir != 1 || fabs(mpctx->audio_speed - 1) > 0.0001) {
++        fail(s, "simultaneous passthrough requires forward, normal-speed playback");
++        return;
++    }
++    if (mp_filter_has_failed(s->decoder->f) || s->chain->failed_output_conversion) {
++        fail(s, "PCM decoding or format conversion failed");
++        return;
++    }
++    if (s->chain->ao_needs_update) {
++        if (s->ao) {
++            fail(s, "midstream PCM format change requires audio reload");
++            return;
++        }
++        struct mp_aframe *fmt = s->chain->output_aformat;
++        struct mp_chmap channels;
++        mp_aframe_get_chmap(fmt, &channels);
++        s->ao = ao_init_pcm(mpctx->global, mpctx->opts->audio_pcm_device,
++            mp_wakeup_core_cb, mpctx, mp_aframe_get_rate(fmt),
++            mp_aframe_get_format(fmt), channels);
++        if (!s->ao) {
++            fail(s, "could not open the selected PCM endpoint");
++            return;
++        }
++        int rate, format;
++        struct mp_chmap actual;
++        ao_get_format(s->ao, &rate, &format, &actual);
++        if (af_fmt_is_spdif(format) || !mp_chmap_equals(&channels, &actual)) {
++            fail(s, "PCM endpoint does not support the decoded channel layout");
++            return;
++        }
++        mp_output_chain_set_ao(s->chain, s->ao);
++        s->writer = mp_async_queue_create_filter(s->f, MP_PIN_IN, ao_get_queue(s->ao));
++        mp_async_queue_set_notifier(s->writer, s->f);
++        ao_set_paused(s->ao, get_internal_paused(mpctx), false);
++        MP_INFO(mpctx, "Secondary PCM: %d Hz, %s, %s\n", rate,
++                mp_chmap_to_str(&actual), af_fmt_to_str(format));
++    }
++    if (s->primary_start_known != mpctx->ao_chain->start_pts_known) {
++        s->primary_start_known = mpctx->ao_chain->start_pts_known;
++        mp_filter_wakeup(s->f);
++    }
++    if (!s->ao)
++        return;
++    if (ao_query_and_reset_events(s->ao, AO_EVENT_RELOAD | AO_EVENT_RELOAD_FAILURE)) {
++        fail(s, "PCM endpoint was lost; reload audio to reconnect");
++        return;
++    }
++    // Follow mute/volume without ever applying PCM processing to the carrier.
++    ao_set_gain(s->ao, audio_get_gain(mpctx));
++    if (get_internal_paused(mpctx))
++        return;
++    double now = mp_time_sec();
++    if (s->planned && !s->started && now >= s->pcm_start) {
++        ao_start(s->ao);
++        s->started = true;
++    }
++    if (s->started && !s->eof && now > s->pcm_start + 0.25 &&
++        !ao_is_playing(s->ao)) {
++        fail(s, "PCM underrun; reload audio to resynchronize");
++        return;
++    }
++    if (!s->started || mpctx->audio_status < STATUS_PLAYING ||
++        mpctx->audio_status == STATUS_EOF || !mpctx->ao ||
++        !ao_is_playing(mpctx->ao) || !ao_is_playing(s->ao))
++        return;
++    if (now < s->next_clock)
++        return;
++    s->next_clock = now + 0.05;
++    double primary = playing_audio_pts(mpctx);
++    double pcm = s->last_pts - ao_get_delay(s->ao) * s->speed;
++    double error = pcm - primary + mpctx->opts->audio_pcm_delay;
++    MP_DBG(mpctx, "PCM clock primary=%.6f pcm=%.6f tail=%.6f delay=%.6f error=%.6f speed=%.6f\n",
++           primary, pcm, s->last_pts, ao_get_delay(s->ao), error, s->speed);
++    s->drift += 0.1 * (error - s->drift);
++    // A bounded clock follower. Positive error means PCM is ahead: slow it.
++    s->speed = 1 - MPCLAMP((fabs(s->drift) < 0.001 ? 0 : s->drift) * 0.1, -0.005, 0.005);
++    mp_output_chain_set_audio_speed(s->chain, 1, s->speed, 1);
++}
++
++bool secondary_audio_drained(struct MPContext *mpctx)
++{
++    struct secondary_audio *s = mpctx->secondary_audio;
++    return !enabled(mpctx) || !s || s->failed ||
++           (s->eof && (!s->ao || (s->started && !ao_is_playing(s->ao) &&
++                                  !mp_async_queue_get_frames(ao_get_queue(s->ao)))));
++}
++
++char *secondary_audio_status(struct MPContext *mpctx)
++{
++    struct secondary_audio *s = mpctx->secondary_audio;
++    if (!s)
++        return talloc_strdup(NULL, "PCM: waiting for passthrough audio");
++    if (s->failed)
++        return talloc_asprintf(NULL, "error: PCM %s", s->error);
++    return talloc_asprintf(NULL, "PCM: %s, drift %+.2f ms, correction %+.0f ppm",
++        s->started ? "running" : "buffering", s->drift * 1000,
++        (s->speed - 1) * 1e6);
++}
+diff --git a/player/command.c b/player/command.c
+index 8f4018ba0..9f0d4c6ba 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -1775,6 +1775,10 @@ static int mp_property_audio_dual_status(void *ctx, struct m_property *prop,
+     }
+     if (action != M_PROPERTY_GET)
+         return M_PROPERTY_NOT_IMPLEMENTED;
++    if (mpctx->opts->audio_pcm_device && mpctx->opts->audio_pcm_device[0]) {
++        *(char **)arg = secondary_audio_status(mpctx);
++        return M_PROPERTY_OK;
++    }
+     if (!mpctx->ao || ao_control(mpctx->ao, AOCONTROL_GET_DUAL_STATUS, arg) != CONTROL_OK)
+         return M_PROPERTY_UNAVAILABLE;
+     return M_PROPERTY_OK;
+@@ -8597,7 +8601,11 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
+ 
+     if (flags & UPDATE_AD && mpctx->ao_chain) {
+         uninit_audio_chain(mpctx);
++        if (opt_ptr == &opts->audio_pcm_device)
++            uninit_audio_out(mpctx);
+         reinit_audio_chain(mpctx);
++        if (opt_ptr == &opts->audio_pcm_device)
++            issue_refresh_seek(mpctx, MPSEEK_EXACT);
+     }
+ 
+     if (flags & UPDATE_VD && mpctx->vo_chain) {
+diff --git a/player/core.h b/player/core.h
+index b7992bbde..dbcfc1256 100644
+--- a/player/core.h
++++ b/player/core.h
+@@ -324,6 +324,7 @@ typedef struct MPContext {
+     struct track *current_track[MAX_PTRACKS][STREAM_TYPE_COUNT];
+ 
+     struct mp_filter *filter_root;
++    struct secondary_audio *secondary_audio;
+ 
+     struct mp_filter *lavfi;
+     char *lavfi_graph;
+@@ -518,6 +519,14 @@ void uninit_audio_chain(struct MPContext *mpctx);
+ void reinit_audio_chain_src(struct MPContext *mpctx, struct track *track);
+ float audio_get_gain(struct MPContext *mpctx);
+ void audio_update_volume(struct MPContext *mpctx);
++void secondary_audio_update(struct MPContext *mpctx);
++void secondary_audio_close(struct MPContext *mpctx);
++void secondary_audio_reset(struct MPContext *mpctx);
++void secondary_audio_pause(struct MPContext *mpctx, bool paused);
++bool secondary_audio_start(struct MPContext *mpctx);
++bool secondary_audio_video_ready(struct MPContext *mpctx);
++bool secondary_audio_drained(struct MPContext *mpctx);
++char *secondary_audio_status(struct MPContext *mpctx);
+ void reload_audio_output(struct MPContext *mpctx);
+ void audio_start_ao(struct MPContext *mpctx);
+ 
+diff --git a/player/playloop.c b/player/playloop.c
+index d899fba12..b8747715f 100644
+--- a/player/playloop.c
++++ b/player/playloop.c
+@@ -170,6 +170,7 @@ void set_pause_state(struct MPContext *mpctx, bool user_pause)
+     bool internal_paused = get_internal_paused(mpctx);
+     if (internal_paused != mpctx->paused) {
+         mpctx->paused = internal_paused;
++        secondary_audio_pause(mpctx, internal_paused);
+ 
+         if (mpctx->ao) {
+             bool eof = mpctx->audio_status == STATUS_EOF;
+@@ -1160,6 +1161,11 @@ static void handle_playback_restart(struct MPContext *mpctx)
+ 
+     handle_update_cache(mpctx);
+ 
++    // A PCM head start must not make video run ahead of the primary carrier.
++    if (mpctx->audio_status == STATUS_READY && !mpctx->seek.type &&
++        !secondary_audio_video_ready(mpctx))
++        return;
++
+     if (mpctx->video_status == STATUS_READY) {
+         mpctx->video_status = STATUS_PLAYING;
+         get_relative_time(mpctx);
+-- 
+2.54.0.windows.1
+
