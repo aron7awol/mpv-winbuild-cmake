@@ -1,0 +1,287 @@
+From 6fdce65510bda74e8b143a1b638d25e988e22170 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Wed, 9 Sep 2026 15:06:03 -0400
+Subject: [PATCH] gpu-next: optimize Analyzer xy with tiled 152-grid reduction
+ and card clipping
+
+---
+ player/command.c                         |  6 +--
+ video/out/analyzer_async_bridge.h        |  8 ++--
+ video/out/analyzer_chromaticity_bridge.h | 57 +++++++++---------------
+ video/out/analyzer_xy_tiled_prototype.h  | 42 +++++++++++++++++
+ video/out/vo.h                           |  2 +-
+ video/out/vo_gpu_next.c                  |  3 ++
+ 6 files changed, 75 insertions(+), 43 deletions(-)
+ create mode 100644 video/out/analyzer_xy_tiled_prototype.h
+
+diff --git a/player/command.c b/player/command.c
+index 6ae3b8a65..ee57f722a 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -2860,7 +2860,7 @@ static int mp_property_analyzer_chromaticity(void *ctx, struct m_property *prop,
+     struct vo *vo = mpctx->video_out;
+     if (!vo) return M_PROPERTY_UNAVAILABLE;
+     float bins[6400];
+-    float colors[102400];
++    float colors[131072];
+     int64_t sequence;
+     mp_mutex_lock(&vo->async_probe_mutex);
+     sequence = vo->async_probe_snapshot.stats_ns;
+@@ -2879,7 +2879,7 @@ static int mp_property_analyzer_chromaticity(void *ctx, struct m_property *prop,
+         used+=n;
+     }
+     // Colors have their own finer grid; legacy density bins retain their ABI.
+-    for (int i=0; i<25600; i++) if (colors[4*i+3]>0) {
++    for (int i=0; i<23104; i++) if (colors[4*i+3]>0) {
+         int n=snprintf(rgb+rgb_used,4194304-rgb_used,"%s%d:%.9g:%.9g:%.9g:%.9g",rgb_used?",":"",i,
+             colors[4*i],colors[4*i+1],colors[4*i+2],colors[4*i+3]);
+         if(n<0 || (size_t)n>=4194304-rgb_used){talloc_free(text);return M_PROPERTY_ERROR;}
+@@ -2888,7 +2888,7 @@ static int mp_property_analyzer_chromaticity(void *ctx, struct m_property *prop,
+     struct m_sub_property props[] = {
+         {"frame-sequence", SUB_PROP_INT64(sequence)}, {"size", SUB_PROP_INT(80)},
+         {"bins", SUB_PROP_STR(text)}, {"colors", SUB_PROP_STR(rgb)},
+-        {"colors-size", SUB_PROP_INT(160)},
++        {"colors-size", SUB_PROP_INT(152)},
+         {"color-space", SUB_PROP_STR("bt.2020-linear-nits")}, {0}
+     };
+     int ret=m_property_read_sub(props,action,arg);
+diff --git a/video/out/analyzer_async_bridge.h b/video/out/analyzer_async_bridge.h
+index 1fea5b5bf..ae9ed809c 100644
+--- a/video/out/analyzer_async_bridge.h
++++ b/video/out/analyzer_async_bridge.h
+@@ -46,7 +46,7 @@ static void async_probe_collect(struct priv *p)
+     for (int i = 0; i < 4; i++) {
+         struct async_probe_slot *s = &a->slots[i];
+         if (!s->pending || pl_buf_poll(p->gpu, s->buf, 0)) continue;
+-        float values[109920] = {0};
++        float values[138592] = {0};
+         size_t size = s->meta.mode == 3 ? sizeof(values) : s->meta.mode == 2 ? 260 * sizeof(float) : 4 * sizeof(float);
+         if (pl_buf_read(p->gpu, s->buf, 0, values, size) &&
+             s->meta.mode == p->next_opts->analyzer_async) {
+@@ -55,14 +55,14 @@ static void async_probe_collect(struct priv *p)
+             if(s->meta.stats_ns > a->latest.stats_ns) {
+                 memcpy(a->latest.values+16,values+16,(548-16)*sizeof(float));
+                 memcpy(a->latest.values+576,values+576,532*sizeof(float));
+-                memcpy(a->latest.values+1120,values+1120,108800*sizeof(float));
++                memcpy(a->latest.values+1120,values+1120,137472*sizeof(float));
+                 a->latest.stats_ns=s->meta.stats_ns;
+             }
+             if(s->meta.sequence <= a->latest.sequence) {s->pending=false;continue;}
+             if (s->meta.mode==3 && !s->meta.stats_ns) {
+                 memcpy(values+16,a->latest.values+16,(548-16)*sizeof(float));
+                 memcpy(values+576,a->latest.values+576,532*sizeof(float));
+-                memcpy(values+1120,a->latest.values+1120,108800*sizeof(float));
++                memcpy(values+1120,a->latest.values+1120,137472*sizeof(float));
+                 s->meta.stats_ns=a->latest.stats_ns;
+             }
+             a->latest = s->meta;
+@@ -103,7 +103,7 @@ static struct pl_hook_res async_probe_hook(void *priv, const struct pl_hook_para
+     for (int i = 0; i < 4; i++) if (!a->slots[i].pending) { s = &a->slots[i]; break; }
+     if (!s) { a->skipped++; return (struct pl_hook_res){0}; }
+     if (!s->buf) s->buf = pl_buf_create(p->gpu, pl_buf_params(
+-        .size = 109920 * sizeof(float), .memory_type = PL_BUF_MEM_DEVICE,
++        .size = 138592 * sizeof(float), .memory_type = PL_BUF_MEM_DEVICE,
+         .host_readable = true, .storable = true));
+     if (!s->buf) return (struct pl_hook_res){0};
+     float pos[] = {
+diff --git a/video/out/analyzer_chromaticity_bridge.h b/video/out/analyzer_chromaticity_bridge.h
+index 107206591..c74b2dd5a 100644
+--- a/video/out/analyzer_chromaticity_bridge.h
++++ b/video/out/analyzer_chromaticity_bridge.h
+@@ -1,3 +1,4 @@
++#include "analyzer_xy_tiled_prototype.h"
+ /* Brightest-P source pixel per xy cell. Two ordered reductions select an
+  * indivisible RGB triplet; equal-P ties select the first raster-order pixel.
+  * No float atomics, 64-bit atomics, locks, or GPU -> CPU waits are required. */
+@@ -8,10 +9,10 @@ static bool analyzer_xy_update(struct priv *p, const struct pl_hook_params *hp,
+     pl_tex source=pl_mpv_user_shader_saved_texture(hook,"ANALYZER_LINEAR");
+     if(!source || !a->xy_tex) return false;
+     if(!a->xy_buf) a->xy_buf=pl_buf_create(p->gpu,pl_buf_params(
+-        .size=51200*4,.storable=true,.host_writable=true,.memory_type=PL_BUF_MEM_DEVICE));
++        .size=46208*4,.storable=true,.host_writable=true,.memory_type=PL_BUF_MEM_DEVICE));
+     if(!a->xy_buf) return false;
+-    uint32_t initial[51200]={0};
+-    for(int i=25600;i<51200;i++) initial[i]=UINT32_MAX;
++    uint32_t initial[46208]={0};
++    for(int i=23104;i<46208;i++) initial[i]=UINT32_MAX;
+     pl_buf_write(p->gpu,a->xy_buf,0,initial,sizeof(initial));
+     float matrix[9];
+     for(int i=0;i<9;i++){char n[40];snprintf(n,sizeof(n),"source_to_bt2020_%d",i);matrix[i]=frame_parameter(hook,n);}
+@@ -23,7 +24,7 @@ static bool analyzer_xy_update(struct priv *p, const struct pl_hook_params *hp,
+         {.var=pl_var_float("cap"),.data=&a->xy_cap,.dynamic=true},
+         {.var=pl_var_float("background"),.data=&a->xy_background,.dynamic=true},
+     };
+-    struct pl_buffer_var bv={.var={.name="keys",.type=PL_VAR_UINT,.dim_v=1,.dim_m=1,.dim_a=51200},.layout={.offset=0,.stride=4,.size=204800}};
++    struct pl_buffer_var bv={.var={.name="keys",.type=PL_VAR_UINT,.dim_v=1,.dim_m=1,.dim_a=46208},.layout={.offset=0,.stride=4,.size=46208*sizeof(uint32_t)}};
+     struct pl_shader_desc desc[]={
+         {.desc={.name="xy_source",.type=PL_DESC_SAMPLED_TEX},.binding={.object=source,.sample_mode=PL_TEX_SAMPLE_NEAREST}},
+         {.desc={.name="XYWinners",.type=PL_DESC_BUF_STORAGE,.access=PL_DESC_ACCESS_READWRITE},.binding.object=a->xy_buf,.buffer_vars=&bv,.num_buffer_vars=1},
+@@ -33,37 +34,14 @@ static bool analyzer_xy_update(struct priv *p, const struct pl_hook_params *hp,
+         "int xy_bin(vec3 rgb){vec3 xyz=mat3(.636958,.262700,0.,.144617,.677998,.028073,.168881,.059302,1.060985)*rgb;"
+         "float total=xyz.x+xyz.y+xyz.z;if(!(total>1e-12))return -1;vec2 xy=xyz.xy/total;"
+         "if(!all(greaterThanEqual(xy,vec2(0)))||!all(lessThan(xy,vec2(.8,.9))))return -1;"
+-        "ivec2 b=ivec2(xy/vec2(.8,.9)*160.);return b.y*160+b.x;}";
+-    char *header=talloc_asprintf(NULL,"%s\n%s\nshared uint local_keys[6400];",frame_math,bin_math);
+-    bool ok=true;
+-    for(int pass=0;pass<2 && ok;pass++) {
+-        // Four xy partitions preserve 25 KiB shared storage per group, below
+-        // D3D11's 32 KiB limit. Both passes use the same partition/bin mapping.
+-        char *body=talloc_asprintf(NULL,
+-            "int lane=int(gl_LocalInvocationID.x),y=int(gl_WorkGroupID.y),base=int(gl_WorkGroupID.x)*6400;ivec2 sz=textureSize(xy_source,0);"
+-            "for(int i=lane;i<6400;i+=64)local_keys[i]=%s;barrier();"
+-            "for(int x=lane;x<sz.x;x+=64){vec3 c=to2020*texelFetch(xy_source,ivec2(x,y),0).rgb;int b=xy_bin(c);if(b<base||b>=base+6400)continue;"
+-            "float value=max(perceptual_bt2020(c),0.);if(b<0||isnan(value)||isinf(value))continue;uint key=floatBitsToUint(value);%s}barrier();"
+-            "for(int i=lane;i<6400;i+=64){%s}",
+-            pass?"0xffffffffu":"0u",
+-            pass?"if(key==keys[b])atomicMin(local_keys[b-base],uint(y*sz.x+x));":"atomicMax(local_keys[b-base],key);",
+-            pass?"if(local_keys[i]!=0xffffffffu)atomicMin(keys[25600+base+i],local_keys[i]);":"if(local_keys[i]>0u)atomicMax(keys[base+i],local_keys[i]);");
+-        pl_shader sh=pl_dispatch_begin(hp->dispatch);
+-        ok=pl_shader_custom(sh,&(struct pl_custom_shader){.description=pass?"Analyzer xy winning pixel":"Analyzer xy peak P",.header=header,.body=body,
+-            .input=PL_SHADER_SIG_NONE,.output=PL_SHADER_SIG_NONE,.variables=vars,.num_variables=3,.descriptors=desc,.num_descriptors=2,
+-            .compute=true,.compute_group_size={64,1}}) &&
+-            pl_dispatch_compute(hp->dispatch,pl_dispatch_compute_params(.shader=&sh,.dispatch_size={4,source->params.h,1}));
+-        talloc_free(body);if(!ok)pl_dispatch_abort(hp->dispatch,&sh);
+-    }
+-    talloc_free(header);
++        "ivec2 b=ivec2(xy/vec2(.8,.9)*152.);return b.y*152+b.x;}";
++    bool ok=analyzer_xy_tiled_reduce(p,hp,source,vars,desc,bin_math,23104);
+     if(!ok)return false;
+-    // The async diagnostic payload contains uncapped BT.2020 RGB nits and P.
+-    // Drawing uses the same triplet, with one shared scale, never channel clip.
+-    struct pl_buffer_var result={.var={.name="xy_colors",.type=PL_VAR_FLOAT,.dim_v=4,.dim_m=1,.dim_a=25600},.layout={.offset=7520*4,.stride=16,.size=25600*16}};
++    struct pl_buffer_var result={.var={.name="xy_colors",.type=PL_VAR_FLOAT,.dim_v=4,.dim_m=1,.dim_a=23104},.layout={.offset=7520*4,.stride=16,.size=23104*16}};
+     desc[2]=(struct pl_shader_desc){.desc={.name="XYColors",.type=PL_DESC_BUF_STORAGE,.access=PL_DESC_ACCESS_WRITEONLY},.binding.object=slot->buf,.buffer_vars=&result,.num_buffer_vars=1};
+     pl_shader sh=pl_dispatch_begin(hp->dispatch);
+     ok=pl_shader_custom(sh,&(struct pl_custom_shader){.description="Analyzer opaque xy color texture",.header=frame_math,
+-        .body="ivec2 q=ivec2(gl_FragCoord.xy);int b=(159-q.y)*160+q.x;uint id=keys[25600+b];color=vec4(vec3(background),1.0);xy_colors[b]=vec4(0);"
++        .body="ivec2 q=ivec2(gl_FragCoord.xy);int b=(151-q.y)*152+q.x;uint id=keys[23104+b];color=vec4(vec3(background),1.0);xy_colors[b]=vec4(0);"
+               "if(id!=0xffffffffu){int w=textureSize(xy_source,0).x;vec3 c=to2020*texelFetch(xy_source,ivec2(int(id)%w,int(id)/w),0).rgb*nits;"
+               "xy_colors[b]=vec4(c,uintBitsToFloat(keys[b])*nits);"
+               "c*=min(1.,cap/max(max(c.r,c.g),max(c.b,1e-12)));"
+@@ -79,7 +57,7 @@ static bool analyzer_xy_update(struct priv *p, const struct pl_hook_params *hp,
+     struct pl_shader_var size_var={.var=pl_var_float("size"),.data=&size,.dynamic=true};
+     sh=pl_dispatch_begin(hp->dispatch);
+     ok=pl_shader_custom(sh,&(struct pl_custom_shader){.description="Analyzer xy nearest-cell expansion",
+-        .body="color=texelFetch(cells,clamp(ivec2(gl_FragCoord.xy/size*160.),ivec2(0),ivec2(159)),0);",
++        .body="color=texelFetch(cells,clamp(ivec2(gl_FragCoord.xy/size*152.),ivec2(0),ivec2(151)),0);",
+         .input=PL_SHADER_SIG_NONE,.output=PL_SHADER_SIG_COLOR,.variables=&size_var,.num_variables=1,.descriptors=&image,.num_descriptors=1}) &&
+         pl_dispatch_finish(hp->dispatch,pl_dispatch_params(.shader=&sh,.target=a->xy_display));
+     if(!ok)pl_dispatch_abort(hp->dispatch,&sh);
+@@ -106,12 +84,12 @@ static void analyzer_xy_prepare(struct priv *p, struct pl_frame *target, struct
+     // Cached analysis must survive OSD-only redraws. pl_tex_recreate would
+     // invalidate the contents even when the existing allocation already fits.
+     if(fresh){
+-        if(!pl_tex_recreate(p->gpu,&a->xy_tex,pl_tex_params(.w=160,.h=160,.format=fmt,.sampleable=true,.renderable=true,.blit_dst=true)))return;
++        if(!pl_tex_recreate(p->gpu,&a->xy_tex,pl_tex_params(.w=152,.h=152,.format=fmt,.sampleable=true,.renderable=true,.blit_dst=true)))return;
+         pl_tex_clear(p->gpu,a->xy_tex,(float[4]){background,background,background,1});
+         a->last_stats_revision=0;
+     }
+     int size=p->next_opts->analyzer_xy_size;
+-    int raster=MPMAX(size,160);
++    int raster=MPMAX(size,152);
+     bool resized=!a->xy_display || a->xy_display->params.w!=raster;
+     if(resized){
+         if(!pl_tex_recreate(p->gpu,&a->xy_display,pl_tex_params(.w=raster,.h=raster,.format=fmt,.sampleable=true,.renderable=true,.blit_dst=true)))return;
+@@ -120,7 +98,16 @@ static void analyzer_xy_prepare(struct priv *p, struct pl_frame *target, struct
+     }
+     if(size<=0)return;
+     int x=p->next_opts->analyzer_xy_x,y=p->next_opts->analyzer_xy_y;
+-    a->xy_part=(struct pl_overlay_part){.src={0,0,raster,raster},.dst={x,y,x+size,y+size}};
++    // Crop only the presented slice. The cached 152-grid analysis and opaque
++    // nearest-cell expansion keep their original coordinate scale.
++    int clip_top=p->next_opts->analyzer_xy_clip_height>0 ?
++        MPMIN(p->next_opts->analyzer_xy_clip_top,size) : 0;
++    int height=p->next_opts->analyzer_xy_clip_height>0 ?
++        MPMIN(p->next_opts->analyzer_xy_clip_height,size-clip_top) : size;
++    if(height<=0)return;
++    a->xy_part=(struct pl_overlay_part){
++        .src={0,clip_top*raster/(float)size,raster,(clip_top+height)*raster/(float)size},
++        .dst={x,y,x+size,y+height}};
+     MP_TARRAY_GROW(p,a->xy_overlays,target->num_overlays);
+     memcpy(a->xy_overlays+1,target->overlays,target->num_overlays*sizeof(*target->overlays));
+     a->xy_overlays[0]=(struct pl_overlay){.tex=a->xy_display,.mode=PL_OVERLAY_NORMAL,
+diff --git a/video/out/analyzer_xy_tiled_prototype.h b/video/out/analyzer_xy_tiled_prototype.h
+new file mode 100644
+index 000000000..8e9901c03
+--- /dev/null
++++ b/video/out/analyzer_xy_tiled_prototype.h
+@@ -0,0 +1,42 @@
++static bool analyzer_xy_tiled_reduce(struct priv *p,const struct pl_hook_params *hp,
++                                    pl_tex source,struct pl_shader_var *vars,
++                                    struct pl_shader_desc *desc,const char *bin_math,
++                                    int bins)
++{
++    // 32x32 source tiles; 64 invocations with 16 pixels each. A bounded shared
++    // hash combines coherent colors before global atomics. Full/colliding hash
++    // entries fall back to the SAME global reduction, never dropping a sample.
++    char *header=talloc_asprintf(NULL,"%s\n%s\nshared uint tags[256];shared uint values[256];",
++                                 frame_math,bin_math);
++    bool ok=true;
++    for(int pass=0;pass<2 && ok;pass++){
++        char *body=talloc_asprintf(NULL,
++            "int lane=int(gl_LocalInvocationID.x);ivec2 sz=textureSize(xy_source,0),origin=ivec2(gl_WorkGroupID.xy)*32;"
++            "for(int i=lane;i<256;i+=64){tags[i]=0xffffffffu;values[i]=%s;}barrier();"
++            "for(int i=lane;i<1024;i+=64){ivec2 pos=origin+ivec2(i%%32,i/32);if(any(greaterThanEqual(pos,sz)))continue;"
++            "vec3 c=to2020*texelFetch(xy_source,pos,0).rgb;int b=xy_bin(c);if(b<0)continue;"
++            "float value=max(perceptual_bt2020(c),0.);if(isnan(value)||isinf(value))continue;uint key=floatBitsToUint(value);%s"
++            "uint h=(uint(b)*2654435761u)&255u;int found=-1;"
++            "for(uint k=0u;k<8u;k++){uint at=(h+k)&255u;uint prev=atomicCompSwap(tags[at],0xffffffffu,uint(b));if(prev==0xffffffffu||prev==uint(b)){found=int(at);break;}}"
++            "%s}barrier();"
++            "for(int i=lane;i<256;i+=64){uint b=tags[i];if(b!=0xffffffffu){%s}}",
++            pass?"0xffffffffu":"0u",
++            pass?"if(key!=keys[b])continue;uint id=uint(pos.y*sz.x+pos.x);":"",
++            pass?"if(found>=0)atomicMin(values[found],id);else atomicMin(keys[XY_TILE_BINS+b],id);":
++                 "if(found>=0)atomicMax(values[found],key);else atomicMax(keys[b],key);",
++            pass?"if(values[i]!=0xffffffffu)atomicMin(keys[XY_TILE_BINS+b],values[i]);":
++                 "if(values[i]>0u)atomicMax(keys[b],values[i]);");
++        char *with_bins=talloc_asprintf(NULL,"#define XY_TILE_BINS %d\n%s",bins,header);
++        pl_shader sh=pl_dispatch_begin(hp->dispatch);
++        ok=pl_shader_custom(sh,&(struct pl_custom_shader){
++            .description=pass?"Analyzer tiled xy winning pixel":"Analyzer tiled xy peak P",
++            .header=with_bins,.body=body,.input=PL_SHADER_SIG_NONE,.output=PL_SHADER_SIG_NONE,
++            .variables=vars,.num_variables=3,.descriptors=desc,.num_descriptors=2,
++            .compute=true,.compute_group_size={64,1}}) &&
++            pl_dispatch_compute(hp->dispatch,pl_dispatch_compute_params(.shader=&sh,
++                .dispatch_size={(source->params.w+31)/32,(source->params.h+31)/32,1}));
++        if(!ok)pl_dispatch_abort(hp->dispatch,&sh);
++        talloc_free(body);talloc_free(with_bins);
++    }
++    talloc_free(header);return ok;
++}
+diff --git a/video/out/vo.h b/video/out/vo.h
+index c774ac152..9befceb94 100644
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -172,7 +172,7 @@ struct voctrl_async_probe {
+     int x, y, mode;
+     double ready_ms;
+     int64_t stats_ns;
+-    float values[109920]; // Telemetry, 80x80 xy counts, then 160x160 winning RGB nits/P.
++    float values[138592]; // Telemetry, 80x80 xy counts, then 160x160 winning RGB nits/P.
+ };
+ 
+ struct voctrl_active_image {
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index fe4bdbd86..e32a0738f 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -260,6 +260,7 @@ struct gl_next_opts {
+     float analyzer_sdr_output_peak, analyzer_sdr_output_gamma;
+     float analyzer_waveform_peak;
+     int analyzer_xy_x, analyzer_xy_y, analyzer_xy_size, analyzer_xy_intensity;
++    int analyzer_xy_clip_top, analyzer_xy_clip_height;
+     bool delayed_peak;
+     bool dovi_enhancement_layer;
+     bool causal_scene_diagnostics;
+@@ -316,6 +317,8 @@ const struct m_sub_options gl_next_conf = {
+         {"analyzer-xy-x", OPT_INT(analyzer_xy_x), M_RANGE(0, 32768)},
+         {"analyzer-xy-y", OPT_INT(analyzer_xy_y), M_RANGE(0, 32768)},
+         {"analyzer-xy-size", OPT_INT(analyzer_xy_size), M_RANGE(0, 4096)},
++        {"analyzer-xy-clip-top", OPT_INT(analyzer_xy_clip_top), M_RANGE(0, 4096)},
++        {"analyzer-xy-clip-height", OPT_INT(analyzer_xy_clip_height), M_RANGE(0, 4096)},
+         {"analyzer-xy-intensity", OPT_INT(analyzer_xy_intensity), M_RANGE(0, 255)},
+         {"analyzer-waveform-y", OPT_INT(analyzer_waveform_y), M_RANGE(0, 32768)},
+         {"analyzer-waveform-height", OPT_INT(analyzer_waveform_height), M_RANGE(0, 4096)},
+-- 
+2.54.0.windows.1
+
