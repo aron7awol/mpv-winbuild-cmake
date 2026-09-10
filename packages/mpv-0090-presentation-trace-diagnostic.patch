@@ -1,6 +1,6 @@
-From edee914c4bd0ea2a9fd6b3179b84b16fcc02a8ec Mon Sep 17 00:00:00 2001
-From: mpv-ht diagnostic preparation <diagnostic@mpv-ht.invalid>
-Date: Thu, 10 Sep 2026 10:09:24 -0400
+From 0ee8a8d603f4c136f4ffeb6a32ccc2addae8b6fe Mon Sep 17 00:00:00 2001
+From: mpv-ht build preparation <diagnostic@mpv-ht.invalid>
+Date: Thu, 10 Sep 2026 12:25:21 -0400
 Subject: [PATCH] diagnostic only: bounded frame identity and Windows
  presentation trace
 
@@ -45,7 +45,7 @@ index eabd54401..c47787348 100644
      frame->approx_duration = approx_duration;
  
 diff --git a/video/out/d3d11/context.c b/video/out/d3d11/context.c
-index 9fb65e283..0e9528fb9 100644
+index 8bac900b2..f5d38a881 100644
 --- a/video/out/d3d11/context.c
 +++ b/video/out/d3d11/context.c
 @@ -289,7 +289,12 @@ static void d3d11_swap_buffers(struct ra_swapchain *sw)
@@ -88,8 +88,8 @@ index 9fb65e283..0e9528fb9 100644
 +        info->ht_feedback.sync_qpc = stats.SyncQPCTime.QuadPart;
 +    }
      if (hr == DXGI_ERROR_FRAME_STATISTICS_DISJOINT) {
-         p->last_sync_refresh_count = 0;
-         p->last_sync_qpc_time = 0;
+         d3d11_vsync_reset(&p->vsync);
+     }
 diff --git a/video/out/presentation_trace.c b/video/out/presentation_trace.c
 new file mode 100644
 index 000000000..fd203754a

@@ -1,0 +1,161 @@
+From df6c63d31b14a5db545a1e71b90e92006686a298 Mon Sep 17 00:00:00 2001
+From: mpv-ht build preparation <diagnostic@mpv-ht.invalid>
+Date: Thu, 10 Sep 2026 12:25:21 -0400
+Subject: [PATCH] d3d11: stabilize queued presentation timing with refresh
+ history
+
+---
+ video/out/d3d11/context.c         | 38 +++++++---------------
+ video/out/d3d11/vsync_estimator.h | 53 +++++++++++++++++++++++++++++++
+ 2 files changed, 65 insertions(+), 26 deletions(-)
+ create mode 100644 video/out/d3d11/vsync_estimator.h
+
+diff --git a/video/out/d3d11/context.c b/video/out/d3d11/context.c
+index 9fb65e283..8bac900b2 100644
+--- a/video/out/d3d11/context.c
++++ b/video/out/d3d11/context.c
+@@ -26,6 +26,7 @@
+ #include "video/out/w32_common.h"
+ #include "context.h"
+ #include "ra_d3d11.h"
++#include "vsync_estimator.h"
+ 
+ #ifdef PL_HAVE_D3D11
+ #include <libplacebo/d3d11.h>
+@@ -121,9 +122,7 @@ struct priv {
+     struct pl_color_space swapchain_csp;
+ 
+     int64_t perf_freq;
+-    unsigned last_sync_refresh_count;
+-    int64_t last_sync_qpc_time;
+-    int64_t vsync_duration_qpc;
++    struct d3d11_vsync_estimator vsync;
+     int64_t last_submit_qpc;
+ 
+     struct mp_dxgi_factory_ctx dxgi_ctx;
+@@ -166,6 +165,7 @@ static bool resize(struct ra_ctx *ctx)
+         return false;
+     }
+ 
++    d3d11_vsync_reset(&p->vsync);
+     return true;
+ }
+ 
+@@ -327,8 +327,7 @@ static void d3d11_get_vsync(struct ra_swapchain *sw, struct vo_vsync_info *info)
+     DXGI_FRAME_STATISTICS stats;
+     hr = IDXGISwapChain_GetFrameStatistics(p->swapchain, &stats);
+     if (hr == DXGI_ERROR_FRAME_STATISTICS_DISJOINT) {
+-        p->last_sync_refresh_count = 0;
+-        p->last_sync_qpc_time = 0;
++        d3d11_vsync_reset(&p->vsync);
+     }
+     if (FAILED(hr))
+         return;
+@@ -336,29 +335,16 @@ static void d3d11_get_vsync(struct ra_swapchain *sw, struct vo_vsync_info *info)
+     // Detecting skipped vsyncs is possible but not supported yet
+     info->skipped_vsyncs = -1;
+ 
+-    // Get the number of physical vsyncs that have passed since the last call.
+-    // Check for 0 here, since sometimes GetFrameStatistics returns S_OK but
+-    // with 0s in some (all?) members of DXGI_FRAME_STATISTICS.
+-    unsigned src_passed = 0;
+-    if (stats.SyncRefreshCount && p->last_sync_refresh_count)
+-        src_passed = stats.SyncRefreshCount - p->last_sync_refresh_count;
+-    p->last_sync_refresh_count = stats.SyncRefreshCount;
+-
+-    // Get the elapsed time passed between the above vsyncs
+-    unsigned sqt_passed = 0;
+-    if (stats.SyncQPCTime.QuadPart && p->last_sync_qpc_time)
+-        sqt_passed = stats.SyncQPCTime.QuadPart - p->last_sync_qpc_time;
+-    p->last_sync_qpc_time = stats.SyncQPCTime.QuadPart;
+-
+-    // If any vsyncs have passed, estimate the physical frame rate
+-    if (src_passed && sqt_passed)
+-        p->vsync_duration_qpc = sqt_passed / src_passed;
+-    if (p->vsync_duration_qpc)
+-        info->vsync_duration = qpc_to_ns(sw, p->vsync_duration_qpc);
++    // S_OK can still contain zero or repeated statistics. The estimator only
++    // incorporates advancing timestamp/count pairs and clears invalid history.
++    d3d11_vsync_sample(&p->vsync, stats.SyncRefreshCount,
++                      stats.SyncQPCTime.QuadPart);
++    if (p->vsync.duration)
++        info->vsync_duration = qpc_to_ns(sw, p->vsync.duration);
+ 
+     // If the physical frame rate is known and the other members of
+     // DXGI_FRAME_STATISTICS are non-0, estimate the timing of the next frame
+-    if (p->vsync_duration_qpc && stats.PresentCount &&
++    if (p->vsync.duration && stats.PresentCount &&
+         stats.PresentRefreshCount && stats.SyncRefreshCount &&
+         stats.SyncQPCTime.QuadPart)
+     {
+@@ -372,7 +358,7 @@ static void d3d11_get_vsync(struct ra_swapchain *sw, struct vo_vsync_info *info)
+         // timestamp of the frame at SyncRefreshCount and the frame rate
+         int queued_frames = submit_count - expected_sync_pc;
+         int64_t last_queue_display_time_qpc = stats.SyncQPCTime.QuadPart +
+-            queued_frames * p->vsync_duration_qpc;
++            queued_frames * p->vsync.duration;
+ 
+         // Only set the estimated display time if it's after the last submission
+         // time. It could be before if mpv skips a lot of frames.
+diff --git a/video/out/d3d11/vsync_estimator.h b/video/out/d3d11/vsync_estimator.h
+new file mode 100644
+index 000000000..2e2e66062
+--- /dev/null
++++ b/video/out/d3d11/vsync_estimator.h
+@@ -0,0 +1,53 @@
++#ifndef MP_D3D11_VSYNC_ESTIMATOR_H
++#define MP_D3D11_VSYNC_ESTIMATOR_H
++
++#include <stdint.h>
++
++// Average past intervals, weighted by refresh count, rather than multiplying
++// a noisy single-refresh duration by the number of queued presentations.
++#define D3D11_VSYNC_SAMPLES 8
++struct d3d11_vsync_estimator {
++    uint32_t last_refresh;
++    int64_t last_qpc;
++    struct { int64_t qpc; uint32_t refresh; } samples[D3D11_VSYNC_SAMPLES];
++    int next;
++    int64_t total_qpc;
++    uint64_t total_refresh;
++    int64_t duration;
++};
++
++static inline void d3d11_vsync_reset(struct d3d11_vsync_estimator *s)
++{
++    *s = (struct d3d11_vsync_estimator){0};
++}
++
++static inline void d3d11_vsync_sample(struct d3d11_vsync_estimator *s,
++                                     uint32_t refresh, int64_t qpc)
++{
++    if (!refresh || qpc <= 0) {
++        d3d11_vsync_reset(s);
++        return;
++    }
++    if (s->last_qpc) {
++        uint32_t dr = refresh - s->last_refresh;
++        int64_t dq = qpc - s->last_qpc;
++        if (!dr && !dq)
++            return; // Repeated feedback is not another measurement.
++        if (dr && dr <= INT32_MAX && dq > 0) {
++            s->total_qpc -= s->samples[s->next].qpc;
++            s->total_refresh -= s->samples[s->next].refresh;
++            s->samples[s->next].qpc = dq;
++            s->samples[s->next].refresh = dr;
++            s->total_qpc += dq;
++            s->total_refresh += dr;
++            s->next = (s->next + 1) % D3D11_VSYNC_SAMPLES;
++            s->duration = s->total_qpc / s->total_refresh;
++        } else {
++            d3d11_vsync_reset(s);
++        }
++    }
++    s->last_refresh = refresh;
++    s->last_qpc = qpc;
++}
++
++#endif
+-- 
+2.54.0.windows.1
+
