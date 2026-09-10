@@ -1,0 +1,369 @@
+From edee914c4bd0ea2a9fd6b3179b84b16fcc02a8ec Mon Sep 17 00:00:00 2001
+From: mpv-ht diagnostic preparation <diagnostic@mpv-ht.invalid>
+Date: Thu, 10 Sep 2026 10:09:24 -0400
+Subject: [PATCH] diagnostic only: bounded frame identity and Windows
+ presentation trace
+
+---
+ meson.build                    |   1 +
+ player/video.c                 |   4 ++
+ video/out/d3d11/context.c      |  19 ++++-
+ video/out/presentation_trace.c | 127 +++++++++++++++++++++++++++++++++
+ video/out/presentation_trace.h |  24 +++++++
+ video/out/vo.c                 |   7 ++
+ video/out/vo.h                 |   6 ++
+ video/out/vo_gpu_next.c        |   7 ++
+ 8 files changed, 194 insertions(+), 1 deletion(-)
+ create mode 100644 video/out/presentation_trace.c
+ create mode 100644 video/out/presentation_trace.h
+
+diff --git a/meson.build b/meson.build
+index afb5cb79f..e154ad9ba 100644
+--- a/meson.build
++++ b/meson.build
+@@ -251,6 +251,7 @@ sources = files(
+     'video/out/gpu/video_shaders.c',
+     'video/out/libmpv_sw.c',
+     'video/out/vo.c',
++    'video/out/presentation_trace.c',
+     'video/out/vo_gpu.c',
+     'video/out/vo_image.c',
+     'video/out/vo_lavc.c',
+diff --git a/player/video.c b/player/video.c
+index eabd54401..c47787348 100644
+--- a/player/video.c
++++ b/player/video.c
+@@ -916,6 +916,10 @@ static void handle_display_sync_frame(struct MPContext *mpctx,
+     frame->ideal_frame_vsync = (-prev_error / frame_duration) * approx_duration;
+     frame->ideal_frame_vsync_duration = (vsync / frame_duration) * approx_duration;
+     frame->num_vsyncs = num_vsyncs;
++    frame->ht_planned = num_vsyncs;
++    frame->ht_correction = drop_repeat;
++    frame->ht_av_diff = av_diff;
++    frame->ht_error = prev_error;
+     frame->display_synced = true;
+     frame->approx_duration = approx_duration;
+ 
+diff --git a/video/out/d3d11/context.c b/video/out/d3d11/context.c
+index 9fb65e283..0e9528fb9 100644
+--- a/video/out/d3d11/context.c
++++ b/video/out/d3d11/context.c
+@@ -289,7 +289,12 @@ static void d3d11_swap_buffers(struct ra_swapchain *sw)
+     QueryPerformanceCounter(&perf_count);
+     p->last_submit_qpc = perf_count.QuadPart;
+ 
+-    IDXGISwapChain_Present(p->swapchain, p->opts->sync_interval, 0);
++    HRESULT present_hr = IDXGISwapChain_Present(p->swapchain, p->opts->sync_interval, 0);
++    if (sw->ctx->vo->ht_trace) {
++        QueryPerformanceCounter(&perf_count);
++        ht_trace_present(sw->ctx->vo, (uintptr_t)p->swapchain, p->last_submit_qpc,
++                         perf_count.QuadPart, present_hr, p->opts->sync_interval);
++    }
+ }
+ 
+ static void d3d11_get_vsync(struct ra_swapchain *sw, struct vo_vsync_info *info)
+@@ -316,8 +321,12 @@ static void d3d11_get_vsync(struct ra_swapchain *sw, struct vo_vsync_info *info)
+     // the last call to IDXGISwapChain::Present()
+     UINT submit_count;
+     hr = IDXGISwapChain_GetLastPresentCount(p->swapchain, &submit_count);
++    info->ht_feedback.swapchain = (uintptr_t)p->swapchain;
++    info->ht_feedback.stats_hr = hr;
+     if (FAILED(hr))
+         return;
++    info->ht_feedback.submit_count = submit_count;
++    info->ht_feedback.valid = 1;
+ 
+     // GetFrameStatistics returns two pairs. The first is (PresentCount,
+     // PresentRefreshCount) which relates a present ID (on the same timeline as
+@@ -326,6 +335,14 @@ static void d3d11_get_vsync(struct ra_swapchain *sw, struct vo_vsync_info *info)
+     // to a timestamp on the same clock as QueryPerformanceCounter.
+     DXGI_FRAME_STATISTICS stats;
+     hr = IDXGISwapChain_GetFrameStatistics(p->swapchain, &stats);
++    info->ht_feedback.stats_hr = hr;
++    if (SUCCEEDED(hr)) {
++        info->ht_feedback.valid |= 2;
++        info->ht_feedback.present_count = stats.PresentCount;
++        info->ht_feedback.present_refresh = stats.PresentRefreshCount;
++        info->ht_feedback.sync_refresh = stats.SyncRefreshCount;
++        info->ht_feedback.sync_qpc = stats.SyncQPCTime.QuadPart;
++    }
+     if (hr == DXGI_ERROR_FRAME_STATISTICS_DISJOINT) {
+         p->last_sync_refresh_count = 0;
+         p->last_sync_qpc_time = 0;
+diff --git a/video/out/presentation_trace.c b/video/out/presentation_trace.c
+new file mode 100644
+index 000000000..fd203754a
+--- /dev/null
++++ b/video/out/presentation_trace.c
+@@ -0,0 +1,127 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#include <stdio.h>
++#include <stdlib.h>
++#include <inttypes.h>
++#include <string.h>
++#ifdef _WIN32
++#include <windows.h>
++#endif
++#include "vo.h"
++#include "video/mp_image.h"
++#include "common/msg.h"
++#include "osdep/io.h"
++#include "osdep/timer.h"
++#include "mpv_talloc.h"
++
++// One producer: VO thread. No locks, allocations, formatting, or file writes
++// in the capture hot path. Stop recording at capacity; never overwrite evidence.
++#define HT_TRACE_CAPACITY 524288
++struct ht_trace_row {
++    uint64_t id, selected_id, swapchain;
++    double pts, selected_pts, av_diff, frame_duration, vsync, error;
++    int kind, remaining, planned, correction, repeat, still, ds, mixed, render_ok;
++    int dropped, sync_interval;
++    int64_t begin, present_begin, present_end, end, predicted_display;
++    int32_t present_hr;
++    struct ht_present_feedback feedback;
++};
++struct ht_present_trace {
++    FILE *file;
++    struct ht_trace_row *rows, pending;
++    unsigned count, omitted;
++    int active;
++};
++static int64_t trace_qpc(void)
++{
++#ifdef _WIN32
++    LARGE_INTEGER q; QueryPerformanceCounter(&q); return q.QuadPart;
++#else
++    return mp_time_ns();
++#endif
++}
++void ht_trace_init(struct vo *vo)
++{
++    const char *prefix = getenv("MPV_HT_PRESENT_TRACE");
++    if (!prefix || !prefix[0]) return;
++    struct ht_present_trace *t = talloc_zero(vo, struct ht_present_trace);
++    t->rows = calloc(HT_TRACE_CAPACITY, sizeof(*t->rows));
++    if (!t->rows) { talloc_free(t); MP_ERR(vo,"Presentation trace allocation failed\n"); return; }
++    // Touch the preallocated pages before playback, not at the first row on each page.
++    volatile unsigned char *pages = (volatile unsigned char *)t->rows;
++    for (size_t i=0; i<HT_TRACE_CAPACITY*sizeof(*t->rows); i+=4096) pages[i]=0;
++    char *filename = talloc_asprintf(t, "%s-%d-%"PRId64".csv", prefix, (int)getpid(), trace_qpc());
++    t->file = fopen(filename,"wx");
++    if (!t->file) { free(t->rows); talloc_free(t); MP_ERR(vo,"Cannot create presentation trace\n"); return; }
++    int64_t freq = 1000000000;
++#ifdef _WIN32
++    LARGE_INTEGER q; QueryPerformanceFrequency(&q); freq=q.QuadPart;
++#endif
++    fprintf(t->file,"# ht-presentation-trace-v1 pid=%d qpc_frequency=%"PRId64" capacity=%d depth=%d video_sync=%d\n",
++            (int)getpid(),freq,HT_TRACE_CAPACITY,vo->opts->swapchain_depth,vo->opts->video_sync);
++    fflush(t->file);
++    vo->ht_trace=t;
++    MP_INFO(vo,"Private presentation trace armed: %s (saved on normal exit)\n",filename);
++}
++void ht_trace_begin(struct vo *vo, const struct vo_frame *f, int kind)
++{
++    struct ht_present_trace *t=vo->ht_trace;
++    if (!t) return;
++    if (t->count==HT_TRACE_CAPACITY) { t->omitted++; t->active=0; return; }
++    t->active=1;
++    t->pending=(struct ht_trace_row){
++        .id=f->current ? f->frame_id : 0, .pts=f->current ? f->current->pts : -1e20,
++        .selected_pts=-1e20, .kind=kind, .remaining=f->num_vsyncs,
++        .planned=f->ht_planned, .correction=f->ht_correction, .av_diff=f->ht_av_diff,
++        .frame_duration=f->ideal_frame_duration, .vsync=f->vsync_interval,
++        .error=f->ht_error, .repeat=f->repeat, .still=f->still, .ds=f->display_synced,
++        .begin=trace_qpc(), .present_hr=-1,
++    };
++}
++void ht_trace_mix(struct vo *vo, uint64_t id, double pts, int count, int ok)
++{
++    struct ht_present_trace *t=vo->ht_trace;
++    if (!t || !t->active) return;
++    t->pending.selected_id=id; t->pending.selected_pts=pts;
++    t->pending.mixed=count; t->pending.render_ok=ok;
++}
++void ht_trace_present(struct vo *vo, uint64_t swapchain, int64_t begin,
++                      int64_t end, int32_t hr, int sync_interval)
++{
++    struct ht_present_trace *t=vo->ht_trace;
++    if (!t || !t->active) return;
++    t->pending.swapchain=swapchain; t->pending.present_begin=begin;
++    t->pending.present_end=end; t->pending.present_hr=hr;
++    t->pending.sync_interval=sync_interval;
++}
++void ht_trace_end(struct vo *vo, const struct vo_vsync_info *info, int dropped)
++{
++    struct ht_present_trace *t=vo->ht_trace;
++    if (!t || !t->active) return;
++    t->pending.end=trace_qpc(); t->pending.dropped=dropped;
++    if (info) {
++        t->pending.feedback=info->ht_feedback;
++        t->pending.predicted_display=info->last_queue_display_time;
++    }
++    t->rows[t->count++]=t->pending; t->active=0;
++}
++void ht_trace_close(struct vo *vo)
++{
++    struct ht_present_trace *t=vo->ht_trace;
++    if (!t) return;
++    // Only teardown writes data: no instrumentation disk stalls during playback.
++    fprintf(t->file,"kind,frame_id,source_pts,selected_id,selected_pts,mix_frames,render_ok,planned_vsyncs,remaining_vsyncs,sync_correction,av_diff_s,rounding_error_s,frame_duration_s,vsync_s,repeat,still,display_sync,vo_dropped,draw_begin_qpc,present_begin_qpc,present_end_qpc,trace_end_qpc,swapchain,present_hr,sync_interval,feedback_swapchain,feedback_valid,stats_hr,submit_count,displayed_present_count,present_refresh_count,sync_refresh_count,sync_qpc,predicted_display_ns\n");
++    for (unsigned i=0;i<t->count;i++) {
++        const struct ht_trace_row *r=&t->rows[i];
++        const struct ht_present_feedback *f=&r->feedback;
++        fprintf(t->file,"%d,%"PRIu64",%.9f,%"PRIu64",%.9f,%d,%d,%d,%d,%d,%.9f,%.9f,%.9f,%.9f,%d,%d,%d,%d,%"PRId64",%"PRId64",%"PRId64",%"PRId64",0x%"PRIx64",%d,%d,0x%"PRIx64",%d,%d,%u,%u,%u,%u,%"PRId64",%"PRId64"\n",
++            r->kind,r->id,r->pts,r->selected_id,r->selected_pts,r->mixed,r->render_ok,
++            r->planned,r->remaining,r->correction,r->av_diff,r->error,r->frame_duration,r->vsync,
++            r->repeat,r->still,r->ds,r->dropped,r->begin,r->present_begin,r->present_end,r->end,
++            r->swapchain,r->present_hr,r->sync_interval,f->swapchain,f->valid,f->stats_hr,
++            f->submit_count,f->present_count,f->present_refresh,f->sync_refresh,f->sync_qpc,r->predicted_display);
++    }
++    fprintf(t->file,"# complete rows=%u omitted=%u\n",t->count,t->omitted);
++    int failed=ferror(t->file); if (fclose(t->file)) failed=1;
++    if (failed) MP_ERR(vo,"Presentation trace write failed\n");
++    free(t->rows); talloc_free(t); vo->ht_trace=NULL;
++}
+diff --git a/video/out/presentation_trace.h b/video/out/presentation_trace.h
+new file mode 100644
+index 000000000..32485a705
+--- /dev/null
++++ b/video/out/presentation_trace.h
+@@ -0,0 +1,24 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++// Private diagnostic build only. Never part of the release patch stack.
++#ifndef MP_PRESENTATION_TRACE_H
++#define MP_PRESENTATION_TRACE_H
++#include <stdint.h>
++struct vo;
++struct vo_frame;
++struct vo_vsync_info;
++struct ht_present_trace;
++struct ht_present_feedback {
++    uint64_t swapchain;
++    int64_t sync_qpc;
++    uint32_t submit_count, present_count, present_refresh, sync_refresh;
++    int32_t stats_hr;
++    int valid; // 1: submit count; 2: frame statistics
++};
++void ht_trace_init(struct vo *vo);
++void ht_trace_close(struct vo *vo);
++void ht_trace_begin(struct vo *vo, const struct vo_frame *frame, int kind);
++void ht_trace_mix(struct vo *vo, uint64_t id, double pts, int count, int ok);
++void ht_trace_present(struct vo *vo, uint64_t swapchain, int64_t begin,
++                      int64_t end, int32_t hr, int sync_interval);
++void ht_trace_end(struct vo *vo, const struct vo_vsync_info *info, int dropped);
++#endif
+diff --git a/video/out/vo.c b/video/out/vo.c
+index dfea9efc2..8248d0fc7 100644
+--- a/video/out/vo.c
++++ b/video/out/vo.c
+@@ -940,6 +940,7 @@ static bool render_frame(struct vo *vo)
+ 
+     frame = vo_frame_ref(in->current_frame);
+     mp_assert(frame);
++    ht_trace_begin(vo, frame, 0);
+ 
+     if (frame->display_synced) {
+         frame->pts = 0;
+@@ -994,6 +995,7 @@ static bool render_frame(struct vo *vo)
+ 
+     if (in->dropped_frame) {
+         in->drop_count += 1;
++        ht_trace_end(vo, NULL, 1);
+         wakeup_core(vo);
+     } else {
+         in->rendering = true;
+@@ -1026,6 +1028,7 @@ static bool render_frame(struct vo *vo)
+         };
+         if (vo->driver->get_vsync)
+             vo->driver->get_vsync(vo, &vsync);
++        ht_trace_end(vo, &vsync, prev_drop_count < vo->in->drop_count);
+ 
+         // Make up some crap if presentation feedback is missing.
+         if (vsync.last_queue_display_time <= 0)
+@@ -1104,8 +1107,10 @@ static void do_redraw(struct vo *vo)
+     frame->duration = -1;
+     mp_mutex_unlock(&in->lock);
+ 
++    ht_trace_begin(vo, frame, 1);
+     vo->driver->draw_frame(vo, frame);
+     vo->driver->flip_page(vo);
++    ht_trace_end(vo, NULL, 0);
+ 
+     if (frame != &dummy && !(vo->driver->caps & VO_CAP_FRAMEOWNER))
+         talloc_free(frame);
+@@ -1132,6 +1137,7 @@ static MP_THREAD_VOID vo_thread(void *ptr)
+     }
+ 
+     int r = vo->driver->preinit(vo) ? -1 : 0;
++    if (r >= 0) ht_trace_init(vo);
+     mp_rendezvous(vo, r); // init barrier
+     if (r < 0)
+         goto done;
+@@ -1221,6 +1227,7 @@ static MP_THREAD_VOID vo_thread(void *ptr)
+     talloc_free(in->current_frame);
+     in->current_frame = NULL;
+     vo->driver->uninit(vo);
++    ht_trace_close(vo);
+ done:
+     TA_FREEP(&in->dr_helper);
+     MP_THREAD_RETURN();
+diff --git a/video/out/vo.h b/video/out/vo.h
+index 9befceb94..823018908 100644
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -31,6 +31,7 @@
+ #include "options/options.h"
+ #include "osdep/threads.h"
+ #include "player/clipboard/clipboard.h"
++#include "presentation_trace.h"
+ 
+ enum {
+     // VO needs to redraw
+@@ -282,6 +283,9 @@ struct vo_extra {
+ };
+ 
+ struct vo_frame {
++    // Private diagnostic build: scheduler decision travels with the frame.
++    int ht_planned, ht_correction;
++    double ht_av_diff, ht_error;
+     // If > 0, realtime when frame should be shown, in mp_time_ns() units.
+     // If 0, present immediately.
+     int64_t pts;
+@@ -341,6 +345,7 @@ struct vo_frame {
+ // Presentation feedback. See get_vsync() for how backends should fill this
+ // struct.
+ struct vo_vsync_info {
++    struct ht_present_feedback ht_feedback;
+     // mp_time_ns() timestamp at which the last queued frame will likely be
+     // displayed (this is in the future, unless the frame is instantly output).
+     // 0 or lower if unset or unsupported.
+@@ -514,6 +519,7 @@ struct vo_driver {
+ };
+ 
+ struct vo {
++    struct ht_present_trace *ht_trace; // accessed only on the VO thread
+     mp_mutex async_probe_mutex;
+     struct voctrl_async_probe async_probe_snapshot;
+     const struct vo_driver *driver;
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index e32a0738f..688e44298 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -3137,6 +3137,13 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+     // Render frame
+     stats_time_start(p->stats, "render");
+     bool render_ok = pl_render_image_mix(p->rr, &mix, &target, &params);
++    if (vo->ht_trace) {
++        const struct pl_frame *selected = pl_frame_mix_current(&mix);
++        const struct mp_image *mpi = selected ? selected->user_data : NULL;
++        const struct frame_priv *fp = mpi ? mpi->priv : NULL;
++        ht_trace_mix(vo, fp && fp->causal_scene_tag ? fp->causal_scene_tag - 1 : 0,
++                     mpi ? mpi->pts : MP_NOPTS_VALUE, mix.num_frames, render_ok);
++    }
+     stats_time_end(p->stats, "render");
+     if (!render_ok) {
+         MP_ERR(vo, "Failed rendering frame!\n");
+-- 
+2.54.0.windows.1
+
