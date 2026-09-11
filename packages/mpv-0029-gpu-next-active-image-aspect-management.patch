@@ -8,11 +8,14 @@ Measure native luma asynchronously, publish frame-tagged active-image geometry, 
 Respect effective pixel aspect and rotation in the published ratio and framing.
 Share final geometry with window screenshots, and asynchronously reanalyze an
 already-mapped frame when detection is re-enabled during paused playback.
+
+Honor panscan and video zoom when scaling the detected aperture.
+Clip zoomed destinations and map their fractional source crops before rendering.
 ---
  player/command.c        |   34 ++
  video/out/vo.h          |   16 +
- video/out/vo_gpu_next.c | 1258 ++++++++++++++++++++++++++++++++++++++++++++++-
- 3 files changed, 1306 insertions(+), 2 deletions(-)
+ video/out/vo_gpu_next.c | 1328 ++++++++++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 1366 insertions(+), 12 deletions(-)
 
 diff --git a/player/command.c b/player/command.c
 index 178ff5429..f14ff99b8 100644
@@ -101,7 +104,7 @@ index f9c0365a2..62532521d 100644
  enum mp_content_type {
      MP_CONTENT_NONE, // used for force-window
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index 9915da25b..61f8bee03 100644
+index 9915da25b..becad85f9 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
 @@ -23,6 +23,8 @@
@@ -230,7 +233,7 @@ index 9915da25b..61f8bee03 100644
  };
  
  #if PL_API_VER >= 367
-@@ -1029,6 +1099,1038 @@ static bool upload_planes_sw(struct vo *vo, pl_gpu gpu, struct mp_image *mpi,
+@@ -1029,6 +1099,1042 @@ static bool upload_planes_sw(struct vo *vo, pl_gpu gpu, struct mp_image *mpi,
      return true;
  }
  
@@ -894,20 +897,23 @@ index 9915da25b..61f8bee03 100644
 +
 +static struct mp_rect fit_active_destination(struct mp_rect canvas,
 +                                             double source_ar,
-+                                             float align_x, float align_y)
++                                             float align_x, float align_y,
++                                             float panscan, float zoom)
 +{
 +    int cw = mp_rect_w(canvas), ch = mp_rect_h(canvas);
 +    if (cw < 1 || ch < 1 || !isfinite(source_ar) || source_ar <= 0)
 +        return canvas;
-+    double canvas_ar = (double) cw / ch;
-+    int w, h;
-+    if (source_ar >= canvas_ar) {
-+        w = cw;
-+        h = lrint(cw / source_ar);
-+    } else {
-+        h = ch;
-+        w = lrint(ch * source_ar);
-+    }
++
++    // Scale the detected aperture, not the encoded frame containing its mattes.
++    // Panscan interpolates from Fit (0) to Fill (1); zoom is an additional
++    // uniform scale, including Fullscreen UI's fixed Video scale adjustment.
++    double fit_h = MPMIN(ch, cw / source_ar);
++    double fill_h = MPMAX(ch, cw / source_ar);
++    double scaled_h = (fit_h + (fill_h - fit_h) * panscan) * exp2(zoom);
++    // Keep integer rectangles representable even at video-zoom's +/-20 limits.
++    scaled_h = MPMIN(scaled_h, (INT_MAX / 4.0) / MPMAX(1.0, source_ar));
++    int w = MPMAX(1, lrint(scaled_h * source_ar));
++    int h = MPMAX(1, lrint(scaled_h));
 +    int x = canvas.x0 + lrint((cw - w) * (MPCLAMP(align_x, -1, 1) + 1) / 2);
 +    int y = canvas.y0 + lrint((ch - h) * (MPCLAMP(align_y, -1, 1) + 1) / 2);
 +    return (struct mp_rect) {x, y, x + w, y + h};
@@ -978,7 +984,8 @@ index 9915da25b..61f8bee03 100644
 +    if (p->osd_res.display_par > 0)
 +        ratio *= p->osd_res.display_par;
 +    geometry.dst = fit_active_destination(canvas, ratio,
-+                                           vo->opts->align_x, vo->opts->align_y);
++                                           vo->opts->align_x, vo->opts->align_y,
++                                           vo->opts->panscan, vo->opts->zoom);
 +    if (geometry.automatic && !geometry.crop) {
 +        struct mp_rect aperture = rotated_active_source_rect(
 +            p, p->active_image.tag, vo->params);
@@ -1269,7 +1276,7 @@ index 9915da25b..61f8bee03 100644
  static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src,
                        struct pl_frame *frame)
  {
-@@ -1178,6 +2280,8 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
+@@ -1178,6 +2284,8 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
      update_lut(p, &p->next_opts->image_lut);
      frame->lut = p->next_opts->image_lut.lut;
      frame->lut_type = p->next_opts->image_lut.type;
@@ -1278,7 +1285,7 @@ index 9915da25b..61f8bee03 100644
      return true;
  }
  
-@@ -1227,8 +2331,11 @@ static void update_options(struct vo *vo)
+@@ -1227,8 +2335,11 @@ static void update_options(struct vo *vo)
  {
      struct priv *p = vo->priv;
      pl_options pars = p->pars;
@@ -1290,7 +1297,74 @@ index 9915da25b..61f8bee03 100644
      if (changed) {
          update_render_options(vo);
          // Cached intermediates were produced with the previous options.
-@@ -1515,6 +2622,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1345,15 +2456,10 @@ static void apply_target_options(struct priv *p, struct pl_frame *target,
+     target->icc = p->icc_profile;
+ }
+ 
+-static void apply_crop(struct pl_frame *frame, struct mp_rect crop,
+-                       int width, int height)
++static void apply_float_crop(struct pl_frame *frame, struct pl_rect2df crop,
++                             int width, int height)
+ {
+-    frame->crop = (struct pl_rect2df) {
+-        .x0 = crop.x0,
+-        .y0 = crop.y0,
+-        .x1 = crop.x1,
+-        .y1 = crop.y1,
+-    };
++    frame->crop = crop;
+ 
+     // mpv gives us rotated/flipped rects, libplacebo expects unrotated
+     pl_rect2df_rotate(&frame->crop, -frame->rotation);
+@@ -1368,6 +2474,47 @@ static void apply_crop(struct pl_frame *frame, struct mp_rect crop,
+     }
+ }
+ 
++static void apply_crop(struct pl_frame *frame, struct mp_rect crop,
++                       int width, int height)
++{
++    apply_float_crop(frame, (struct pl_rect2df) {
++        crop.x0, crop.y0, crop.x1, crop.y1,
++    }, width, height);
++}
++
++static void apply_active_crops(struct pl_frame *image, struct pl_frame *target,
++                               struct mp_rect src, struct mp_rect dst,
++                               int source_w, int source_h, int width, int height)
++{
++    // Clip the destination before rendering, mapping the same fraction back
++    // into the source. In particular, never allocate an offscreen zoom-sized
++    // render target. Keep fractional source coordinates for large zoom values.
++    struct mp_rect visible = {
++        MPCLAMP(dst.x0, 0, width), MPCLAMP(dst.y0, 0, height),
++        MPCLAMP(dst.x1, 0, width), MPCLAMP(dst.y1, 0, height),
++    };
++    double sx = (double) mp_rect_w(src) / MPMAX(1, mp_rect_w(dst));
++    double sy = (double) mp_rect_h(src) / MPMAX(1, mp_rect_h(dst));
++    struct pl_rect2df crop = {
++        src.x0 + (visible.x0 - dst.x0) * sx,
++        src.y0 + (visible.y0 - dst.y0) * sy,
++        src.x1 + (visible.x1 - dst.x1) * sx,
++        src.y1 + (visible.y1 - dst.y1) * sy,
++    };
++    // Match mpv's minimum one-source-pixel crop at extreme zoom. Tiny
++    // subpixel rectangles can round to an empty renderer sampling region.
++    double min_extent = fmin(fabs(pl_rect_w(crop)), fabs(pl_rect_h(crop)));
++    if (min_extent > 0 && min_extent < 1) {
++        double cx = (crop.x0 + crop.x1) / 2.0;
++        double cy = (crop.y0 + crop.y1) / 2.0;
++        double rx = pl_rect_w(crop) / (2.0 * min_extent);
++        double ry = pl_rect_h(crop) / (2.0 * min_extent);
++        crop = (struct pl_rect2df) {cx - rx, cy - ry, cx + rx, cy + ry};
++    }
++    apply_float_crop(image, crop, source_w, source_h);
++    apply_crop(target, visible, width, height);
++}
++
+ static bool set_colorspace_hint(struct priv *p, struct pl_color_space *hint)
+ {
+     struct ra_swapchain *sw = p->ra_ctx->swapchain;
+@@ -1515,6 +2662,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
              p->last_pts = 0.0;
              p->last_id = 0;
              reset_authored_scene_state(p);
@@ -1300,7 +1374,7 @@ index 9915da25b..61f8bee03 100644
              p->want_reset = false;
              pl_renderer_flush_cache(p->rr);
          }
-@@ -1809,11 +2919,15 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1809,11 +2959,15 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
      }
  
      struct pl_frame_mix mix = {0};
@@ -1316,7 +1390,7 @@ index 9915da25b..61f8bee03 100644
              .vsync_duration = can_interpolate ? frame->ideal_frame_vsync_duration : 0,
              .interpolation_threshold = opts->interpolation_threshold,
              .drift_compensation = 0,
-@@ -1848,6 +2962,34 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1848,6 +3002,34 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
              break;
          }
  
@@ -1351,22 +1425,25 @@ index 9915da25b..61f8bee03 100644
          // Update source crop and overlays on all existing frames. We
          // technically own the `pl_frame` struct so this is kosher. This could
          // be partially avoided by instead flushing the queue on resizes, but
-@@ -1859,7 +3001,13 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1859,7 +3041,16 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
  #if PL_API_VER >= 367
              apply_dovi_enhancement_layer(p, image, fp);
  #endif
 -            apply_crop(image, p->src, vo->params->w, vo->params->h);
-+            if (hard_crop_effective) {
-+                struct mp_rect auto_src = rotated_active_source_rect(
-+                    p, fp->causal_scene_tag, vo->params);
-+                apply_crop(image, auto_src, vo->params->w, vo->params->h);
++            struct mp_rect src = hard_crop_effective
++                ? rotated_active_source_rect(p, fp->causal_scene_tag, vo->params)
++                : p->src;
++            if (detected_framing_effective) {
++                apply_active_crops(image, &target, src, geometry.dst,
++                                   vo->params->w, vo->params->h,
++                                   swframe.fbo->params.w, swframe.fbo->params.h);
 +            } else {
-+                apply_crop(image, p->src, vo->params->w, vo->params->h);
++                apply_crop(image, src, vo->params->w, vo->params->h);
 +            }
              if (opts->blend_subs) {
                  if (frame->redraw)
                      p->osd_sync++;
-@@ -1902,6 +3050,43 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1902,6 +3093,43 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
              ((uint64_t *) mix.signatures)[i] ^= fp->osd_sync << 48;
          }
  
@@ -1410,23 +1487,34 @@ index 9915da25b..61f8bee03 100644
          // Update dynamic hook parameters
          for (int i = 0; i < pars->params.num_hooks; i++)
              update_hook_opts_dynamic(vo, p, p->hooks[i], frame->current);
-@@ -2385,6 +3570,15 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
+@@ -2385,8 +3613,24 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
          target.color.transfer = PL_COLOR_TRC_GAMMA22;
      }
  
+-    apply_crop(&image, src, mpi->params.w, mpi->params.h);
+-    apply_crop(&target, dst, fbo->params.w, fbo->params.h);
++    bool detected_framing = false;
 +    if (args->scaled) {
 +        struct active_geometry geometry = resolve_active_geometry(
 +            vo, fbo->params.w, fbo->params.h);
 +        dst = geometry.dst;
++        detected_framing = geometry.automatic || geometry.crop;
 +        if (geometry.crop) {
 +            struct frame_priv *fp = mpi->priv;
 +            src = rotated_active_source_rect(p, fp->causal_scene_tag, &mpi->params);
 +        }
 +    }
-     apply_crop(&image, src, mpi->params.w, mpi->params.h);
-     apply_crop(&target, dst, fbo->params.w, fbo->params.h);
++    if (detected_framing) {
++        apply_active_crops(&image, &target, src, dst, mpi->params.w, mpi->params.h,
++                           fbo->params.w, fbo->params.h);
++    } else {
++        apply_crop(&image, src, mpi->params.w, mpi->params.h);
++        apply_crop(&target, dst, fbo->params.w, fbo->params.h);
++    }
      update_tm_viz(&pars->color_map_params, &target);
-@@ -2608,6 +3802,46 @@ static int control(struct vo *vo, uint32_t request, void *data)
+ 
+     struct pl_color_map_params automatic_color_map;
+@@ -2608,6 +3852,46 @@ static int control(struct vo *vo, uint32_t request, void *data)
          return VO_TRUE;
      }
  
@@ -1473,7 +1561,7 @@ index 9915da25b..61f8bee03 100644
      case VOCTRL_SCREENSHOT:
          video_screenshot(vo, data);
          return true;
-@@ -2847,11 +4081,22 @@ static void uninit(struct vo *vo)
+@@ -2847,11 +4131,22 @@ static void uninit(struct vo *vo)
  {
      struct priv *p = vo->priv;
  
@@ -1496,7 +1584,7 @@ index 9915da25b..61f8bee03 100644
      for (int i = 0; i < MP_ARRAY_SIZE(p->osd_state.entries); i++)
          pl_tex_destroy(p->gpu, &p->osd_state.entries[i].tex);
      for (int i = 0; i < p->num_sub_tex; i++)
-@@ -2947,6 +4192,11 @@ static int preinit(struct vo *vo)
+@@ -2947,6 +4242,11 @@ static int preinit(struct vo *vo)
      pl_gpu_set_cache(p->gpu, p->shader_cache.cache);
      p->rr = pl_renderer_create(p->pllog, p->gpu);
      p->queue = pl_queue_create(p->gpu);
@@ -1508,7 +1596,7 @@ index 9915da25b..61f8bee03 100644
      p->osd_fmt[SUBBITMAP_LIBASS] = pl_find_named_fmt(p->gpu, "r8");
      p->osd_fmt[SUBBITMAP_BGRA] = pl_find_named_fmt(p->gpu, "bgra8");
      p->osd_sync = 1;
-@@ -3301,7 +4551,11 @@ static void update_render_options(struct vo *vo)
+@@ -3301,7 +4601,11 @@ static void update_render_options(struct vo *vo)
      // Request as many frames as required from the decoder, depending on the
      // speed VPS/FPS ratio libplacebo may need more frames. Request frames up to
      // ratio of 1/2, but only if anti aliasing is enabled.
