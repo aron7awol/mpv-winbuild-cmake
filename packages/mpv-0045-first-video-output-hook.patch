@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000045 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <development@mpv-ht.invalid>
+Date: Fri, 11 Sep 2026 01:00:00 -0400
+Subject: [PATCH] player: synchronize output target before first video render
+
+Expose decoded video-params through on_video_start before VO configuration.
+Yield to the core while hooks run so property and option commands remain live.
+Run once per video chain, without changing seek or steady-state cadence.
+
+diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
+index da12a7fa6..245aaf19f 100644
+--- a/DOCS/man/input.rst
++++ b/DOCS/man/input.rst
+@@ -2082,6 +2082,18 @@ The following hooks are currently defined:
+ 
+     Ordered after ``on_preloaded``. and before ``playback-restart``.
+ 
++``on_video_start``
++    Called once per newly created video output chain after decoded source
++    ``video-params`` become available, before its first video frame configures
++    or renders on the video output. Clients can set output-target options
++    synchronously here without racing the first frame. Not called for audio-only
++    playback. Ordinary seeks within the same chain do not invoke it again.
++
++    Do not wait for ``playback-restart`` or rendered output inside this hook:
++    video cannot start until the hook continues. The core remains responsive
++    to commands while waiting. Subsequent source parameter changes still emit
++    ordinary property notifications.
++
+ ``on_unload``
+     Run before closing a file, and before actually uninitializing
+     everything. It's not possible to resume playback in this state.
+diff --git a/player/core.h b/player/core.h
+index dbcfc1256..323c54213 100644
+--- a/player/core.h
++++ b/player/core.h
+@@ -180,6 +180,8 @@ struct vo_chain {
+ 
+     bool underrun;
+     bool underrun_signaled;
++    // First decoded source parameters must reach synchronous clients before VO.
++    bool video_start_hook_started;
+ };
+ 
+ // Like vo_chain, for audio.
+@@ -335,6 +337,9 @@ typedef struct MPContext {
+ 
+     struct vo_chain *vo_chain;
+ 
++    // Survives chain replacement while an asynchronous hook is outstanding.
++    bool video_start_hook_pending;
++
+     struct vo *video_out;
+     // next_frame[0] is the next frame, next_frame[1] the one after that.
+     // The +1 is for adding 1 additional frame in backstep mode.
+diff --git a/player/video.c b/player/video.c
+index c47787348..a28faf822 100644
+--- a/player/video.c
++++ b/player/video.c
+@@ -1051,6 +1051,14 @@ void write_video(struct MPContext *mpctx)
+     struct vo_chain *vo_c = mpctx->vo_chain;
+     struct vo *vo = vo_c->vo;
+ 
++    // A hook may still belong to a chain replaced by a track/file change.
++    // Keep processing core commands, but never overlap hook invocations.
++    if (mpctx->video_start_hook_pending) {
++        if (!mp_hook_test_completion(mpctx, "on_video_start"))
++            return;
++        mpctx->video_start_hook_pending = false;
++    }
++
+     if (vo_c->filter->reconfig_happened) {
+         mp_notify(mpctx, MPV_EVENT_VIDEO_RECONFIG, NULL);
+         vo_c->filter->reconfig_happened = false;
+@@ -1068,6 +1076,19 @@ void write_video(struct MPContext *mpctx)
+     MP_TRACE(mpctx, "video_output_image: r=%d/eof=%d/st=%s\n", r, logical_eof,
+              mp_status_str(mpctx->video_status));
+ 
++    // A filter read can discover source parameters in this very iteration.
++    // Property observers alone do not prevent rendering with an old target.
++    // Retain queued frames and yield to the core so hook clients can set options.
++    if (!vo_c->video_start_hook_started && vo_c->filter->input_params.imgfmt) {
++        vo_c->video_start_hook_started = true;
++        mp_notify(mpctx, MPV_EVENT_VIDEO_RECONFIG, NULL);
++        mp_hook_start(mpctx, "on_video_start");
++        mpctx->video_start_hook_pending =
++            !mp_hook_test_completion(mpctx, "on_video_start");
++        if (mpctx->video_start_hook_pending)
++            return;
++    }
++
+     if (r < 0)
+         goto error;
+ 
