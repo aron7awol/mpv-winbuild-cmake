@@ -1,0 +1,29 @@
+From 06f3721bb1c3093bb0dd77f33bb0bf891f7ccca3 Mon Sep 17 00:00:00 2001
+From: mpv-ht <build@mpv-ht.invalid>
+Date: Fri, 11 Sep 2026 09:47:42 -0400
+Subject: [PATCH] analyzer: skip waveform reduction for the unselected side
+
+---
+ video/out/analyzer_waveform_bridge.h | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/video/out/analyzer_waveform_bridge.h b/video/out/analyzer_waveform_bridge.h
+index 6429fa19e..06aaa439f 100644
+--- a/video/out/analyzer_waveform_bridge.h
++++ b/video/out/analyzer_waveform_bridge.h
+@@ -75,7 +75,11 @@ static void analyzer_waveform_update(struct priv *p,const struct pl_hook_params
+     struct async_probe *a=p->async_probe;
+     if(!a->wave_tex || !p->next_opts->analyzer_waveform || p->next_opts->analyzer_waveform_height<=0) return;
+     pl_tex source=pl_mpv_user_shader_saved_texture(hook,"ANALYZER_LINEAR");
+-    if(!analyzer_waveform_reduce(p,hp,hook,source,false) ||
++    // The density shader never reads the unselected side. Frame statistics
++    // and output linearization still serve both cards and remain unchanged.
++    int layers=p->next_opts->analyzer_waveform_layers;
++    if(layers!=2 && !analyzer_waveform_reduce(p,hp,hook,source,false)) return;
++    if(layers!=1 &&
+        !analyzer_waveform_reduce(p,&a->output,hook,slot->output_linear,true)) return;
+     int width=a->wave_w, tint=p->next_opts->analyzer_waveform_tint;
+     int channels=p->next_opts->analyzer_waveform==4 ? 3 : 1, stride=256*channels;
+-- 
+2.54.0.windows.1
+
