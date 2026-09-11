@@ -1,0 +1,102 @@
+From a8eba46de700a7ecf18808150010da86a6223c41 Mon Sep 17 00:00:00 2001
+From: mpv-ht diagnostic preparation <diagnostic@mpv-ht.invalid>
+Date: Thu, 10 Sep 2026 20:25:06 -0400
+Subject: [PATCH] diagnostic: retain unchanged ASS images behind explicit
+ environment switch
+
+---
+ sub/osd_libass.c | 21 ++++++++++++++++++++-
+ sub/osd_state.h  |  3 +++
+ 2 files changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/sub/osd_libass.c b/sub/osd_libass.c
+index 7b0850954..54923019b 100644
+--- a/sub/osd_libass.c
++++ b/sub/osd_libass.c
+@@ -52,6 +52,8 @@ static void create_ass_renderer(struct osd_state *osd, struct ass_state *ass)
+     ass_add_font(ass->library, "mpv-osd-symbols", (void *)osd_font_pfb,
+                  sizeof(osd_font_pfb) - 1);
+ 
++    const char *cache = getenv("MPV_HT_ASS_CACHE");
++    ass->cache_enabled = cache && strcmp(cache, "1") == 0;
+     ass->render = ass_renderer_init(ass->library);
+     if (!ass->render)
+         abort();
+@@ -63,6 +65,8 @@ static void create_ass_renderer(struct osd_state *osd, struct ass_state *ass)
+ 
+ static void destroy_ass_renderer(struct ass_state *ass)
+ {
++    ass->cache_valid = false;
++    ass->cached_images = NULL;
+     if (ass->track)
+         ass_free_track(ass->track);
+     ass->track = NULL;
+@@ -110,13 +114,16 @@ static void update_playres(struct ass_state *ass, struct mp_osd_res *vo_res)
+ 
+     // Force libass to clear its internal cache - it doesn't check for
+     // PlayRes changes itself.
+-    if (old_res_x != track->PlayResX || old_res_y != track->PlayResY)
++    if (old_res_x != track->PlayResX || old_res_y != track->PlayResY) {
++        ass->cache_valid = false;
+         ass_set_frame_size(ass->render, 1, 1);
++    }
+ }
+ 
+ static void create_ass_track(struct osd_state *osd, struct osd_object *obj,
+                              struct ass_state *ass)
+ {
++    ass->cache_valid = false;
+     create_ass_renderer(osd, ass);
+ 
+     ASS_Track *track = ass->track;
+@@ -189,6 +196,7 @@ static ASS_Event *add_osd_ass_event(ASS_Track *track, const char *style,
+ 
+ static void clear_ass(struct ass_state *ass)
+ {
++    ass->cache_valid = false;
+     if (ass->track)
+         ass_flush_events(ass->track);
+ }
+@@ -668,6 +676,13 @@ static void append_ass(struct ass_state *ass, struct mp_osd_res *res,
+         return;
+     }
+ 
++    // OSD tracks are always rendered at time zero. Reuse libass-owned images
++    // only until the next track/style mutation or renderer geometry change.
++    if (ass->cache_enabled && ass->cache_valid &&
++        osd_res_equals(ass->cached_res, *res)) {
++        *img_list = ass->cached_images;
++        goto done;
++    }
+     update_playres(ass, res);
+ 
+     ass_set_frame_size(ass->render, res->w, res->h);
+@@ -677,7 +692,11 @@ static void append_ass(struct ass_state *ass, struct mp_osd_res *res,
+     *img_list = ass_render_frame(ass->render, ass->track, 0, &ass_changed);
+ 
+     ass->changed |= ass_changed;
++    ass->cached_images = *img_list;
++    ass->cached_res = *res;
++    ass->cache_valid = true;
+ 
++done:
+     if (changed) {
+         *changed |= ass->changed;
+         ass->changed = false;
+diff --git a/sub/osd_state.h b/sub/osd_state.h
+index cd4ca15a0..df1763fe5 100644
+--- a/sub/osd_state.h
++++ b/sub/osd_state.h
+@@ -24,6 +24,9 @@ struct ass_state {
+     struct ass_renderer *render;
+     struct ass_library *library;
+     int res_x, res_y;
++    bool cache_enabled, cache_valid;
++    struct ass_image *cached_images;
++    struct mp_osd_res cached_res;
+     bool changed;
+     struct mp_osd_res vo_res; // last known value
+ };
+-- 
+2.54.0.windows.1
+
