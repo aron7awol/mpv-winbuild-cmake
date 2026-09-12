@@ -1,0 +1,60 @@
+From 2165c470c34bfed4e84c1c794bd4995e2067cb8c Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Sat, 12 Sep 2026 14:43:18 -0400
+Subject: [PATCH] wasapi: retain the MTA for the audio-device notifier lifetime
+
+A property query can create the notifier on a script thread. That thread may exit before command_uninit releases the notifier. Keep the MTA alive with a usage cookie, paired once during notifier destruction, instead of balancing thread-local COM initialization across different threads.
+---
+ audio/out/ao_wasapi.c | 14 +++++++++++---
+ audio/out/ao_wasapi.h |  1 +
+ 2 files changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/audio/out/ao_wasapi.c b/audio/out/ao_wasapi.c
+index 1f00ec7ba..ee3db6770 100644
+--- a/audio/out/ao_wasapi.c
++++ b/audio/out/ao_wasapi.c
+@@ -566,9 +566,13 @@ static bool audio_set_pause(struct ao *ao, bool paused)
+ 
+ static void hotplug_uninit(struct ao *ao)
+ {
++    struct wasapi_state *state = ao->priv;
+     MP_DBG(ao, "Hotplug uninit\n");
+     wasapi_change_uninit(ao);
+-    CoUninitialize();
++    if (state->hotplug_mta) {
++        CoDecrementMTAUsage(state->hotplug_mta);
++        state->hotplug_mta = NULL;
++    }
+ }
+ 
+ static int hotplug_init(struct ao *ao)
+@@ -576,8 +580,12 @@ static int hotplug_init(struct ao *ao)
+     MP_DBG(ao, "Hotplug init\n");
+     struct wasapi_state *state = ao->priv;
+     state->log = ao->log;
+-    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+-    HRESULT hr = wasapi_change_init(ao, true);
++    // A client property query can create the notifier on a script thread,
++    // while command_uninit destroys it after that thread has exited. Keep
++    // the MTA alive for the notifier's lifetime, independently of that thread.
++    HRESULT hr = CoIncrementMTAUsage(&state->hotplug_mta);
++    EXIT_ON_ERROR(hr);
++    hr = wasapi_change_init(ao, true);
+     EXIT_ON_ERROR(hr);
+ 
+     return 0;
+diff --git a/audio/out/ao_wasapi.h b/audio/out/ao_wasapi.h
+index 4e7a808ca..27c16f158 100644
+--- a/audio/out/ao_wasapi.h
++++ b/audio/out/ao_wasapi.h
+@@ -105,6 +105,7 @@ typedef struct wasapi_state {
+     struct ao_convert_fmt convert_format;
+ 
+     change_notify change;
++    CO_MTA_USAGE_COOKIE hotplug_mta;
+ } wasapi_state;
+ 
+ char *mp_PKEY_to_str_buf(char *buf, size_t buf_size, const PROPERTYKEY *pkey);
+-- 
+2.54.0.windows.1
+
