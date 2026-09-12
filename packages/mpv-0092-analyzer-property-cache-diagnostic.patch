@@ -1,0 +1,210 @@
+From de5e45ae2bcebaa80b9e1ffe323f34c364fb8c08 Mon Sep 17 00:00:00 2001
+From: mpv-ht diagnostic preparation <diagnostic@mpv-ht.invalid>
+Date: Sat, 12 Sep 2026 01:45:45 -0400
+Subject: [PATCH] diagnostic: compare cached Analyzer properties independently
+
+---
+ player/analyzer_property_cache.h | 71 ++++++++++++++++++++++++++++++
+ player/command.c                 | 74 +++++++++++++++++++++++++++++++-
+ video/out/vo.h                   |  1 +
+ 3 files changed, 145 insertions(+), 1 deletion(-)
+ create mode 100644 player/analyzer_property_cache.h
+
+diff --git a/player/analyzer_property_cache.h b/player/analyzer_property_cache.h
+new file mode 100644
+index 000000000..f36461564
+--- /dev/null
++++ b/player/analyzer_property_cache.h
+@@ -0,0 +1,71 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#ifndef MP_ANALYZER_PROPERTY_CACHE_H
++#define MP_ANALYZER_PROPERTY_CACHE_H
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++
++// Core-thread owned, tied to a VO's lifetime. Frame and cursor sequences are
++// independent. Copy new measurements under the snapshot mutex, format outside.
++struct analyzer_property_cache {
++    int64_t frame_sequence, histogram_sequence;
++    bool frame_dirty, histogram_dirty;
++    float frame_values[2][532], histogram_values[256];
++    char frame[2][16384], histogram[16384];
++};
++
++static inline void analyzer_property_cache_snapshot(struct analyzer_property_cache *c,
++    int mode, int64_t sequence, int64_t frame_sequence, const float *values)
++{
++    if (mode == 3 && frame_sequence) {
++        if (c->frame_sequence != frame_sequence) {
++            memcpy(c->frame_values[0], values + 16, sizeof(c->frame_values[0]));
++            memcpy(c->frame_values[1], values + 576, sizeof(c->frame_values[1]));
++            c->frame_sequence = frame_sequence;
++            c->frame_dirty = true;
++        }
++    } else {
++        c->frame_sequence = 0;
++        c->frame[0][0] = c->frame[1][0] = 0;
++        c->frame_dirty = false;
++    }
++    if (mode == 2 && sequence) {
++        if (c->histogram_sequence != sequence) {
++            memcpy(c->histogram_values, values + 4, sizeof(c->histogram_values));
++            c->histogram_sequence = sequence;
++            c->histogram_dirty = true;
++        }
++    } else {
++        c->histogram_sequence = 0;
++        c->histogram[0] = 0;
++        c->histogram_dirty = false;
++    }
++}
++
++static inline void analyzer_format_values(char *text, size_t capacity,
++    const float *values, int count, const char *format)
++{
++    size_t used = 0;
++    for (int i = 0; i < count; i++) {
++        int n = snprintf(text + used, capacity - used, format, i ? "," : "", values[i]);
++        if (n < 0 || (size_t)n >= capacity - used) { text[0] = 0; return; }
++        used += n;
++    }
++}
++
++static inline void analyzer_property_cache_format(struct analyzer_property_cache *c)
++{
++    if (c->frame_dirty) {
++        for (int stage = 0; stage < 2; stage++)
++            analyzer_format_values(c->frame[stage], sizeof(c->frame[stage]),
++                c->frame_values[stage], 532, "%s%.9g");
++        c->frame_dirty = false;
++    }
++    if (c->histogram_dirty) {
++        analyzer_format_values(c->histogram, sizeof(c->histogram),
++            c->histogram_values, 256, "%s%.0f");
++        c->histogram_dirty = false;
++    }
++}
++#endif
+diff --git a/player/command.c b/player/command.c
+index 48b08cc99..67c906ef5 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -86,6 +86,7 @@
+ #include "osdep/terminal.h"
+ 
+ #include "core.h"
++#include "analyzer_property_cache.h"
+ 
+ #ifdef _WIN32
+ #include <windows.h>
+@@ -2794,7 +2795,7 @@ static int mp_property_output_capture(void *ctx, struct m_property *prop,
+     return m_property_read_sub(props, action, arg);
+ }
+ 
+-static int mp_property_async_probe(void *ctx, struct m_property *prop, int action, void *arg)
++static int mp_property_async_probe_original(void *ctx, struct m_property *prop, int action, void *arg)
+ {
+     MPContext *mpctx = ctx;
+     struct voctrl_async_probe v;
+@@ -2824,6 +2825,7 @@ static int mp_property_async_probe(void *ctx, struct m_property *prop, int actio
+     if (v.mode == 2) for (int i = 4; i < 260; i++)
+         hist = talloc_asprintf_append(hist, "%s%.0f", i == 4 ? "" : ",", v.values[i]);
+     struct m_sub_property props[] = {
++        {"property-cache", SUB_PROP_BOOL(false)},
+         {"poll-ns", SUB_PROP_INT64(v.poll_ns)},
+         {"poll-count", SUB_PROP_INT64(v.poll_count)},
+         {"poll-busy", SUB_PROP_INT64(v.poll_busy)},
+@@ -2864,6 +2866,76 @@ static int mp_property_async_probe(void *ctx, struct m_property *prop, int actio
+     return ret;
+ }
+ 
++static int mp_property_async_probe_cached(void *ctx, struct m_property *prop, int action, void *arg)
++{
++    MPContext *mpctx = ctx;
++    struct vo *vo = mpctx->video_out;
++    if (!vo) return M_PROPERTY_UNAVAILABLE;
++    if (!vo->async_probe_property_cache)
++        vo->async_probe_property_cache = talloc_zero(vo, struct analyzer_property_cache);
++    struct analyzer_property_cache *cache = vo->async_probe_property_cache;
++    mp_mutex_lock(&vo->async_probe_mutex);
++    const struct voctrl_async_probe *v = &vo->async_probe_snapshot;
++    analyzer_property_cache_snapshot(cache, v->mode, v->sequence, v->stats_ns, v->values);
++    bool available = v->sequence != 0;
++    char *hist = cache->histogram;
++    char *frame = cache->frame[0], *output_frame = cache->frame[1];
++    // Copy only scalar property values. In particular, do not copy the 0.55 MB
++    // chromaticity tail on every cursor query; it has its own property below.
++    struct m_sub_property props[] = {
++        {"property-cache", SUB_PROP_BOOL(true)},
++        {"poll-ns", SUB_PROP_INT64(v->poll_ns)},
++        {"poll-count", SUB_PROP_INT64(v->poll_count)},
++        {"poll-busy", SUB_PROP_INT64(v->poll_busy)},
++        {"frame-results", SUB_PROP_INT64(v->frame_results)},
++        {"readback-ns", SUB_PROP_INT64(v->readback_ns)},
++        {"readback-count", SUB_PROP_INT64(v->readback_count)},
++        {"readback-max-ns", SUB_PROP_INT64(v->readback_max_ns)},
++        {"staging-bytes", SUB_PROP_INT(v->compact_telemetry >= 2 ? 4480 : 554368)},
++        {"compact-telemetry", SUB_PROP_INT(v->compact_telemetry)},
++        {"readback-bytes", SUB_PROP_INT(v->compact_telemetry ? 4480 : 554368)},
++        {"waveform-x", SUB_PROP_INT(v->wave_x)}, {"waveform-y", SUB_PROP_INT(v->wave_y)},
++        {"waveform-w", SUB_PROP_INT(v->wave_w)}, {"waveform-h", SUB_PROP_INT(v->wave_h)},
++        {"waveform-sequence", SUB_PROP_INT64(v->wave_sequence)},
++        {"sequence", SUB_PROP_INT64(v->sequence)}, {"skipped", SUB_PROP_INT64(v->skipped)},
++        {"x", SUB_PROP_INT(v->x)}, {"y", SUB_PROP_INT(v->y)}, {"mode", SUB_PROP_INT(v->mode)},
++        {"ready-ms", SUB_PROP_DOUBLE(v->ready_ms)},
++        {"age-ms", SUB_PROP_DOUBLE((mp_time_ns() - v->submitted_ns) / 1e6)},
++        {"r", SUB_PROP_DOUBLE(v->values[0])}, {"g", SUB_PROP_DOUBLE(v->values[1])},
++        {"b", SUB_PROP_DOUBLE(v->values[2])}, {"histogram", SUB_PROP_STR(hist)},
++        {"Y", SUB_PROP_DOUBLE(v->values[3])}, {"P", SUB_PROP_DOUBLE(v->values[4])},
++        {"cx", SUB_PROP_DOUBLE(v->values[5])}, {"cy", SUB_PROP_DOUBLE(v->values[6])},
++        {"gamut", SUB_PROP_INT((int)v->values[7])}, {"de", SUB_PROP_DOUBLE(v->values[8])},
++        {"sdr", SUB_PROP_BOOL(v->values[9] > .5f)}, {"chromatic", SUB_PROP_BOOL(v->values[10] > .5f)},
++        {"valid", SUB_PROP_BOOL(v->values[11] > .5f)},
++        {"output-r", SUB_PROP_DOUBLE(v->values[548])}, {"output-g", SUB_PROP_DOUBLE(v->values[549])},
++        {"output-b", SUB_PROP_DOUBLE(v->values[550])}, {"output-Y", SUB_PROP_DOUBLE(v->values[551])},
++        {"output-P", SUB_PROP_DOUBLE(v->values[552])}, {"output-valid", SUB_PROP_BOOL(v->values[553] > .5f)},
++        {"output-cx", SUB_PROP_DOUBLE(v->values[554])}, {"output-cy", SUB_PROP_DOUBLE(v->values[555])},
++        {"output-chromatic", SUB_PROP_BOOL(v->values[556] > .5f)},
++        {"frame", SUB_PROP_STR(frame)}, {"frame-age-ms", SUB_PROP_DOUBLE(v->stats_ns ? (mp_time_ns()-v->stats_ns)/1e6 : -1)},
++        {"output-frame", SUB_PROP_STR(output_frame)},
++        {"frame-sequence", SUB_PROP_INT64(v->stats_ns)}, {0}
++    };
++    mp_mutex_unlock(&vo->async_probe_mutex);
++    vo_wakeup(vo); // Request a future zero-timeout poll; never wait for the VO thread.
++    if (!available) return M_PROPERTY_UNAVAILABLE;
++    analyzer_property_cache_format(cache);
++    return m_property_read_sub(props, action, arg);
++}
++
++static int mp_property_async_probe(void *ctx, struct m_property *prop, int action, void *arg)
++{
++    // Diagnostic comparison: fixed for the lifetime of this core thread/process.
++    static int enabled = -1;
++    if (enabled < 0) {
++        const char *value = getenv("MPV_HT_ANALYZER_PROPERTY_CACHE");
++        enabled = value && !strcmp(value, "1");
++    }
++    return enabled ? mp_property_async_probe_cached(ctx, prop, action, arg)
++                   : mp_property_async_probe_original(ctx, prop, action, arg);
++}
++
+ // Queried only when frame-sequence changes, not for every cursor update.
+ static int mp_property_analyzer_chromaticity(void *ctx, struct m_property *prop,
+                                             int action, void *arg)
+diff --git a/video/out/vo.h b/video/out/vo.h
+index ee52907ee..c2a214197 100644
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -519,6 +519,7 @@ struct vo_driver {
+ struct vo {
+     mp_mutex async_probe_mutex;
+     struct voctrl_async_probe async_probe_snapshot;
++    struct analyzer_property_cache *async_probe_property_cache; // core thread only
+     const struct vo_driver *driver;
+     struct mp_log *log; // Using e.g. "[vo/vdpau]" as prefix
+     void *priv;
+-- 
+2.54.0.windows.1
+
