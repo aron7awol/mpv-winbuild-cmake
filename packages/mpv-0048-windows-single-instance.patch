@@ -1,0 +1,329 @@
+From: mpv-ht <build@mpv-ht.invalid>
+Date: Fri, 11 Sep 2026 14:00:00 -0400
+Subject: [PATCH] win32: reuse the primary player before scripts and display setup
+
+Read the persistent single-instance preference, serialize startup, and forward
+files with acknowledged IPC commands. Keep independent diagnostic launches.
+
+---
+diff --git a/meson.build b/meson.build
+index afb5cb79f..3ad7cb176 100644
+--- a/meson.build
++++ b/meson.build
+@@ -542,6 +542,7 @@ if features['win32-desktop']
+                      'osdep/language-win.c',
+                      'osdep/terminal-win.c',
+                      'osdep/w32_register.c',
++                     'osdep/w32_single_instance.c',
+                      'video/out/w32_common.c',
+                      'video/out/win32/displayconfig.c',
+                      'video/out/win32/droptarget.c',
+diff --git a/options/options.c b/options/options.c
+index 3d7c3dc7a..15e1dee31 100644
+--- a/options/options.c
++++ b/options/options.c
+@@ -923,6 +923,7 @@ static const m_option_t mp_opts[] = {
+ #endif
+     {"input-terminal", OPT_BOOL(consolecontrols), .flags = UPDATE_TERM},
+ 
++    {"single-instance", OPT_BOOL(single_instance)},
+     {"input-ipc-server", OPT_STRING(ipc_path), .flags = M_OPT_FILE},
+     {"input-ipc-client", OPT_STRING(ipc_client)},
+ 
+@@ -1053,6 +1054,7 @@ static const struct MPOpts mp_default_opts = {
+     .sync_max_video_change = 1,
+     .sync_max_audio_change = 0.125,
+     .sync_max_factor = 5,
++    .single_instance = true,
+     .load_config = true,
+     .position_resume = true,
+     .watch_history_path = "~~state/watch_history.jsonl",
+diff --git a/options/options.h b/options/options.h
+index fa48bc7c6..15324915d 100644
+--- a/options/options.h
++++ b/options/options.h
+@@ -405,6 +405,7 @@ typedef struct MPOpts {
+ 
+     struct encode_opts *encode_opts;
+ 
++    bool single_instance;
+     char *ipc_path;
+     char *ipc_client;
+ 
+diff --git a/osdep/w32_single_instance.c b/osdep/w32_single_instance.c
+new file mode 100644
+index 000000000..144caf227
+--- /dev/null
++++ b/osdep/w32_single_instance.c
+@@ -0,0 +1,240 @@
++/*
++ * This file is part of mpv.
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++// Windows application-instance handoff. Runs before IPC/scripts/display setup.
++#include <windows.h>
++#include <stdio.h>
++#include <ctype.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include "mpv_talloc.h"
++#include "common/common.h"
++#include "common/msg.h"
++#include "common/playlist.h"
++#include "options/options.h"
++#include "options/m_config_frontend.h"
++#include "options/path.h"
++#include "osdep/io.h"
++#include "player/core.h"
++#include "include/mpv/client.h"
++#include "misc/json.h"
++#include "osdep/w32_single_instance.h"
++
++static void read_preference(struct MPContext *mpctx)
++{
++    struct m_config_option *co = m_config_get_co(mpctx->mconfig, bstr0("single-instance"));
++    if (co && co->is_set_from_cmdline)
++        return;
++    const char *root = getenv("MPV_HT_USER_DATA");
++    if (!root || !root[0])
++        root = getenv("MPV_SK_USER_DATA");
++    char *path = root && root[0] ? talloc_asprintf(NULL, "%s/settings/instance.conf", root)
++                                 : mp_get_user_path(NULL, mpctx->global,
++                                                    "~~/../user-data/settings/instance.conf");
++    FILE *f = fopen(path, "rb");
++    if (!f) {
++        char *backup = talloc_asprintf(NULL, "%s.bak", path);
++        f = fopen(backup, "rb");
++        talloc_free(backup);
++    }
++    if (f) {
++        char line[256];
++        while (fgets(line, sizeof(line), f)) {
++            char *p = line;
++            if (!strncmp(p, "\xef\xbb\xbf", 3))
++                p += 3;
++            while (*p && isspace((unsigned char)*p))
++                p++;
++            if (strncmp(p, "single-instance=", 16))
++                continue;
++            p += 16;
++            p[strcspn(p, "\r\n# ")] = 0;
++            if (!strcmp(p, "yes") || !strcmp(p, "no"))
++                m_config_set_option_cli(mpctx->mconfig, bstr0("single-instance"), bstr0(p), 0);
++        }
++        fclose(f);
++    }
++    talloc_free(path);
++}
++
++static void release_owner(void *ctx)
++{
++    HANDLE *owner = ctx;
++    ReleaseMutex(*owner);
++    CloseHandle(*owner);
++}
++
++static bool pipe_io(HANDLE pipe, bool write, void *buffer, DWORD size, DWORD *count)
++{
++    OVERLAPPED op = {.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL)};
++    if (!op.hEvent)
++        return false;
++    BOOL ok = write ? WriteFile(pipe, buffer, size, count, &op)
++                    : ReadFile(pipe, buffer, size, count, &op);
++    if (!ok && GetLastError() == ERROR_IO_PENDING) {
++        if (WaitForSingleObject(op.hEvent, 10000) != WAIT_OBJECT_0)
++            CancelIoEx(pipe, &op);
++        // Complete cancellation before the stack OVERLAPPED goes out of scope.
++        ok = GetOverlappedResult(pipe, &op, count, TRUE);
++    }
++    CloseHandle(op.hEvent);
++    return ok;
++}
++
++static bool command(HANDLE pipe, const char **args, int count)
++{
++    mpv_node values[8];
++    if (count > MP_ARRAY_SIZE(values))
++        return false;
++    for (int i = 0; i < count; i++)
++        values[i] = (mpv_node){.format = MPV_FORMAT_STRING, .u.string = (char *)args[i]};
++    mpv_node_list list = {.num = count, .values = values};
++    mpv_node array = {.format = MPV_FORMAT_NODE_ARRAY, .u.list = &list};
++    char *keys[] = {"command", "request_id"};
++    mpv_node fields[] = {array, {.format = MPV_FORMAT_INT64, .u.int64 = 1}};
++    mpv_node_list object = {.num = 2, .keys = keys, .values = fields};
++    mpv_node node = {.format = MPV_FORMAT_NODE_MAP, .u.list = &object};
++    char *json = NULL;
++    json_write(&json, &node);
++    json = talloc_strdup_append(json, "\n");
++    DWORD written = 0;
++    bool ok = pipe_io(pipe, true, json, strlen(json), &written) && written == strlen(json);
++    talloc_free(json);
++    if (!ok)
++        return false;
++    char reply[65536];
++    DWORD total = 0;
++    ULONGLONG deadline = GetTickCount64() + 15000;
++    while (total < sizeof(reply) - 1 && GetTickCount64() < deadline) {
++        DWORD read = 0;
++        if (!pipe_io(pipe, false, reply + total, sizeof(reply) - total - 1, &read) || !read)
++            return false;
++        total += read;
++        reply[total] = 0;
++        char *end;
++        while ((end = memchr(reply, '\n', total))) {
++            *end = 0;
++            mpv_node result = {0};
++            char *cursor = reply;
++            void *ctx = talloc_new(NULL);
++            ok = false;
++            bool matched = false;
++            if (json_parse(ctx, &result, &cursor, 10) == 0 &&
++                result.format == MPV_FORMAT_NODE_MAP) {
++                for (int i = 0; i < result.u.list->num; i++) {
++                    mpv_node *value = &result.u.list->values[i];
++                    if (!strcmp(result.u.list->keys[i], "error") &&
++                        value->format == MPV_FORMAT_STRING)
++                        ok = !strcmp(value->u.string, "success");
++                    if (!strcmp(result.u.list->keys[i], "request_id") &&
++                        value->format == MPV_FORMAT_INT64)
++                        matched = value->u.int64 == 1;
++                }
++            }
++            talloc_free(ctx);
++            if (matched)
++                return ok;
++            DWORD consumed = end - reply + 1;
++            total -= consumed;
++            memmove(reply, end + 1, total);
++        }
++    }
++    return false;
++}
++
++static BOOL CALLBACK activate_window(HWND window, LPARAM pid)
++{
++    DWORD owner = 0;
++    GetWindowThreadProcessId(window, &owner);
++    if (owner != (DWORD)pid || !IsWindowVisible(window) || GetWindow(window, GW_OWNER))
++        return TRUE;
++    if (IsIconic(window))
++        ShowWindow(window, SW_RESTORE);
++    SetForegroundWindow(window);
++    return FALSE;
++}
++
++// 0: start this player; 1: handed off; -1: existing owner could not accept it.
++int mp_w32_single_instance(struct MPContext *mpctx)
++{
++    if (!mpctx->is_cli || !mpctx->opts->load_config)
++        return 0;
++    read_preference(mpctx);
++    if (!mpctx->opts->single_instance)
++        return 0;
++    if (!mpctx->opts->ipc_path || !mpctx->opts->ipc_path[0])
++        m_config_set_option_cli(mpctx->mconfig, bstr0("input-ipc-server"),
++                                bstr0("\\\\.\\pipe\\mpv-ht"), 0);
++    const char *name = mpctx->opts->ipc_path;
++    char *pipe_name = strncmp(name, "\\\\.\\pipe\\", 9)
++                          ? talloc_asprintf(NULL, "\\\\.\\pipe\\%s", name)
++                          : talloc_strdup(NULL, name);
++    wchar_t *wide_pipe = mp_from_utf8(NULL, pipe_name);
++    uint64_t hash = 14695981039346656037ULL;
++    for (char *p = pipe_name; *p; p++)
++        hash = (hash ^ (unsigned char)tolower((unsigned char)*p)) * 1099511628211ULL;
++    wchar_t mutex_name[80];
++    swprintf(mutex_name, MP_ARRAY_SIZE(mutex_name), L"Local\\mpv-ht-instance-%016llx",
++             (unsigned long long)hash);
++    HANDLE mutex = CreateMutexW(NULL, FALSE, mutex_name);
++    if (!mutex) {
++        talloc_free(wide_pipe);
++        talloc_free(pipe_name);
++        return -1;
++    }
++    DWORD acquired = WaitForSingleObject(mutex, 0);
++    bool owner = acquired == WAIT_OBJECT_0 || acquired == WAIT_ABANDONED;
++    HANDLE pipe = INVALID_HANDLE_VALUE;
++    DWORD pipe_error = ERROR_FILE_NOT_FOUND;
++    ULONGLONG deadline = GetTickCount64() + (owner ? 0 : 10000);
++    do {
++        pipe = CreateFileW(wide_pipe, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
++                           FILE_FLAG_OVERLAPPED, NULL);
++        pipe_error = GetLastError();
++        if (pipe != INVALID_HANDLE_VALUE || owner)
++            break;
++        // If the first launch failed before IPC appeared, reclaim its mutex.
++        acquired = WaitForSingleObject(mutex, 50);
++        if (acquired == WAIT_OBJECT_0 || acquired == WAIT_ABANDONED) {
++            owner = true;
++            break;
++        }
++    } while (GetTickCount64() < deadline);
++    talloc_free(wide_pipe);
++    talloc_free(pipe_name);
++    if (pipe == INVALID_HANDLE_VALUE && owner && pipe_error == ERROR_FILE_NOT_FOUND) {
++        HANDLE *held = talloc(mpctx, HANDLE);
++        *held = mutex;
++        talloc_set_destructor(held, release_owner);
++        return 0;
++    }
++    bool ok = pipe != INVALID_HANDLE_VALUE;
++    if (ok) {
++        ULONG pid = 0;
++        GetNamedPipeServerProcessId(pipe, &pid);
++        if (pid)
++            AllowSetForegroundWindow(pid);
++        for (int i = 0; ok && i < mpctx->playlist->num_entries; i++) {
++            char *file = mp_normalize_user_path(NULL, mpctx->global,
++                                                mpctx->playlist->entries[i]->filename);
++            const char *args[] = {"loadfile", file, i ? "append" : "replace"};
++            ok = command(pipe, args, 3);
++            talloc_free(file);
++        }
++        if (ok) {
++            const char *args[] = {"script-message-to", "ht_tools", "htt-activate-instance"};
++            ok = command(pipe, args, 3);
++            if (pid)
++                EnumWindows(activate_window, pid);
++        }
++        CloseHandle(pipe);
++    }
++    if (owner)
++        ReleaseMutex(mutex);
++    CloseHandle(mutex);
++    if (!ok)
++        MP_ERR(mpctx, "Existing mpv-ht instance did not accept the request.\n");
++    return ok ? 1 : -1;
++}
+diff --git a/osdep/w32_single_instance.h b/osdep/w32_single_instance.h
+new file mode 100644
+index 000000000..713787c7b
+--- /dev/null
++++ b/osdep/w32_single_instance.h
+@@ -0,0 +1,3 @@
++#pragma once
++struct MPContext;
++int mp_w32_single_instance(struct MPContext *mpctx);
+diff --git a/player/main.c b/player/main.c
+index 6891c9d5a..cefd4cf00 100644
+--- a/player/main.c
++++ b/player/main.c
+@@ -82,6 +82,7 @@ static const char def_config[] =
+ 
+ #if HAVE_WIN32_DESKTOP
+ #include "osdep/w32_register.h"
++#include "osdep/w32_single_instance.h"
+ #endif
+ 
+ #if HAVE_COCOA
+@@ -401,6 +402,9 @@ int mp_initialize(struct MPContext *mpctx, char **options)
+ #if HAVE_WIN32_DESKTOP
+     if (mp_w32_handle_register(mpctx))
+         return 1; // register/unregister
++    int instance = mp_w32_single_instance(mpctx);
++    if (instance)
++        return instance;
+ #endif
+ 
+     check_library_versions(mp_null_log, 0);
