@@ -1,0 +1,276 @@
+From e271b7b14ef7cfaa3a1f9e6aa9642af3681c7032 Mon Sep 17 00:00:00 2001
+From: mpv-ht diagnostic preparation <diagnostic@mpv-ht.invalid>
+Date: Sat, 12 Sep 2026 01:42:54 -0400
+Subject: [PATCH] diagnostic: compare compact Analyzer telemetry with transport
+ timings
+
+---
+ player/command.c                         | 19 ++++++++-
+ video/out/analyzer_async_bridge.h        | 51 +++++++++++++++++++-----
+ video/out/analyzer_chromaticity_bridge.h | 11 +++--
+ video/out/analyzer_frame_bridge.h        |  9 +++--
+ video/out/vo.h                           |  3 ++
+ video/out/vo_gpu_next.c                  |  2 +
+ 6 files changed, 74 insertions(+), 21 deletions(-)
+
+diff --git a/player/command.c b/player/command.c
+index ee57f722a..48b08cc99 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -2797,11 +2797,13 @@ static int mp_property_output_capture(void *ctx, struct m_property *prop,
+ static int mp_property_async_probe(void *ctx, struct m_property *prop, int action, void *arg)
+ {
+     MPContext *mpctx = ctx;
+-    struct voctrl_async_probe v = {0};
++    struct voctrl_async_probe v;
+     struct vo *vo = mpctx->video_out;
+     if (!vo) return M_PROPERTY_UNAVAILABLE;
+     mp_mutex_lock(&vo->async_probe_mutex);
+-    v = vo->async_probe_snapshot;
++    if (vo->async_probe_snapshot.compact_telemetry)
++        memcpy(&v, &vo->async_probe_snapshot, offsetof(struct voctrl_async_probe, values) + 1120 * sizeof(float));
++    else v = vo->async_probe_snapshot;
+     mp_mutex_unlock(&vo->async_probe_mutex);
+     vo_wakeup(vo); // Request a future zero-timeout poll; never wait for the VO thread.
+     if (!v.sequence) return M_PROPERTY_UNAVAILABLE;
+@@ -2822,6 +2824,16 @@ static int mp_property_async_probe(void *ctx, struct m_property *prop, int actio
+     if (v.mode == 2) for (int i = 4; i < 260; i++)
+         hist = talloc_asprintf_append(hist, "%s%.0f", i == 4 ? "" : ",", v.values[i]);
+     struct m_sub_property props[] = {
++        {"poll-ns", SUB_PROP_INT64(v.poll_ns)},
++        {"poll-count", SUB_PROP_INT64(v.poll_count)},
++        {"poll-busy", SUB_PROP_INT64(v.poll_busy)},
++        {"frame-results", SUB_PROP_INT64(v.frame_results)},
++        {"readback-ns", SUB_PROP_INT64(v.readback_ns)},
++        {"readback-count", SUB_PROP_INT64(v.readback_count)},
++        {"readback-max-ns", SUB_PROP_INT64(v.readback_max_ns)},
++        {"staging-bytes", SUB_PROP_INT(v.compact_telemetry >= 2 ? 4480 : 554368)},
++        {"compact-telemetry", SUB_PROP_INT(v.compact_telemetry)},
++        {"readback-bytes", SUB_PROP_INT(v.compact_telemetry ? 4480 : 554368)},
+         {"waveform-x", SUB_PROP_INT(v.wave_x)}, {"waveform-y", SUB_PROP_INT(v.wave_y)},
+         {"waveform-w", SUB_PROP_INT(v.wave_w)}, {"waveform-h", SUB_PROP_INT(v.wave_h)},
+         {"waveform-sequence", SUB_PROP_INT64(v.wave_sequence)},
+@@ -2863,6 +2875,9 @@ static int mp_property_analyzer_chromaticity(void *ctx, struct m_property *prop,
+     float colors[131072];
+     int64_t sequence;
+     mp_mutex_lock(&vo->async_probe_mutex);
++    if (vo->async_probe_snapshot.compact_telemetry) {
++        mp_mutex_unlock(&vo->async_probe_mutex); return M_PROPERTY_UNAVAILABLE;
++    }
+     sequence = vo->async_probe_snapshot.stats_ns;
+     memcpy(bins, vo->async_probe_snapshot.values+1120, sizeof(bins));
+     memcpy(colors, vo->async_probe_snapshot.values+7520, sizeof(colors));
+diff --git a/video/out/analyzer_async_bridge.h b/video/out/analyzer_async_bridge.h
+index ae9ed809c..52b319e4f 100644
+--- a/video/out/analyzer_async_bridge.h
++++ b/video/out/analyzer_async_bridge.h
+@@ -30,6 +30,8 @@ struct async_probe {
+     struct async_probe_slot slots[4];
+     struct voctrl_async_probe latest;
+     int64_t sequence, skipped;
++    int64_t readback_ns, readback_count, readback_max_ns;
++    int64_t poll_ns, poll_count, poll_busy, frame_results;
+     uint64_t last_stats_revision, last_stats_parameters;
+     const struct pl_hook *last_stats_hook;
+ };
+@@ -45,39 +47,58 @@ static void async_probe_collect(struct priv *p)
+     if (!a) return;
+     for (int i = 0; i < 4; i++) {
+         struct async_probe_slot *s = &a->slots[i];
+-        if (!s->pending || pl_buf_poll(p->gpu, s->buf, 0)) continue;
+-        float values[138592] = {0};
+-        size_t size = s->meta.mode == 3 ? sizeof(values) : s->meta.mode == 2 ? 260 * sizeof(float) : 4 * sizeof(float);
+-        if (pl_buf_read(p->gpu, s->buf, 0, values, size) &&
++        if (!s->pending) continue;
++        int64_t poll_start = mp_time_ns();
++        bool busy = pl_buf_poll(p->gpu, s->buf, 0);
++        a->poll_ns += mp_time_ns() - poll_start; a->poll_count++;
++        if (busy) { a->poll_busy++; continue; }
++        float values[138592];
++        bool compact = s->meta.compact_telemetry != 0;
++        size_t size = s->meta.mode == 3 ? (compact ? 1120 * sizeof(float) : sizeof(values)) : s->meta.mode == 2 ? 260 * sizeof(float) : 4 * sizeof(float);
++        memset(values, 0, compact ? 1120 * sizeof(float) : sizeof(values));
++        int64_t read_start = mp_time_ns();
++        bool read_ok = pl_buf_read(p->gpu, s->buf, 0, values, size);
++        int64_t read_ns = mp_time_ns() - read_start;
++        a->readback_ns += read_ns; a->readback_count++;
++        a->readback_max_ns = MPMAX(a->readback_max_ns, read_ns);
++        if (read_ok &&
+             s->meta.mode == p->next_opts->analyzer_async) {
+             // Frame and cursor snapshots have independent cadences. A newer
+             // cursor slot must not discard an older newly completed frame job.
+             if(s->meta.stats_ns > a->latest.stats_ns) {
++                a->frame_results++;
+                 memcpy(a->latest.values+16,values+16,(548-16)*sizeof(float));
+                 memcpy(a->latest.values+576,values+576,532*sizeof(float));
+-                memcpy(a->latest.values+1120,values+1120,137472*sizeof(float));
++                if (!compact) memcpy(a->latest.values+1120,values+1120,137472*sizeof(float));
+                 a->latest.stats_ns=s->meta.stats_ns;
+             }
+             if(s->meta.sequence <= a->latest.sequence) {s->pending=false;continue;}
+             if (s->meta.mode==3 && !s->meta.stats_ns) {
+                 memcpy(values+16,a->latest.values+16,(548-16)*sizeof(float));
+                 memcpy(values+576,a->latest.values+576,532*sizeof(float));
+-                memcpy(values+1120,a->latest.values+1120,137472*sizeof(float));
++                if (!compact) memcpy(values+1120,a->latest.values+1120,137472*sizeof(float));
+                 s->meta.stats_ns=a->latest.stats_ns;
+             }
+-            a->latest = s->meta;
+-            memcpy(a->latest.values, values, sizeof(values));
++            if (compact) memcpy(&a->latest, &s->meta, offsetof(struct voctrl_async_probe, values));
++            else a->latest = s->meta;
++            memcpy(a->latest.values, values, compact ? 1120 * sizeof(float) : sizeof(values));
+             a->latest.ready_ms = (mp_time_ns() - s->meta.submitted_ns) / 1e6;
+         }
+         s->pending = false;
+     }
++    a->latest.poll_ns = a->poll_ns; a->latest.poll_count = a->poll_count;
++    a->latest.poll_busy = a->poll_busy; a->latest.frame_results = a->frame_results;
++    a->latest.readback_ns = a->readback_ns; a->latest.readback_count = a->readback_count;
++    a->latest.readback_max_ns = a->readback_max_ns;
+     a->latest.skipped = a->skipped;
+     a->latest.wave_x=a->wave_x;a->latest.wave_y=a->wave_y;
+     a->latest.wave_w=a->wave_w;a->latest.wave_h=a->wave_h;
+     a->latest.wave_sequence=a->wave_sequence;
+     struct vo *vo = a->hook.priv;
+     mp_mutex_lock(&vo->async_probe_mutex);
+-    vo->async_probe_snapshot = p->next_opts->analyzer_async ? a->latest : (struct voctrl_async_probe){0};
++    if (p->next_opts->analyzer_async && a->latest.compact_telemetry)
++        memcpy(&vo->async_probe_snapshot, &a->latest, offsetof(struct voctrl_async_probe, values) + 1120 * sizeof(float));
++    else vo->async_probe_snapshot = p->next_opts->analyzer_async ? a->latest : (struct voctrl_async_probe){0};
+     mp_mutex_unlock(&vo->async_probe_mutex);
+ }
+ 
+@@ -102,8 +123,10 @@ static struct pl_hook_res async_probe_hook(void *priv, const struct pl_hook_para
+     struct async_probe_slot *s = NULL;
+     for (int i = 0; i < 4; i++) if (!a->slots[i].pending) { s = &a->slots[i]; break; }
+     if (!s) { a->skipped++; return (struct pl_hook_res){0}; }
++    size_t buffer_bytes = (p->next_opts->analyzer_async == 3 && p->next_opts->analyzer_compact_telemetry >= 2 ? 1120 : 138592) * sizeof(float);
++    if (s->buf && s->buf->params.size != buffer_bytes) pl_buf_destroy(p->gpu, &s->buf);
+     if (!s->buf) s->buf = pl_buf_create(p->gpu, pl_buf_params(
+-        .size = 138592 * sizeof(float), .memory_type = PL_BUF_MEM_DEVICE,
++        .size = buffer_bytes, .memory_type = PL_BUF_MEM_DEVICE,
+         .host_readable = true, .storable = true));
+     if (!s->buf) return (struct pl_hook_res){0};
+     float pos[] = {
+@@ -161,8 +184,14 @@ static struct pl_hook_res async_probe_hook(void *priv, const struct pl_hook_para
+     if (!ok) { pl_dispatch_abort(hp->dispatch, &sh); return (struct pl_hook_res){0}; }
+     if (source_hook && a->output_valid)
+         async_output_pixel(p, &a->output, s, x, y);
+-    s->meta = (struct voctrl_async_probe){.sequence = ++a->sequence,
++    int compact = p->next_opts->analyzer_async == 3 ? p->next_opts->analyzer_compact_telemetry : 0;
++    if (compact) {
++        memset(&s->meta, 0, offsetof(struct voctrl_async_probe, values));
++        s->meta.sequence = ++a->sequence; s->meta.submitted_ns = submitted;
++        s->meta.x = x; s->meta.y = y; s->meta.mode = p->next_opts->analyzer_async;
++    } else s->meta = (struct voctrl_async_probe){.sequence = ++a->sequence,
+         .submitted_ns = submitted, .x = x, .y = y, .mode = p->next_opts->analyzer_async};
++    s->meta.compact_telemetry = compact;
+     if (source_hook) {
+         uint64_t revision=pl_mpv_user_shader_saved_revision(source_hook,"ANALYZER_LINEAR");
+         uint64_t parameters=1469598103934665603ULL;
+diff --git a/video/out/analyzer_chromaticity_bridge.h b/video/out/analyzer_chromaticity_bridge.h
+index c74b2dd5a..b56e6674e 100644
+--- a/video/out/analyzer_chromaticity_bridge.h
++++ b/video/out/analyzer_chromaticity_bridge.h
+@@ -39,15 +39,18 @@ static bool analyzer_xy_update(struct priv *p, const struct pl_hook_params *hp,
+     if(!ok)return false;
+     struct pl_buffer_var result={.var={.name="xy_colors",.type=PL_VAR_FLOAT,.dim_v=4,.dim_m=1,.dim_a=23104},.layout={.offset=7520*4,.stride=16,.size=23104*16}};
+     desc[2]=(struct pl_shader_desc){.desc={.name="XYColors",.type=PL_DESC_BUF_STORAGE,.access=PL_DESC_ACCESS_WRITEONLY},.binding.object=slot->buf,.buffer_vars=&result,.num_buffer_vars=1};
++    bool telemetry = p->next_opts->analyzer_compact_telemetry < 2;
++    char *color_header=talloc_asprintf(NULL, "%s\n#define TELEMETRY %d\n", frame_math, telemetry);
+     pl_shader sh=pl_dispatch_begin(hp->dispatch);
+-    ok=pl_shader_custom(sh,&(struct pl_custom_shader){.description="Analyzer opaque xy color texture",.header=frame_math,
+-        .body="ivec2 q=ivec2(gl_FragCoord.xy);int b=(151-q.y)*152+q.x;uint id=keys[23104+b];color=vec4(vec3(background),1.0);xy_colors[b]=vec4(0);"
++    ok=pl_shader_custom(sh,&(struct pl_custom_shader){.description="Analyzer opaque xy color texture",.header=color_header,
++        .body="ivec2 q=ivec2(gl_FragCoord.xy);int b=(151-q.y)*152+q.x;uint id=keys[23104+b];color=vec4(vec3(background),1.0);\n#if TELEMETRY\nxy_colors[b]=vec4(0);\n#endif\n"
+               "if(id!=0xffffffffu){int w=textureSize(xy_source,0).x;vec3 c=to2020*texelFetch(xy_source,ivec2(int(id)%w,int(id)/w),0).rgb*nits;"
+-              "xy_colors[b]=vec4(c,uintBitsToFloat(keys[b])*nits);"
++              "\n#if TELEMETRY\nxy_colors[b]=vec4(c,uintBitsToFloat(keys[b])*nits);\n#endif\n"
+               "c*=min(1.,cap/max(max(c.r,c.g),max(c.b,1e-12)));"
+               "color=vec4(c/203.,1.);}",
+-        .input=PL_SHADER_SIG_NONE,.output=PL_SHADER_SIG_COLOR,.variables=vars,.num_variables=4,.descriptors=desc,.num_descriptors=3}) &&
++        .input=PL_SHADER_SIG_NONE,.output=PL_SHADER_SIG_COLOR,.variables=vars,.num_variables=4,.descriptors=desc,.num_descriptors=telemetry ? 3 : 2}) &&
+         pl_dispatch_finish(hp->dispatch,pl_dispatch_params(.shader=&sh,.target=a->xy_tex));
++    talloc_free(color_header);
+     if(!ok){pl_dispatch_abort(hp->dispatch,&sh);return false;}
+     // libplacebo filters overlay textures. Expand with nearest-cell sampling
+     // first, then display 1:1 so occupied cells retain alpha=1 at every pixel.
+diff --git a/video/out/analyzer_frame_bridge.h b/video/out/analyzer_frame_bridge.h
+index 421791704..4c1ae8b5f 100644
+--- a/video/out/analyzer_frame_bridge.h
++++ b/video/out/analyzer_frame_bridge.h
+@@ -18,7 +18,8 @@ static bool async_frame_dispatch(struct priv *p, const struct pl_hook_params *hp
+     int w=source->params.w, h=source->params.h;
+     // 80x80 source xy density, in addition to the two 256-bin histograms.
+     // Shared storage stays below D3D11's 32 KiB limit (29,952 bytes).
+-    int bins=output ? 512 : 6912;
++    bool density = !output && p->next_opts->analyzer_compact_telemetry < 2;
++    int bins=density ? 6912 : 512;
+     size_t bins_size=(size_t)bins*4;
+     size_t scratch_size=bins_size+(size_t)h*48;
+     pl_buf *scratch=output ? &slot->output_scratch : &slot->scratch;
+@@ -54,7 +55,7 @@ static bool async_frame_dispatch(struct priv *p, const struct pl_hook_params *hp
+         {.desc={.name="frame_tex",.type=PL_DESC_SAMPLED_TEX},.binding={.object=source,.address_mode=PL_TEX_ADDRESS_CLAMP,.sample_mode=PL_TEX_SAMPLE_NEAREST}},
+         {.desc={.name="FrameScratch",.type=PL_DESC_BUF_STORAGE,.access=PL_DESC_ACCESS_READWRITE},.binding.object=*scratch,.buffer_vars=scratch_vars,.num_buffer_vars=2},
+     };
+-    char *header=talloc_asprintf(NULL,"%s\n#define BINS %d\n#define SOURCE_DENSITY %d\nshared vec3 mn[64], mx[64], sm[64];\nshared uint hist[BINS];\n",frame_math,bins,!output);
++    char *header=talloc_asprintf(NULL,"%s\n#define BINS %d\n#define SOURCE_DENSITY %d\nshared vec3 mn[64], mx[64], sm[64];\nshared uint hist[BINS];\n",frame_math,bins,density);
+     const char *body=
+         "int lane=int(gl_LocalInvocationID.x), y=int(gl_WorkGroupID.y); ivec2 sz=textureSize(frame_tex,0);"
+         "for(int i=lane;i<BINS;i+=64) hist[i]=0u; barrier();"
+@@ -82,7 +83,7 @@ static bool async_frame_dispatch(struct priv *p, const struct pl_hook_params *hp
+         .compute=true,.compute_group_size={64,1}}) && pl_dispatch_compute(hp->dispatch,pl_dispatch_compute_params(.shader=&sh,.dispatch_size={1,h,1}));
+     talloc_free(header);
+     if(!ok){pl_dispatch_abort(hp->dispatch,&sh);return false;}
+-    int result_count=output ? 140 : 1880;
++    int result_count=density ? 1880 : 140;
+     struct pl_buffer_var result_var={.var={.name="samples",.type=PL_VAR_FLOAT,.dim_v=4,.dim_m=1,.dim_a=result_count},.layout={.offset=(size_t)offset*4,.stride=16,.size=(size_t)result_count*16}};
+     desc[0]=(struct pl_shader_desc){.desc={.name="FrameResults",.type=PL_DESC_BUF_STORAGE,.access=PL_DESC_ACCESS_WRITEONLY},.binding.object=slot->buf,.buffer_vars=&result_var,.num_buffer_vars=1};
+     char *finish=talloc_asprintf(NULL,
+@@ -91,7 +92,7 @@ static bool async_frame_dispatch(struct priv *p, const struct pl_hook_params *hp
+         "for(int step=32;step>0;step/=2){if(lane<step){mn[lane]=min(mn[lane],mn[lane+step]);mx[lane]=max(mx[lane],mx[lane+step]);sm[lane]+=sm[lane+step];}barrier();}"
+         "if(lane==0){samples[4]=vec4(mn[0],0);samples[5]=vec4(clamp(sm[0]/%.1f,mn[0],mx[0]),0);samples[6]=vec4(mx[0],0);samples[136]=vec4(%d,%d,1,0);}"
+         "for(int i=lane;i<128;i+=64)samples[8+i]=vec4(bins[4*i],bins[4*i+1],bins[4*i+2],bins[4*i+3]);",h,(double)w*h,w,h);
+-    if (!output) finish=talloc_asprintf_append(finish,
++    if (density) finish=talloc_asprintf_append(finish,
+         "for(int i=lane;i<1600;i+=64)samples[280+i]=vec4(bins[512+4*i],bins[513+4*i],bins[514+4*i],bins[515+4*i]);");
+     sh=pl_dispatch_begin(hp->dispatch);
+     ok=pl_shader_custom(sh,&(struct pl_custom_shader){.description="Analyzer compact frame result",.body=finish,
+diff --git a/video/out/vo.h b/video/out/vo.h
+index 9befceb94..ee52907ee 100644
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -172,6 +172,9 @@ struct voctrl_async_probe {
+     int x, y, mode;
+     double ready_ms;
+     int64_t stats_ns;
++    int64_t readback_ns, readback_count, readback_max_ns;
++    int64_t poll_ns, poll_count, poll_busy, frame_results;
++    int compact_telemetry; // local comparison mode
+     float values[138592]; // Telemetry, 80x80 xy counts, then 160x160 winning RGB nits/P.
+ };
+ 
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 4bb42acdb..537c8f9d9 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -255,6 +255,7 @@ static void update_lut(struct priv *p, struct user_lut *lut);
+ 
+ struct gl_next_opts {
+     int analyzer_async;
++    int analyzer_compact_telemetry; // local comparison only: 0/1/2
+     int analyzer_waveform, analyzer_waveform_y, analyzer_waveform_height;
+     int analyzer_waveform_layers, analyzer_waveform_tint;
+     float analyzer_sdr_output_peak, analyzer_sdr_output_gamma;
+@@ -310,6 +311,7 @@ const struct m_sub_options gl_next_conf = {
+         {"hdr-authored-scene-reset", OPT_BOOL(authored_scene_reset)},
+         {"active-image-detection", OPT_BOOL(active_image_detection)},
+         {"analyzer-async", OPT_INT(analyzer_async), M_RANGE(0, 3)},
++        {"analyzer-compact-telemetry", OPT_INT(analyzer_compact_telemetry), M_RANGE(0, 2)},
+         {"analyzer-waveform", OPT_INT(analyzer_waveform), M_RANGE(0, 4)},
+         {"analyzer-sdr-output-peak", OPT_FLOAT(analyzer_sdr_output_peak), M_RANGE(1, 10000)},
+         {"analyzer-sdr-output-gamma", OPT_FLOAT(analyzer_sdr_output_gamma), M_RANGE(1, 4)},
+-- 
+2.54.0.windows.1
+
