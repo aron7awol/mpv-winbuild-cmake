@@ -273,4 +273,3 @@ index 4bb42acdb..537c8f9d9 100644
          {"analyzer-sdr-output-gamma", OPT_FLOAT(analyzer_sdr_output_gamma), M_RANGE(1, 4)},
 -- 
 2.54.0.windows.1
-
