@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mpv-ht <mpv-ht@local>
+Date: Sat, 12 Sep 2026 12:00:00 -0400
+Subject: [PATCH] vo_gpu_next: expose experimental IPT-path gamut mapper
+
+Experimental opt-in only; existing gamut-mapping defaults are unchanged.
+The direct GPU path avoids hard-boundary interpolation errors in a 3D LUT.
+See analysis/ipt-path-gamut in the mpv-ht packaging repository for tests.
+
+---
+diff --git a/video/out/gpu/video.c b/video/out/gpu/video.c
+index 8b14c69a8..31fc93322 100644
+--- a/video/out/gpu/video.c
++++ b/video/out/gpu/video.c
+@@ -498,7 +498,8 @@ const struct m_sub_options gl_video_conf = {
+             {"desaturate",  GAMUT_DESATURATE},
+             {"darken",      GAMUT_DARKEN},
+             {"warn",        GAMUT_WARN},
+-            {"linear",      GAMUT_LINEAR})},
++            {"linear",      GAMUT_LINEAR},
++            {"ipt-path",    GAMUT_IPT_PATH})},
+         {"hdr-compute-peak", OPT_CHOICE(tone_map.compute_peak,
+             {"auto", 0},
+             {"yes", 1},
+diff --git a/video/out/gpu/video.h b/video/out/gpu/video.h
+index 4161375b8..dc508c1d3 100644
+--- a/video/out/gpu/video.h
++++ b/video/out/gpu/video.h
+@@ -123,6 +123,7 @@ enum gamut_mode {
+     GAMUT_DARKEN,
+     GAMUT_WARN,
+     GAMUT_LINEAR,
++    GAMUT_IPT_PATH,
+ };
+ 
+ struct gl_tone_map_opts {
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 4bb42acdb..622eabbee 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -2921,7 +2921,12 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+         const struct pl_raw_primaries target_signal =
+             *pl_raw_primaries_get(target_color.primaries);
+         if (pl_raw_primaries_equal(&source_signal, &target_signal)) {
+-            target.color.hdr.prim = source_color.hdr.prim;
++            // The experimental path deliberately runs even for equal gamuts
++            // to handle RGB peak overflow. Do not turn source mastering
++            // metadata into a new output constraint in that case. An explicit
++            // --target-gamut still takes the normal target path above.
++            target.color.hdr.prim = opts->tone_map.gamut_mode == GAMUT_IPT_PATH
++                ? target_signal : source_color.hdr.prim;
+             preserve_source_gamut = true;
+         }
+     }
+@@ -4745,6 +4750,7 @@ static void update_render_options(struct vo *vo)
+         [GAMUT_DARKEN]          = &pl_gamut_map_darken,
+         [GAMUT_WARN]            = &pl_gamut_map_highlight,
+         [GAMUT_LINEAR]          = &pl_gamut_map_linear,
++        [GAMUT_IPT_PATH]        = &pl_gamut_map_ipt_path,
+     };
+ 
+     pars->color_map_params.tone_mapping_function = tone_map_funs[opts->tone_map.curve];
