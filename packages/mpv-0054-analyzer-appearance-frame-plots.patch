@@ -1,0 +1,178 @@
+From: mpv-ht development <dev@mpv-ht.local>
+Date: Sun, 13 Sep 2026 08:00:00 -0400
+Subject: [PATCH] analyzer: separate background opacity and keep frame plots live
+
+Keep occupied XY and waveform cells opaque while allowing transparent empty
+backgrounds. Invalidate cached plots when opacity changes, including while
+paused. Chromaticity reduction follows the visible chart independently of
+cursor sampling, so mouse exit can stop pixel readouts without hiding the
+whole-frame gamut cloud.
+
+diff --git a/video/out/analyzer_async_bridge.h b/video/out/analyzer_async_bridge.h
+index 555e4a40d..7404e447a 100644
+--- a/video/out/analyzer_async_bridge.h
++++ b/video/out/analyzer_async_bridge.h
+@@ -13,7 +13,7 @@ struct async_probe {
+     pl_tex xy_display;
+     struct pl_overlay_part xy_part;
+     struct pl_overlay *xy_overlays;
+-    float xy_cap, xy_background;
++    float xy_cap, xy_background, xy_opacity, wave_opacity;
+     pl_buf wave_buf;
+     pl_tex wave_tex;
+     struct pl_overlay_part wave_part;
+@@ -254,7 +254,7 @@ static struct pl_hook_res async_probe_hook(void *priv, const struct pl_hook_para
+             (!(stages & 2) || async_output_frame(p,&a->output,s,source_hook))) {
+             s->meta.stats_ns=submitted;
+             // Optional presentation work must never gate frame statistics.
+-            if (p->next_opts->analyzer_cursor && p->next_opts->analyzer_xy_size > 0)
++            if (p->next_opts->analyzer_xy_size > 0)
+                 analyzer_xy_update(p,hp,s,source_hook);
+             analyzer_waveform_update(p,hp,s,source_hook);
+             a->last_stats_revision=revision;
+diff --git a/video/out/analyzer_chromaticity_bridge.h b/video/out/analyzer_chromaticity_bridge.h
+index 45fc7b6d8..5dec18b47 100644
+--- a/video/out/analyzer_chromaticity_bridge.h
++++ b/video/out/analyzer_chromaticity_bridge.h
+@@ -31,6 +31,7 @@ static bool analyzer_xy_update(struct priv *p, const struct pl_hook_params *hp,
+         {.var=pl_var_float("nits"),.data=&scale,.dynamic=true},
+         {.var=pl_var_float("cap"),.data=&a->xy_cap,.dynamic=true},
+         {.var=pl_var_float("background"),.data=&a->xy_background,.dynamic=true},
++        {.var=pl_var_float("opacity"),.data=&a->xy_opacity,.dynamic=true},
+     };
+     struct pl_buffer_var bv={.var={.name="keys",.type=PL_VAR_UINT,.dim_v=1,.dim_m=1,.dim_a=46208},.layout={.offset=0,.stride=4,.size=46208*sizeof(uint32_t)}};
+     struct pl_shader_desc desc[]={
+@@ -50,13 +51,13 @@ static bool analyzer_xy_update(struct priv *p, const struct pl_hook_params *hp,
+     bool telemetry = p->next_opts->analyzer_compact_telemetry < 2;
+     char *color_header=talloc_asprintf(NULL, "%s\n#define TELEMETRY %d\n", frame_math, telemetry);
+     pl_shader sh=pl_dispatch_begin(hp->dispatch);
+-    ok=pl_shader_custom(sh,&(struct pl_custom_shader){.description="Analyzer opaque xy color texture",.header=color_header,
+-        .body="ivec2 q=ivec2(gl_FragCoord.xy);int b=(151-q.y)*152+q.x;uint id=keys[23104+b];color=vec4(vec3(background),1.0);\n#if TELEMETRY\nxy_colors[b]=vec4(0);\n#endif\n"
++    ok=pl_shader_custom(sh,&(struct pl_custom_shader){.description="Analyzer xy color texture",.header=color_header,
++        .body="ivec2 q=ivec2(gl_FragCoord.xy);int b=(151-q.y)*152+q.x;uint id=keys[23104+b];color=vec4(vec3(background),opacity);\n#if TELEMETRY\nxy_colors[b]=vec4(0);\n#endif\n"
+               "if(id!=0xffffffffu){int w=textureSize(xy_source,0).x;vec3 c=to2020*texelFetch(xy_source,ivec2(int(id)%w,int(id)/w),0).rgb*nits;"
+               "\n#if TELEMETRY\nxy_colors[b]=vec4(c,uintBitsToFloat(keys[b])*nits);\n#endif\n"
+               "c*=min(1.,cap/max(max(c.r,c.g),max(c.b,1e-12)));"
+               "color=vec4(c/203.,1.);}",
+-        .input=PL_SHADER_SIG_NONE,.output=PL_SHADER_SIG_COLOR,.variables=vars,.num_variables=4,.descriptors=desc,.num_descriptors=telemetry ? 3 : 2}) &&
++        .input=PL_SHADER_SIG_NONE,.output=PL_SHADER_SIG_COLOR,.variables=vars,.num_variables=5,.descriptors=desc,.num_descriptors=telemetry ? 3 : 2}) &&
+         pl_dispatch_finish(hp->dispatch,pl_dispatch_params(.shader=&sh,.target=a->xy_tex));
+     talloc_free(color_header);
+     if(!ok){pl_dispatch_abort(hp->dispatch,&sh);return false;}
+@@ -78,17 +79,18 @@ static bool analyzer_xy_update(struct priv *p, const struct pl_hook_params *hp,
+ static void analyzer_xy_prepare(struct priv *p, struct pl_frame *target, struct pl_color_space osd)
+ {
+     struct async_probe *a=p->async_probe;
+-    if(!a || p->next_opts->analyzer_async!=3 || !p->next_opts->analyzer_cursor ||
++    if(!a || p->next_opts->analyzer_async!=3 ||
+         p->next_opts->analyzer_xy_size<=0)return;
+     pl_color_space_infer(&osd);
+     float code=p->next_opts->analyzer_xy_intensity/255.f;
+     float light=code<=.04045f ? code/12.92f : powf((code+.055f)/1.055f,2.4f);
+     float cap=fmaxf(.0001f,osd.hdr.max_luma*light);
+-    // Match the opaque ASS card backing: #080808, alpha 1. Plotted cells
+-    // replace that backing with fully opaque source color.
++    // Match the ASS card backing. Only empty cells use its opacity;
++    // occupied cells retain fully opaque, color-managed source RGB.
+     float background=(8.f/255.f/12.92f)*osd.hdr.max_luma/203.f;
+-    if(cap!=a->xy_cap || background!=a->xy_background){
+-        a->xy_cap=cap;a->xy_background=background;a->last_stats_revision=0;
++    float opacity=p->next_opts->analyzer_background_opacity;
++    if(cap!=a->xy_cap || background!=a->xy_background || opacity!=a->xy_opacity){
++        a->xy_cap=cap;a->xy_background=background;a->xy_opacity=opacity;a->last_stats_revision=0;
+     }
+     pl_fmt fmt=pl_find_fmt(p->gpu,PL_FMT_FLOAT,4,32,0,PL_FMT_CAP_SAMPLEABLE|PL_FMT_CAP_RENDERABLE);
+     bool fresh=!a->xy_tex;
+@@ -97,7 +99,7 @@ static void analyzer_xy_prepare(struct priv *p, struct pl_frame *target, struct
+     // invalidate the contents even when the existing allocation already fits.
+     if(fresh){
+         if(!pl_tex_recreate(p->gpu,&a->xy_tex,pl_tex_params(.w=152,.h=152,.format=fmt,.sampleable=true,.renderable=true,.blit_dst=true)))return;
+-        pl_tex_clear(p->gpu,a->xy_tex,(float[4]){background,background,background,1});
++        pl_tex_clear(p->gpu,a->xy_tex,(float[4]){background,background,background,opacity});
+         a->last_stats_revision=0;
+     }
+     int size=p->next_opts->analyzer_xy_size;
+@@ -105,7 +107,7 @@ static void analyzer_xy_prepare(struct priv *p, struct pl_frame *target, struct
+     bool resized=!a->xy_display || a->xy_display->params.w!=raster;
+     if(resized){
+         if(!pl_tex_recreate(p->gpu,&a->xy_display,pl_tex_params(.w=raster,.h=raster,.format=fmt,.sampleable=true,.renderable=true,.blit_dst=true)))return;
+-        pl_tex_clear(p->gpu,a->xy_display,(float[4]){background,background,background,1});
++        pl_tex_clear(p->gpu,a->xy_display,(float[4]){background,background,background,opacity});
+         a->last_stats_revision=0;
+     }
+     if(size<=0)return;
+diff --git a/video/out/analyzer_waveform_bridge.h b/video/out/analyzer_waveform_bridge.h
+index 24e59dbaf..4f96ffd68 100644
+--- a/video/out/analyzer_waveform_bridge.h
++++ b/video/out/analyzer_waveform_bridge.h
+@@ -84,7 +84,10 @@ static void analyzer_waveform_update(struct priv *p,const struct pl_hook_params
+     int width=a->wave_w, tint=p->next_opts->analyzer_waveform_tint;
+     int channels=p->next_opts->analyzer_waveform==4 ? 3 : 1, stride=256*channels;
+     float rgb[3]={((tint>>16)&255)/255.f,((tint>>8)&255)/255.f,(tint&255)/255.f};
+-    struct pl_shader_var var={.var=pl_var_vec3("tint"),.data=rgb,.dynamic=true};
++    struct pl_shader_var vars[]={
++        {.var=pl_var_vec3("tint"),.data=rgb,.dynamic=true},
++        {.var=pl_var_float("opacity"),.data=&a->wave_opacity,.dynamic=true},
++    };
+     struct pl_buffer_var bv={.var={.name="counts",.type=PL_VAR_UINT,.dim_v=1,.dim_m=1,.dim_a=width*stride*2},.layout={.offset=0,.stride=4,.size=(size_t)width*stride*2*4}};
+     struct pl_shader_desc desc={.desc={.name="WaveCounts",.type=PL_DESC_BUF_STORAGE,.access=PL_DESC_ACCESS_READONLY},.binding.object=a->wave_buf,.buffer_vars=&bv,.num_buffer_vars=1};
+     char *body=talloc_asprintf(NULL,
+@@ -93,10 +96,10 @@ static void analyzer_waveform_update(struct priv *p,const struct pl_hook_params
+         "float s=%d==2?0.0:float(counts[idx]);float o=%d==1?0.0:float(counts[%d+idx]);"
+         "s=s>0.0?clamp(.20+.13*log(1.0+s),0.0,1.0):0.0;o=o>0.0?clamp(.20+.13*log(1.0+o),0.0,1.0):0.0;"
+         "if(%d==3)c[ch]=max(s,o);else c=max(vec3(.18,.78,1)*s,vec3(1,.72,.32)*o);}"
+-        "color=vec4(c*tint,1.0);",channels,stride,p->next_opts->analyzer_waveform_layers,p->next_opts->analyzer_waveform_layers,width*stride,channels);
++        "color=vec4(c*tint,any(greaterThan(c,vec3(0)))?1.0:opacity);",channels,stride,p->next_opts->analyzer_waveform_layers,p->next_opts->analyzer_waveform_layers,width*stride,channels);
+     pl_shader sh=pl_dispatch_begin(hp->dispatch);
+     bool ok=pl_shader_custom(sh,&(struct pl_custom_shader){.description="Analyzer waveform density texture",.body=body,
+-        .input=PL_SHADER_SIG_NONE,.output=PL_SHADER_SIG_COLOR,.variables=&var,.num_variables=1,.descriptors=&desc,.num_descriptors=1}) &&
++        .input=PL_SHADER_SIG_NONE,.output=PL_SHADER_SIG_COLOR,.variables=vars,.num_variables=2,.descriptors=&desc,.num_descriptors=1}) &&
+         pl_dispatch_finish(hp->dispatch,pl_dispatch_params(.shader=&sh,.target=a->wave_tex));
+     talloc_free(body);if(!ok)pl_dispatch_abort(hp->dispatch,&sh);
+     if(ok)a->wave_sequence++;
+@@ -108,6 +111,8 @@ static void analyzer_waveform_prepare(struct priv *p, struct pl_frame *target,
+     struct async_probe *a=p->async_probe;
+     if(!a || p->next_opts->analyzer_async!=3 || !p->next_opts->analyzer_waveform ||
+        p->next_opts->analyzer_waveform_height<=0) return;
++    float opacity=p->next_opts->analyzer_background_opacity;
++    if(opacity!=a->wave_opacity){a->wave_opacity=opacity;a->last_stats_revision=0;}
+     int frame_w=target->planes[0].texture->params.w, frame_h=target->planes[0].texture->params.h;
+     int x=MPCLAMP((int)ceilf(target->crop.x0),0,frame_w),right=MPCLAMP((int)floorf(target->crop.x1),0,frame_w);
+     int y=MPCLAMP(p->next_opts->analyzer_waveform_y,0,frame_h);
+@@ -126,7 +131,7 @@ static void analyzer_waveform_prepare(struct priv *p, struct pl_frame *target,
+     // cached analysis, so retain its pixels until a real allocation change.
+     if(recreate){
+         if(!pl_tex_recreate(p->gpu,&a->wave_tex,pl_tex_params(.w=width,.h=256,.format=fmt,.sampleable=true,.renderable=true,.blit_dst=true)))return;
+-        pl_tex_clear(p->gpu,a->wave_tex,(float[4]){0,0,0,1});
++        pl_tex_clear(p->gpu,a->wave_tex,(float[4]){0,0,0,opacity});
+         a->last_stats_revision=0;
+     }
+     a->wave_part=(struct pl_overlay_part){.src={0,0,width,256},.dst={x,y,right,y+height}};
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 5fab09e69..4ce1ea2da 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -257,6 +257,7 @@ struct gl_next_opts {
+     int analyzer_async;
+     int analyzer_stages;
+     bool analyzer_cursor;
++    float analyzer_background_opacity;
+     int analyzer_compact_telemetry; // 0: legacy, 1: compact reads, 2: compact GPU results
+     bool analyzer_readback_nonblocking;
+     int analyzer_waveform, analyzer_waveform_y, analyzer_waveform_height;
+@@ -317,6 +318,7 @@ const struct m_sub_options gl_next_conf = {
+         {"analyzer-async", OPT_INT(analyzer_async), M_RANGE(0, 3)},
+         {"analyzer-stages", OPT_INT(analyzer_stages), M_RANGE(1, 3)},
+         {"analyzer-cursor", OPT_BOOL(analyzer_cursor)},
++        {"analyzer-background-opacity", OPT_FLOAT(analyzer_background_opacity), M_RANGE(0, 1)},
+         {"analyzer-readback-nonblocking", OPT_BOOL(analyzer_readback_nonblocking)},
+         {"analyzer-compact-telemetry", OPT_INT(analyzer_compact_telemetry), M_RANGE(0, 2)},
+         {"analyzer-waveform", OPT_INT(analyzer_waveform), M_RANGE(0, 4)},
+@@ -365,6 +367,7 @@ const struct m_sub_options gl_next_conf = {
+         .analyzer_waveform_layers = 3,
+         .analyzer_stages = 3,
+         .analyzer_cursor = true,
++        .analyzer_background_opacity = 1,
+         .analyzer_compact_telemetry = 2,
+         .analyzer_readback_nonblocking = true,
+         .analyzer_sdr_output_peak = 100,

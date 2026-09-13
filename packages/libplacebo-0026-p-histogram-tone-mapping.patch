@@ -1,0 +1,631 @@
+From: mpv-ht <mpv-ht@localhost>
+Date: Sun, 13 Sep 2026 00:00:00 -0400
+Subject: [PATCH] Add opt-in histogram-shaped P tone mapping and bounded brightening
+
+Use the measured P RGB-ray histogram to redistribute the existing tone curve.
+Strength and above-source retention default to zero; no SEP path is added.
+
+---
+diff --git a/src/include/libplacebo/shaders/colorspace.h b/src/include/libplacebo/shaders/colorspace.h
+index ac59d8a..ad6c98e 100644
+--- a/src/include/libplacebo/shaders/colorspace.h
++++ b/src/include/libplacebo/shaders/colorspace.h
+@@ -190,6 +190,9 @@ struct pl_peak_detect_params {
+     // Set internally by the renderer only for generic pixel DTM.
+     enum pl_tone_map_metric metric;
+ 
++    // Renderer-owned full-range P histogram, only for enabled HSTM.
++    bool hstm_histogram;
++
+     // One-shot tag for the measurement submitted with these parameters. When
+     // its GPU result is consumed, temporal peak/average smoothing is reseeded
+     // from that frame. Deliberately excluded from parameter equality.
+@@ -353,6 +356,11 @@ struct pl_color_map_params {
+     // mapping function capable of bidirectional mapping.
+     bool gamut_expansion;
+ 
++    // Private P RGB-ray histogram shaping and above-source retention (0..1).
++    // Defaults off. At full retention above-source gain is bounded to 2x.
++    float hstm_strength;
++    float hstm_overbrightening;
++
+     // --- Tone mapping options
+ 
+     // Tone mapping function to use to handle out-of-range colors.
+diff --git a/src/renderer.c b/src/renderer.c
+index f6f749b..abbcf37 100644
+--- a/src/renderer.c
++++ b/src/renderer.c
+@@ -1389,6 +1389,10 @@ static void hdr_update_peak(struct pass_state *pass)
+     if (!rr->gpu->limits.max_ssbo_size)
+         goto cleanup;
+ 
++    const struct pl_color_map_params *hstm_cp = params->color_map_params;
++    const bool hstm = hstm_cp && hstm_cp->hstm_strength > 0 &&
++        hstm_cp->tone_mapping_metric == PL_TONE_MAP_METRIC_BT2020_RGB;
++
+     float max_peak = pl_color_transfer_nominal_peak(pass->image.color.transfer) *
+                      PL_COLOR_SDR_WHITE;
+     if (pass->image.color.transfer == PL_COLOR_TRC_HLG)
+@@ -1398,10 +1402,10 @@ static void hdr_update_peak(struct pass_state *pass)
+         pl_color_space_is_hdr(&pass->target.color) &&
+         max_peak <= pass->target.color.hdr.max_luma + 1e-6;
+     if (max_peak <= pass->target.color.hdr.max_luma + 1e-6 &&
+-        !hlg_measure_only)
++        !hlg_measure_only && !hstm)
+         goto cleanup; // no adaptation needed
+ 
+-    if (pass->img.color.hdr.avg_pq_y && !params->peak_detect_params->force)
++    if (pass->img.color.hdr.avg_pq_y && !params->peak_detect_params->force && !hstm)
+         goto cleanup; // DV metadata already present
+ 
+     enum pl_hdr_metadata_type metadata = PL_HDR_METADATA_ANY;
+@@ -1430,6 +1434,7 @@ static void hdr_update_peak(struct pass_state *pass)
+     struct pl_peak_detect_params peak_params = *params->peak_detect_params;
+     peak_params.metric = cpars ? cpars->tone_mapping_metric
+                                : PL_TONE_MAP_METRIC_STANDARD;
++    peak_params.hstm_histogram = hstm && !hlg_measure_only;
+     peak_params.scene_reset = pass->image.scene_cut;
+     peak_params.scene_reset_tag = pass->image.scene_cut_tag;
+     peak_params.scene_reset_source = pass->image.scene_cut_source;
+diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
+index b9575ee..61ead47 100644
+--- a/src/shaders/colorspace.c
++++ b/src/shaders/colorspace.c
+@@ -25,6 +25,7 @@
+ #include <libplacebo/shaders/colorspace.h>
+ #include <libplacebo/renderer.h>
+ #include "shaders/ipt_path.h"
++#include "shaders/hstm.h"
+ 
+ void pl_shader_set_alpha(pl_shader sh, struct pl_color_repr *repr,
+                          enum pl_alpha_mode mode)
+@@ -1087,7 +1088,8 @@ static bool peak_detect_params_eq(const struct pl_peak_detect_params *a,
+            a->scene_threshold_low  == b->scene_threshold_low  &&
+            a->scene_threshold_high == b->scene_threshold_high &&
+            a->percentile           == b->percentile &&
+-           a->metric               == b->metric;
++           a->metric               == b->metric &&
++           a->hstm_histogram       == b->hstm_histogram;
+     // Don't compare `allow_delayed` because it doesn't change measurement,
+     // or `scene_reset` / `scene_reset_tag` because they are one-shot tags for
+     // the pending buffer.
+@@ -1153,6 +1155,8 @@ struct peak_buf_data {
+     unsigned causal_hist[CAUSAL_HIST_BINS];
+     unsigned causal_tiles[CAUSAL_TILES];
+     unsigned causal_grid[CAUSAL_GRID];
++    // Optional tail. Disabled HSTM retains the original SSBO/readback size.
++    unsigned hstm_hist[SLICES][HSTM_BINS];
+ };
+ 
+ static const struct pl_buffer_var peak_buf_vars[] = {
+@@ -1186,9 +1190,16 @@ static const struct pl_buffer_var peak_buf_vars[] = {
+     VAR(causal_hist),
+     VAR(causal_tiles),
+     VAR(causal_grid),
++    VAR(hstm_hist),
+ #undef VAR
+ };
+ 
++static size_t peak_buffer_size(bool hstm)
++{
++    return hstm ? sizeof(struct peak_buf_data)
++                : offsetof(struct peak_buf_data, hstm_hist);
++}
++
+ // Private causal transaction context. It is deliberately not part of the
+ // public peak-detection parameters/state: causal observation must never alter
+ // peak parameter comparison, smoothing, or ownership.
+@@ -1226,6 +1237,7 @@ struct sh_color_map_obj {
+     struct {
+         struct pl_tone_map_params params;
+         pl_shader_obj lut;
++        uint64_t hstm_signature;
+     } tone;
+ 
+     // Gamut map state
+@@ -1238,6 +1250,8 @@ struct sh_color_map_obj {
+         struct pl_peak_detect_params params;    // currently active parameters
+         pl_buf buf;                             // pending peak detection buffer
+         pl_buf readback;                        // readback buffer (fallback)
++        float hstm_hist[HSTM_BINS];
++        bool hstm_valid;
+         float avg_pq;                           // current (smoothed) values
+         float max_pq;
+         float raw_avg_pq;                       // newest completed frame
+@@ -1830,11 +1844,22 @@ static void analysis_consume(pl_gpu gpu, struct sh_color_map_obj *obj, bool forc
+ 
+     bool ok;
+     struct peak_buf_data data = {0};
++    const size_t bytes = obj->peak.buf->params.size;
++    if (obj->peak.readback && obj->peak.readback->params.size < bytes) {
++        pl_buf larger = pl_buf_create(gpu, pl_buf_params(
++            .size = bytes, .host_readable = true));
++        if (!larger) {
++            PL_ERR(gpu, "Failed growing peak detection readback buffer!");
++            return;
++        }
++        pl_buf_destroy(gpu, &obj->peak.readback);
++        obj->peak.readback = larger;
++    }
+     if (obj->peak.readback) {
+-        pl_buf_copy(gpu, obj->peak.readback, 0, obj->peak.buf, 0, sizeof(data));
+-        ok = pl_buf_read(gpu, obj->peak.readback, 0, &data, sizeof(data));
++        pl_buf_copy(gpu, obj->peak.readback, 0, obj->peak.buf, 0, bytes);
++        ok = pl_buf_read(gpu, obj->peak.readback, 0, &data, bytes);
+     } else {
+-        ok = pl_buf_read(gpu, obj->peak.buf, 0, &data, sizeof(data));
++        ok = pl_buf_read(gpu, obj->peak.buf, 0, &data, bytes);
+     }
+     bool causal_data = false;
+     for (int i = 0; i < CAUSAL_HIST_BINS; i++)
+@@ -1869,19 +1894,30 @@ static void analysis_consume(pl_gpu gpu, struct sh_color_map_obj *obj, bool forc
+             sink->peak.causal.acceleration_count++;
+         sink->peak.causal_test.readback_count++;
+         sink->peak.causal_test.borrowed_peak_transaction = true;
+-        sink->peak.causal_test.transaction_bytes = sizeof(data);
++        sink->peak.causal_test.transaction_bytes = bytes;
+         obj->peak.causal_sink = NULL;
+     } else if (obj->peak.causal_owns) {
+         causal_consume(obj, &data, &obj->peak.causal_params);
+         obj->peak.causal_test.readback_count++;
+         obj->peak.causal_test.borrowed_peak_transaction = false;
+-        obj->peak.causal_test.transaction_bytes = sizeof(data);
++        obj->peak.causal_test.transaction_bytes = bytes;
+     }
+ 
+     if (!data.frame_wg_count[0]) {
+         return;
+     }
+ 
++    if (params->hstm_histogram && bytes == peak_buffer_size(true)) {
++        uint64_t hist[HSTM_BINS] = {0};
++        for (int k = 0; k < SLICES; k++)
++            for (int i = 0; i < HSTM_BINS; i++) hist[i] += data.hstm_hist[k][i];
++        obj->peak.hstm_valid = hstm_update_histogram(obj->peak.hstm_hist,
++            obj->peak.hstm_valid, hist, iir_coeff(params->smoothing_period),
++            params->scene_reset || causal_acceleration);
++    } else {
++        obj->peak.hstm_valid = false;
++    }
++
+     uint64_t frame_sum_pq = 0u, frame_sum_rgb = 0u, frame_sum_metric = 0u;
+     uint64_t frame_wg_count = 0u, frame_wg_active = 0u;
+     unsigned frame_max_rgb = 0u;
+@@ -2030,10 +2066,13 @@ bool pl_shader_detect_peak(pl_shader sh, struct pl_color_space csp,
+         return false;
+ 
+     pl_gpu gpu = SH_GPU(sh);
+-    if (!gpu || gpu->limits.max_ssbo_size < sizeof(struct peak_buf_data)) {
++    const bool use_hstm = params->hstm_histogram &&
++        params->metric == PL_TONE_MAP_METRIC_BT2020_RGB;
++    const size_t buffer_size = peak_buffer_size(use_hstm);
++    if (!gpu || gpu->limits.max_ssbo_size < buffer_size) {
+         PL_ERR(sh, "HDR peak detection requires a GPU with support for at "
+                "least %zu bytes of SSBO data (supported: %zu)",
+-               sizeof(struct peak_buf_data), gpu ? gpu->limits.max_ssbo_size : 0);
++               buffer_size, gpu ? gpu->limits.max_ssbo_size : 0);
+         return false;
+     }
+ 
+@@ -2046,6 +2085,7 @@ bool pl_shader_detect_peak(pl_shader sh, struct pl_color_space csp,
+     if (use_histogram)
+         shmem_req += (use_metric ? 3 : 2) * sizeof(uint32_t[HIST_BINS]);
+ 
++    if (use_hstm) shmem_req += sizeof(uint32_t[HSTM_BINS]);
+     if (!sh_try_compute(sh, 16, 16, true, shmem_req)) {
+         PL_ERR(sh, "HDR peak detection requires compute shaders with support "
+                "for at least %zu bytes of shared memory! (avail: %zu)",
+@@ -2077,16 +2117,25 @@ bool pl_shader_detect_peak(pl_shader sh, struct pl_color_space csp,
+ 
+ retry_ssbo:
+     if (append_causal) {
+-        // The causal dispatch already allocated the exact same transaction.
++        // Expand an earlier causal-only transaction on the GPU if needed.
++        if (obj->peak.buf->params.size < buffer_size) {
++            pl_buf expanded = pl_buf_create(gpu, pl_buf_params(
++                .size = buffer_size, .memory_type = PL_BUF_MEM_DEVICE,
++                .host_readable = !obj->peak.readback, .storable = true, .initial_data = &zero));
++            if (!expanded) return false;
++            pl_buf_copy(gpu, expanded, 0, obj->peak.buf, 0, obj->peak.buf->params.size);
++            pl_buf_destroy(gpu, &obj->peak.buf);
++            obj->peak.buf = expanded;
++        }
+     } else if (obj->peak.readback) {
+         obj->peak.buf = pl_buf_create(gpu, pl_buf_params(
+-            .size           = sizeof(struct peak_buf_data),
++            .size           = buffer_size,
+             .storable       = true,
+             .initial_data   = &zero,
+         ));
+     } else {
+         obj->peak.buf = pl_buf_create(gpu, pl_buf_params(
+-            .size           = sizeof(struct peak_buf_data),
++            .size           = buffer_size,
+             .memory_type    = PL_BUF_MEM_DEVICE,
+             .host_readable  = true,
+             .storable       = true,
+@@ -2098,7 +2147,7 @@ retry_ssbo:
+         PL_WARN(sh, "Failed creating host-readable peak detection SSBO, "
+                 "retrying with fallback buffer");
+         obj->peak.readback = pl_buf_create(gpu, pl_buf_params(
+-            .size           = sizeof(struct peak_buf_data),
++            .size           = buffer_size,
+             .host_readable  = true,
+         ));
+         if (obj->peak.readback)
+@@ -2131,7 +2180,7 @@ retry_ssbo:
+         },
+         .binding.object  = obj->peak.buf,
+         .buffer_vars     = (struct pl_buffer_var *) peak_buf_vars,
+-        .num_buffer_vars = PL_ARRAY_SIZE(peak_buf_vars),
++        .num_buffer_vars = PL_ARRAY_SIZE(peak_buf_vars) - (use_hstm ? 0 : 1),
+     });
+ 
+     // For performance, we want to do as few atomic operations on global
+@@ -2146,7 +2195,8 @@ retry_ssbo:
+             wg_hist_rgb = NULL_IDENT,
+             wg_metric_sum = NULL_IDENT,
+             wg_metric_max = NULL_IDENT,
+-            wg_hist_metric = NULL_IDENT;
++            wg_hist_metric = NULL_IDENT,
++            wg_hstm = NULL_IDENT;
+     GLSLH("shared uint "$", "$", "$", "$", "$", "$"; \n",
+           wg_sum, wg_max, wg_rgb_sum, wg_rgb_max, wg_rgb_pq_max, wg_black);
+     if (use_histogram) {
+@@ -2166,7 +2216,12 @@ retry_ssbo:
+         }
+     }
+ 
+-    sh_describe(sh, "peak detection");
++    if (use_hstm) {
++        wg_hstm = sh_fresh(sh, "wg_hstm");
++        GLSLH("shared uint "$"[%u]; \n", wg_hstm, HSTM_BINS);
++    }
++
++    sh_describe(sh, use_hstm ? "peak detection + HSTM(P) histogram" : "peak detection");
+ #pragma GLSL /* pl_shader_detect_peak */                                        \
+     {                                                                           \
+     const uint wg_size = gl_WorkGroupSize.x * gl_WorkGroupSize.y;               \
+@@ -2190,6 +2245,10 @@ retry_ssbo:
+             @}                                                                  \
+         }                                                                       \
+     @}                                                                          \
++    @if (use_hstm) {                                                          \
++        for (uint i = local_idx; i < ${const uint: HSTM_BINS}; i += wg_size)  \
++            $wg_hstm[i] = 0u;                                                 \
++    @}                                                                        \
+     barrier();
+ 
+     // Decode color into linear light representation
+@@ -2226,6 +2285,23 @@ retry_ssbo:
+         @}                                                                         \
+     @}                                                                          \
+                                                                                 \
++    @if (use_hstm) {                                                          \
++        /* Fixed 4x4 stratified samples; never rotates between frames. */     \
++        uvec2 hp = gl_LocalInvocationID.xy;                                   \
++        if ((hp.x & 3u) == (hp.y & 3u) && (hp.y & 3u) == 1u && y_pq > 0u) {   \
++            float v = pow(float(metric_pq) / ${const float: PQ_MAX},          \
++                          1.0 / ${const float: PQ_M2});                       \
++            float pn = 10000.0 * pow(max(v - ${const float: PQ_C1}, 0.0)      \
++                / max(${const float: PQ_C2} - ${const float: PQ_C3} * v, 1e-6), \
++                1.0 / ${const float: PQ_M1});                                 \
++            if (pn > 0.001) {                                                 \
++                float hc = log2(1.0 + pn / ${const float: HSTM_FLOOR});       \
++                uint hb = uint(hc * ${const float: HSTM_BINS / HSTM_LOG_MAX}); \
++                atomicAdd($wg_hstm[min(hb, ${const uint: HSTM_BINS - 1})], 1u); \
++            }                                                                 \
++        }                                                                     \
++    @}                                                                        \
++                                                                              \
+     /* Update the work group's shared atomics */                                \
+     @if (use_histogram) {                                                       \
+         int bin = int(y_pq) >> ${const int: PQ_BITS - HIST_BITS};               \
+@@ -2311,6 +2387,14 @@ retry_ssbo:
+         @}                                                                       \
+     @}                                                                          \
+                                                                                 \
++    @if (use_hstm) {                                                          \
++        for (uint i = local_idx; i < ${const uint: HSTM_BINS}; i += wg_size) { \
++            uint count = $wg_hstm[i];                                         \
++            if (count > 0u)                                                   \
++                atomicAdd(hstm_hist[slice * ${const uint: HSTM_BINS} + i], count); \
++        }                                                                     \
++    @}                                                                        \
++                                                                              \
+     /* Have one thread per work group update the global atomics */              \
+     if (gl_LocalInvocationIndex == 0u) {                                        \
+         uint num = wg_size - $wg_black;                                         \
+@@ -2386,16 +2470,16 @@ bool pl_shader_detect_causal_scene(pl_dispatch dp, pl_gpu gpu, pl_tex proxy,
+     if (!append_peak && !obj->peak.buf) {
+         static const struct peak_buf_data zero = {0};
+         obj->peak.buf = pl_buf_create(gpu, pl_buf_params(
+-            .size = sizeof(zero), .memory_type = PL_BUF_MEM_DEVICE,
++            .size = peak_buffer_size(false), .memory_type = PL_BUF_MEM_DEVICE,
+             .host_readable = true, .storable = true, .initial_data = &zero,
+         ));
+         if (!obj->peak.buf) {
+             obj->peak.readback = pl_buf_create(gpu, pl_buf_params(
+-                .size = sizeof(zero), .host_readable = true,
++                .size = peak_buffer_size(false), .host_readable = true,
+             ));
+             if (obj->peak.readback)
+                 obj->peak.buf = pl_buf_create(gpu, pl_buf_params(
+-                    .size = sizeof(zero), .storable = true,
++                    .size = peak_buffer_size(false), .storable = true,
+                     .initial_data = &zero,
+                 ));
+         }
+@@ -2426,7 +2510,7 @@ bool pl_shader_detect_causal_scene(pl_dispatch dp, pl_gpu gpu, pl_tex proxy,
+                   .access = PL_DESC_ACCESS_READWRITE },
+         .binding.object = append_peak ? borrow->peak.buf : obj->peak.buf,
+         .buffer_vars = (struct pl_buffer_var *) peak_buf_vars,
+-        .num_buffer_vars = PL_ARRAY_SIZE(peak_buf_vars),
++        .num_buffer_vars = PL_ARRAY_SIZE(peak_buf_vars) - 1,
+     });
+     GLSL("// native-cie-y-v1 causal descriptor reduction\n"
+          "uvec2 p = gl_GlobalInvocationID.xy;\n"
+@@ -2780,10 +2864,33 @@ static void visualize_gamut_map(pl_shader sh, pl_rect2df rc,
+          lut);
+ }
+ 
++struct hstm_lut_data {
++    const struct pl_tone_map_params *tone;
++    const float *hist;
++    float strength, brightening;
++};
++
+ static void fill_tone_lut(void *data, const struct sh_lut_params *params)
+ {
+-    const struct pl_tone_map_params *lut_params = params->priv;
++    const struct hstm_lut_data *ctx = params->priv;
++    const struct pl_tone_map_params *lut_params = ctx->tone;
+     pl_tone_map_generate(data, lut_params);
++    if (!ctx->hist) return;
++    const int n = params->width;
++    float *tmp = pl_alloc(NULL, 3 * n * sizeof(float));
++    float *input = tmp, *base = tmp + n, *scratch = tmp + 2*n;
++    float *out = data;
++    for (int i = 0; i < n; i++) {
++        const float x = PL_MIX(lut_params->input_min, lut_params->input_max,
++                               (float)i / (n-1));
++        input[i] = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, x);
++        base[i] = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, out[i]);
++    }
++    hstm_shape_curve(ctx->hist, input, base, base, scratch, n,
++                     ctx->strength, ctx->brightening);
++    for (int i = 0; i < n; i++)
++        out[i] = pl_hdr_rescale(PL_HDR_NITS, PL_HDR_PQ, base[i]);
++    pl_free(tmp);
+ }
+ 
+ static void fill_gamut_lut(void *data, const struct sh_lut_params *params)
+@@ -2833,7 +2940,10 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+     const bool ambient_requested = isfinite(params->ambient_gamma) &&
+         params->ambient_gamma > 0.0f &&
+         fabsf(params->ambient_gamma - 1.0f) > 1e-6f;
+-    if (pl_color_space_equal(&src, &dst) && !ambient_requested &&
++    const bool hstm_requested = params->hstm_strength > 0 &&
++        params->tone_mapping_metric == PL_TONE_MAP_METRIC_BT2020_RGB &&
++        pl_color_space_is_hdr(&src);
++    if (pl_color_space_equal(&src, &dst) && !ambient_requested && !hstm_requested &&
+         params->gamut_mapping != &pl_gamut_map_ipt_path &&
+         !args->measure_rgb_ray && !args->rgb_ray_peak) {
+ #ifdef PL_BLACK_LEVEL_DIAGNOSTICS
+@@ -3005,7 +3115,17 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+         pl_unreachable();
+     }
+ 
+-    bool can_fast = !params->force_tone_mapping_lut;
++    const bool hstm_active = hstm_requested && metric_active && obj &&
++        obj->peak.params.hstm_histogram && obj->peak.hstm_valid;
++    uint64_t hstm_signature = 0;
++    if (hstm_active) {
++        hstm_signature = 1;
++        for (int i = 0; i < HSTM_BINS; i++)
++            pl_hash_merge(&hstm_signature, pl_var_hash(obj->peak.hstm_hist[i]));
++        pl_hash_merge(&hstm_signature, pl_var_hash(params->hstm_strength));
++        pl_hash_merge(&hstm_signature, pl_var_hash(params->hstm_overbrightening));
++    }
++    bool can_fast = !params->force_tone_mapping_lut && !hstm_active;
+     if (!args->state) {
+         // No state object provided, forcibly disable advanced methods
+         can_fast = true;
+@@ -3027,7 +3147,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+     const bool base_need_tone_map = !pl_tone_map_params_noop(&tone);
+     const bool inverse_expansion = params->inverse_tone_mapping &&
+         tone.output_max > tone.input_max + 1e-6f;
+-    bool need_tone_map = base_need_tone_map || ambient_active ||
++    bool need_tone_map = base_need_tone_map || ambient_active || hstm_active ||
+         args->measure_rgb_ray || args->rgb_ray_peak;
+     bool need_gamut_map = !pl_gamut_map_params_noop(&gamut);
+ 
+@@ -3126,6 +3246,12 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+         } else {
+ 
+             pl_assert(obj);
++            struct hstm_lut_data lut_data = {
++                .tone = &tone, .hist = hstm_active ? obj->peak.hstm_hist : NULL,
++                .strength = params->hstm_strength,
++                .brightening = params->hstm_overbrightening,
++            };
++            if (hstm_active) sh_describe(sh, "HSTM(P)");
+             ident_t lut = sh_lut(sh, sh_lut_params(
+                 .object     = &obj->tone.lut,
+                 .var_type   = PL_VAR_FLOAT,
+@@ -3133,12 +3259,14 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+                 .method     = SH_LUT_LINEAR,
+                 .width      = tone.lut_size,
+                 .comps      = 1,
+-                .update     = !pl_tone_map_params_equal(&tone, &obj->tone.params),
+-                .dynamic    = tone.input_avg > 0, // dynamic metadata
++                .update     = !pl_tone_map_params_equal(&tone, &obj->tone.params) ||
++                              obj->tone.hstm_signature != hstm_signature,
++                .dynamic    = tone.input_avg > 0 || hstm_active,
+                 .fill       = fill_tone_lut,
+-                .priv       = &tone,
++                .priv       = &lut_data,
+             ));
+             obj->tone.params = tone;
++            obj->tone.hstm_signature = hstm_signature;
+             if (!lut) {
+                 SH_FAIL(sh, "Failed generating tone-mapping LUT!");
+                 return;
+@@ -3254,6 +3382,12 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+                  "float metric_scale = metric_in_lin > 1e-12            \n"
+                  "    ? metric_out_lin / metric_in_lin : 1.0;           \n");
+ 
++            if (hstm_active) {
++                // Bound final P gain even between interpolated LUT samples.
++                GLSL("metric_scale = min(metric_scale, "$"); \n",
++                     SH_FLOAT_DYN(1.0f + hstm_clamp(params->hstm_overbrightening, 0, 1)));
++            }
++
+             if (params->tone_mapping_metric == PL_TONE_MAP_METRIC_BT2020_RGB ||
+                 params->tone_mapping_metric == PL_TONE_MAP_METRIC_MAXRGB_RGB) {
+                 // Homogeneity makes this the exact fixed-hue inverse:
+@@ -3294,6 +3428,17 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+                          SH_FLOAT_DYN(tone.output_max),
+                          PQ_M2, PQ_C1, PQ_C2, PQ_C3, PQ_M1, 10000/PL_COLOR_SDR_WHITE);
+                 }
++                if (hstm_active) {
++                    const pl_matrix3x3 hstm_to_dst = pl_get_color_mapping_matrix(
++                        pl_raw_primaries_get(src.primaries),
++                        pl_raw_primaries_get(dst.primaries),
++                        PL_INTENT_RELATIVE_COLORIMETRIC);
++                    GLSL("vec3 hstm_dst = "$" * color.rgb; \n"
++                         "float hstm_max = max(max(hstm_dst.r, hstm_dst.g), hstm_dst.b); \n"
++                         "metric_scale = min(metric_scale, "$" / max(hstm_max, 1e-12)); \n",
++                         SH_MAT3(hstm_to_dst),
++                         SH_FLOAT_DYN(pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NORM, tone.output_max)));
++                }
+                 GLSL("color.rgb *= metric_scale;                           \n"
+                  "lms = "$" * color.rgb;                                \n"
+                  "lmspq = %f * lms;                                      \n"
+diff --git a/src/shaders/hstm.h b/src/shaders/hstm.h
+new file mode 100644
+index 0000000..41f5bfb
+--- /dev/null
++++ b/src/shaders/hstm.h
+@@ -0,0 +1,120 @@
++/* Private mpv-ht histogram-shaped P mapping. No spatial filtering or SEP.
++ * SPDX-License-Identifier: LGPL-2.1-or-later */
++#ifndef PL_SHADERS_HSTM_H_
++#define PL_SHADERS_HSTM_H_
++#include <math.h>
++#include <stdbool.h>
++#include <stdint.h>
++
++#define HSTM_BINS 256
++#define HSTM_FLOOR 0.01f
++#define HSTM_LOG_MAX 19.931570012f /* log2(1 + 10000 / 0.01) */
++
++static inline float hstm_coord(float nits)
++{
++    return log2f(1.0f + fmaxf(nits, 0.0f) / HSTM_FLOOR);
++}
++
++static inline float hstm_nits(float coord)
++{
++    return HSTM_FLOOR * expm1f(coord * 0.69314718056f);
++}
++
++static inline float hstm_clamp(float x, float lo, float hi)
++{
++    return fminf(hi, fmaxf(lo, x));
++}
++
++/* Normalize before smoothing so proportional sample populations and excluded
++ * black pixels cannot change strength. Only consume completed measurements. */
++static inline bool hstm_update_histogram(float state[HSTM_BINS], bool valid,
++                                        const uint64_t counts[HSTM_BINS],
++                                        float temporal, bool cut)
++{
++    double total = 0;
++    for (int i = 0; i < HSTM_BINS; i++) total += counts[i];
++    if (!(total > 0)) return false;
++    float raw[HSTM_BINS], smooth[HSTM_BINS], sum = 0, tv = 0;
++    for (int i = 0; i < HSTM_BINS; i++) raw[i] = counts[i] / total;
++    for (int i = 0; i < HSTM_BINS; i++) {
++        float v = 0, norm = 0;
++        for (int j = -3; j <= 3; j++) {
++            const int k = i + j;
++            if (k < 0 || k >= HSTM_BINS) continue;
++            const float w = expf(-0.5f * j*j / 2.25f);
++            v += w * raw[k]; norm += w;
++        }
++        smooth[i] = v / norm;
++        sum += smooth[i];
++    }
++    for (int i = 0; i < HSTM_BINS; i++) {
++        smooth[i] /= sum;
++        if (valid) tv += fabsf(smooth[i] - state[i]) * 0.5f;
++    }
++    // Distribution changes can identify a cut even when peak and mean match.
++    const float alpha = !valid || cut || tv > 0.65f ? 1.0f
++        : hstm_clamp(temporal, 0.0f, 1.0f);
++    for (int i = 0; i < HSTM_BINS; i++)
++        state[i] = valid ? state[i] + alpha * (smooth[i] - state[i]) : smooth[i];
++    return true;
++}
++
++static inline float hstm_density(const float hist[HSTM_BINS], float nits)
++{
++    const float p = hstm_clamp(hstm_coord(nits) / HSTM_LOG_MAX * HSTM_BINS - 0.5f,
++                               0.0f, HSTM_BINS - 1.0f);
++    const int lo = (int)p, hi = lo + 1 < HSTM_BINS ? lo + 1 : lo;
++    return (hist[lo] + (p - lo) * (hist[hi] - hist[lo])) * HSTM_BINS;
++}
++
++/* input/base/out contain linear P in nits on the same monotonic input grid.
++ * Redistribute the base curve's log-brightness increments, then normalize its
++ * endpoints. Positive bounded weights preserve order. Near-black is anchored.
++ * Above-source retention is a separate final operation and never affects an
++ * already dimmed value. At 100%, maximum above-source gain is 2x (one stop).
++ * The caller supplies scratch[n] and may alias base and out. */
++static inline void hstm_shape_curve(const float hist[HSTM_BINS],
++                                    const float *input, const float *base,
++                                    float *out, float *scratch, int n,
++                                    float strength, float brightening)
++{
++    if (n < 2) return;
++    strength = hstm_clamp(strength, 0, 1);
++    brightening = hstm_clamp(brightening, 0, 1);
++    if (strength == 0) {
++        for (int i = 0; i < n; i++) out[i] = base[i];
++        return;
++    }
++    int anchor = 0;
++    while (anchor + 1 < n && input[anchor + 1] <= 0.1f) anchor++;
++    const float lower = hstm_coord(base[anchor]);
++    const float upper = hstm_coord(base[n - 1]);
++    scratch[anchor] = 0;
++    float previous = lower;
++    for (int i = anchor + 1; i < n; i++) {
++        const float current = fmaxf(previous, hstm_coord(base[i]));
++        const float p = sqrtf(fmaxf(input[i - 1], 0) * fmaxf(input[i], 0));
++        const float density = hstm_density(hist, p);
++        // Log softens large populations; clamp bounds local slope allocation.
++        const float weight = hstm_clamp(0.5f + log1pf(8.0f*density) / logf(9.0f),
++                                        0.5f, 4.0f);
++        scratch[i] = scratch[i - 1] + (current - previous) * weight;
++        previous = current;
++    }
++    const float scale = scratch[n - 1] > 1e-12f
++        ? (upper - lower) / scratch[n - 1] : 0;
++    const float ceiling = base[n - 1];
++    for (int i = 0; i < n; i++) {
++        float candidate = base[i];
++        if (i > anchor) {
++            const float target = lower + scratch[i] * scale;
++            candidate = hstm_nits(hstm_coord(base[i]) * (1 - strength)
++                                  + strength * target);
++        }
++        candidate = fminf(candidate, 2.0f * input[i]);
++        const float below = fminf(candidate, input[i]);
++        out[i] = fminf(ceiling, below + brightening * fmaxf(candidate - input[i], 0));
++        if (input[i] <= 0) out[i] = 0;
++    }
++}
++#endif

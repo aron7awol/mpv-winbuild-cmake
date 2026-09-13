@@ -1,0 +1,58 @@
+From: mpv-ht development <dev@mpv-ht.local>
+Subject: [PATCH] analyzer: crop the native xy viewport horizontally
+
+Expose bounded horizontal presentation cropping alongside the existing vertical
+clip. Lua can fit a larger Rec.709 diagram without changing the cached 152-grid
+analysis, selected colors, GPU reduction or readback. Zero width retains the
+existing full-width behavior.
+
+Extend the native overlay behind its ASS backing by one physical pixel to
+prevent antialiased clip boundaries from exposing the underlying video.
+
+diff --git a/video/out/analyzer_chromaticity_bridge.h b/video/out/analyzer_chromaticity_bridge.h
+index d427aee21..45fc7b6d8 100644
+--- a/video/out/analyzer_chromaticity_bridge.h
++++ b/video/out/analyzer_chromaticity_bridge.h
+@@ -116,10 +116,18 @@ static void analyzer_xy_prepare(struct priv *p, struct pl_frame *target, struct
+         MPMIN(p->next_opts->analyzer_xy_clip_top,size) : 0;
+     int height=p->next_opts->analyzer_xy_clip_height>0 ?
+         MPMIN(p->next_opts->analyzer_xy_clip_height,size-clip_top) : size;
+-    if(height<=0)return;
++    int clip_left=p->next_opts->analyzer_xy_clip_width>0 ?
++        MPMIN(p->next_opts->analyzer_xy_clip_left,size) : 0;
++    int width=p->next_opts->analyzer_xy_clip_width>0 ?
++        MPMIN(p->next_opts->analyzer_xy_clip_width,size-clip_left) : size;
++    if(width<=0 || height<=0)return;
++    // Extend behind the neighboring ASS backing by one physical pixel. Its
++    // antialiased cutout edge then blends with opaque chart pixels, not video.
++    // Extend source and destination equally to retain every cell coordinate.
+     a->xy_part=(struct pl_overlay_part){
+-        .src={0,clip_top*raster/(float)size,raster,(clip_top+height)*raster/(float)size},
+-        .dst={x,y,x+size,y+height}};
++        .src={(clip_left-1)*raster/(float)size,clip_top*raster/(float)size,
++              (clip_left+width+1)*raster/(float)size,(clip_top+height)*raster/(float)size},
++        .dst={x-1,y,x+width+1,y+height}};
+     MP_TARRAY_GROW(p,a->xy_overlays,target->num_overlays);
+     memcpy(a->xy_overlays+1,target->overlays,target->num_overlays*sizeof(*target->overlays));
+     a->xy_overlays[0]=(struct pl_overlay){.tex=a->xy_display,.mode=PL_OVERLAY_NORMAL,
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 608aa232a..5fab09e69 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -265,6 +265,7 @@ struct gl_next_opts {
+     float analyzer_waveform_peak;
+     int analyzer_xy_x, analyzer_xy_y, analyzer_xy_size, analyzer_xy_intensity;
+     int analyzer_xy_clip_top, analyzer_xy_clip_height;
++    int analyzer_xy_clip_left, analyzer_xy_clip_width;
+     bool delayed_peak;
+     bool dovi_enhancement_layer;
+     bool causal_scene_diagnostics;
+@@ -325,6 +326,8 @@ const struct m_sub_options gl_next_conf = {
+         {"analyzer-xy-x", OPT_INT(analyzer_xy_x), M_RANGE(0, 32768)},
+         {"analyzer-xy-y", OPT_INT(analyzer_xy_y), M_RANGE(0, 32768)},
+         {"analyzer-xy-size", OPT_INT(analyzer_xy_size), M_RANGE(0, 4096)},
++        {"analyzer-xy-clip-left", OPT_INT(analyzer_xy_clip_left), M_RANGE(0, 4096)},
++        {"analyzer-xy-clip-width", OPT_INT(analyzer_xy_clip_width), M_RANGE(0, 4096)},
+         {"analyzer-xy-clip-top", OPT_INT(analyzer_xy_clip_top), M_RANGE(0, 4096)},
+         {"analyzer-xy-clip-height", OPT_INT(analyzer_xy_clip_height), M_RANGE(0, 4096)},
+         {"analyzer-xy-intensity", OPT_INT(analyzer_xy_intensity), M_RANGE(0, 255)},

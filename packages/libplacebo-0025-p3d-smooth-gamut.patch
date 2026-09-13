@@ -1,0 +1,412 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mpv-ht <mpv-ht@local>
+Date: Sat, 12 Sep 2026 20:00:00 -0400
+Subject: [PATCH] gamut: replace hard-boundary P3D with a smooth mapping
+
+Opt-in P3D only. Existing automatic and Softclip behavior is unchanged.
+See analysis/ipt-path-gamut/SMOOTH-P3D.md in the packaging repository.
+
+---
+diff --git a/src/gamut_mapping.c b/src/gamut_mapping.c
+index 9efbcc6a..33a471e6 100644
+--- a/src/gamut_mapping.c
++++ b/src/gamut_mapping.c
+@@ -744,33 +744,64 @@ static void perceptual(float *lut, const struct pl_gamut_map_params *params)
+     }
+ }
+ 
++static void softclip_map(float *lut, const struct pl_gamut_map_params *params);
++
++// The public sampling API follows the same policy as the renderer. Rendering
++// interpolates the *Softclip color LUT*, then recovers P per pixel afterwards;
++// interpolating a P-restored LUT is not equivalent and is not used.
+ static void ipt_path(float *lut, const struct pl_gamut_map_params *params)
+ {
+     struct cache cache;
+     struct gamut working;
+-    struct pl_gamut_map_params work = *params;
++    struct pl_gamut_map_params work = *params, color = *params;
+     const struct pl_raw_primaries *bt2020 = pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020);
+     work.output_gamut = *bt2020;
+     get_gamuts(&working, NULL, &cache, &work);
+-    pl_matrix3x3 m = pl_get_color_mapping_matrix(bt2020, &params->output_gamut,
+-                                                PL_INTENT_RELATIVE_COLORIMETRIC);
+-    hp_mat target;
+-    for (int i=0;i<3;i++) for (int j=0;j<3;j++) target.m[i][j]=m.m[i][j];
+-    hp_ctx ctx=hp_context(target, pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, params->max_luma)/10000.0);
++    const pl_matrix3x3 target = pl_get_color_mapping_matrix(bt2020,
++        &params->output_gamut, PL_INTENT_RELATIVE_COLORIMETRIC);
++    const pl_matrix3x3 inverse = pl_get_color_mapping_matrix(&params->output_gamut,
++        bt2020, PL_INTENT_RELATIVE_COLORIMETRIC);
++    const float peak = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, params->max_luma)/10000.0f;
++    const size_t count = (size_t) params->lut_size_I * params->lut_size_C * params->lut_size_h;
++    float *brightness = pl_alloc(NULL, count * sizeof(*brightness));
++    size_t i = 0;
++    FOREACH_LUT(lut, ipt) {
++        const struct RGB rgb = ipt2rgb(ipt, working);
++        brightness[i++] = hp_p((hp_vec){{rgb.R, rgb.G, rgb.B}});
++    }
++
++    color.function = &pl_gamut_map_softclip;
++    if (!pl_gamut_map_params_noop(&color))
++        softclip_map(lut, &color);
++
++    i = 0;
+     FOREACH_LUT(lut, ipt) {
+-        struct RGB raw=ipt2rgb(ipt, working);
+-        // Keep the original IPT direction at off-source-gamut LUT nodes.
+-        // Clipping those nodes first biases interpolation near saturated
+-        // source boundaries. hp_p defines the nonnegative metric extension.
+-        hp_vec rgb={{raw.R,raw.G,raw.B}};
+-        hp_vec mapped=hp_map(ctx,rgb);
+-        ipt=rgb2ipt((struct RGB){mapped.v[0],mapped.v[1],mapped.v[2]},working);
++        struct RGB rgb = ipt2rgb(ipt, working);
++        float d[3] = {rgb.R, rgb.G, rgb.B};
++        pl_matrix3x3_apply(&target, d);
++        for (int j = 0; j < 3; j++)
++            d[j] = fmaxf(d[j], 0.0f);
++        const float maximum = fmaxf(d[0], fmaxf(d[1], d[2]));
++        pl_matrix3x3_apply(&inverse, d);
++        const double actual = hp_p((hp_vec){{d[0], d[1], d[2]}});
++        float gain = brightness[i++] / fmax(actual, 1e-30);
++        const float limit = peak / fmaxf(maximum, 1e-30f);
++        if (gain > 1.0f) {
++            // Match the shader: retain at least half of Softclip's remaining
++            // headroom rather than restoring P right up to a hard ceiling.
++            const float boost = gain - 1.0f;
++            const float room = 0.5f * fmaxf(limit - 1.0f, 0.0f);
++            gain = 1.0f + room * (boost / (room + boost));
++        }
++        gain = fminf(gain, limit);
++        ipt = rgb2ipt((struct RGB){d[0]*gain, d[1]*gain, d[2]*gain}, working);
+     }
++    pl_free(brightness);
+ }
+ 
+ const struct pl_gamut_map_function pl_gamut_map_ipt_path = {
+     .name = "ipt-path",
+-    .description = "Original-IPT path, Perceptual P (experimental)",
++    .description = "P3D smooth gamut, Perceptual P (experimental)",
+     .map = ipt_path,
+ };
+ 
+diff --git a/src/gamut_mapping_pipt.h b/src/gamut_mapping_pipt.h
+index 764b3ee1..564c5364 100644
+--- a/src/gamut_mapping_pipt.h
++++ b/src/gamut_mapping_pipt.h
+@@ -1,67 +1,11 @@
+-/* Experimental original-IPT (1998) hue path with homogeneous Perceptual P.
++/* Perceptual P shared by P3D's CPU reference and GPU code generation.
+  * Copyright (c) 2026 mpv-ht contributors
+  * SPDX-License-Identifier: LGPL-2.1-or-later
+- *
+- * Reuses the HKTest IPT-derived saturation path, not libplacebo's IPTPQc4.
+- * Chroma is reduced only to remove negative target RGB. Remaining upper-
+- * channel overflow is handled by one RGB scale, deliberately sacrificing P
+- * rather than forcing extra desaturation. No perceptual-distance claim.
+  */
+ #ifndef PL_GAMUT_MAPPING_PIPT_H
+ #define PL_GAMUT_MAPPING_PIPT_H
+-
+ #include <math.h>
+-#include <stdbool.h>
+-
+ typedef struct { double v[3]; } hp_vec;
+-typedef struct { double m[3][3]; } hp_mat;
+-typedef struct { hp_mat to_lms, from_lms, to_target; double peak; } hp_ctx;
+-
+-static inline hp_vec hp_mul(hp_mat m, hp_vec v)
+-{
+-    hp_vec r = {{0}};
+-    for (int i = 0; i < 3; i++)
+-        for (int j = 0; j < 3; j++) r.v[i] += m.m[i][j] * v.v[j];
+-    return r;
+-}
+-
+-static inline hp_mat hp_product(hp_mat a, hp_mat b)
+-{
+-    hp_mat r = {{{0}}};
+-    for (int i = 0; i < 3; i++)
+-        for (int j = 0; j < 3; j++)
+-            for (int k = 0; k < 3; k++) r.m[i][j] += a.m[i][k] * b.m[k][j];
+-    return r;
+-}
+-
+-static inline hp_mat hp_inverse(hp_mat a)
+-{
+-    const double (*m)[3] = a.m;
+-    hp_mat r = {{{m[1][1]*m[2][2]-m[1][2]*m[2][1], m[0][2]*m[2][1]-m[0][1]*m[2][2], m[0][1]*m[1][2]-m[0][2]*m[1][1]},
+-                 {m[1][2]*m[2][0]-m[1][0]*m[2][2], m[0][0]*m[2][2]-m[0][2]*m[2][0], m[0][2]*m[1][0]-m[0][0]*m[1][2]},
+-                 {m[1][0]*m[2][1]-m[1][1]*m[2][0], m[0][1]*m[2][0]-m[0][0]*m[2][1], m[0][0]*m[1][1]-m[0][1]*m[1][0]}}};
+-    double det = m[0][0]*r.m[0][0] + m[0][1]*r.m[1][0] + m[0][2]*r.m[2][0];
+-    for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) r.m[i][j] /= det;
+-    return r;
+-}
+-
+-static inline hp_ctx hp_context(hp_mat to_target, double peak)
+-{
+-    const hp_mat xyz = {{{.636958048301,.144616903586,.168880975164},
+-                        {.262700212011,.677998071519,.059301716470},
+-                        {0,.028072693049,1.060985057711}}};
+-    const hp_mat lms = {{{.4002,.7075,-.0807},{-.2280,1.1500,.0612},{0,0,.9184}}};
+-    hp_ctx c = {.to_lms = hp_product(lms, xyz), .to_target = to_target, .peak = peak};
+-    c.from_lms = hp_inverse(c.to_lms);
+-    return c;
+-}
+-
+-static inline hp_vec hp_scale(hp_vec v, double gain)
+-{
+-    for (int j = 0; j < 3; j++) v.v[j] *= gain;
+-    return v;
+-}
+-
+ static inline double hp_p(hp_vec c)
+ {
+     double r=fmax(c.v[0],0), g=fmax(c.v[1],0), b=fmax(c.v[2],0), total=r+g+b;
+@@ -73,62 +17,4 @@ static inline double hp_p(hp_vec c)
+     double q3=73.1408564899*w-38.0916687975;
+     return total*(((q3*p+q2)*p+q1)*p+q0);
+ }
+-
+-static inline hp_vec hp_lmsp(hp_ctx c, hp_vec rgb)
+-{
+-    hp_vec v=hp_mul(c.to_lms,rgb);
+-    for (int j=0;j<3;j++) v.v[j]=copysign(pow(fabs(v.v[j]),.43),v.v[j]);
+-    return v;
+-}
+-
+-static inline hp_vec hp_path(hp_ctx c, hp_vec neutral, hp_vec source, double t, double p)
+-{
+-    hp_vec v;
+-    // Mixing LMS' is equivalent to a straight original-IPT segment because
+-    // its opponent transform is linear. RGB normalization leaves its centered
+-    // IPT hue unchanged, while making P exact at each point on the path.
+-    for (int j=0;j<3;j++) {
+-        double a=neutral.v[j]+t*(source.v[j]-neutral.v[j]);
+-        v.v[j]=copysign(pow(fabs(a),1/.43),a);
+-    }
+-    v=hp_mul(c.from_lms,v);
+-    double actual=hp_p(v);
+-    return actual>1e-30 ? hp_scale(v,p/actual) : (hp_vec){{0,0,0}};
+-}
+-
+-static inline bool hp_chroma_fits(hp_ctx c, hp_vec rgb)
+-{
+-    hp_vec d=hp_mul(c.to_target,rgb);
+-    double eps=1e-12*fmax(fabs(rgb.v[0]),fmax(fabs(rgb.v[1]),fabs(rgb.v[2])));
+-    return d.v[0]>=-eps && d.v[1]>=-eps && d.v[2]>=-eps;
+-}
+-
+-static inline hp_vec hp_map(hp_ctx c, hp_vec rgb)
+-{
+-    double p=hp_p(rgb);
+-    if (!(p>0) || !isfinite(p) || !(c.peak>0)) return (hp_vec){{0,0,0}};
+-    hp_vec mapped=rgb;
+-    if (!hp_chroma_fits(c,rgb)) {
+-        hp_vec source=hp_lmsp(c,rgb), gray=hp_lmsp(c,(hp_vec){{p,p,p}});
+-        double lo=0,hi=1;
+-        // Walk inward from the source to the first sampled legal interval.
+-        // A neutral-outward search can choose an unnecessarily distant
+-        // boundary near IPT's re-entrant primary cusps.
+-        for (int i=15;i>=0;i--) {
+-            lo=i/16.0;
+-            if (hp_chroma_fits(c,hp_path(c,gray,source,lo,p))) break;
+-            hi=lo;
+-        }
+-        for (int i=0;i<24;i++) {
+-            double mid=(lo+hi)*.5;
+-            if (hp_chroma_fits(c,hp_path(c,gray,source,mid,p))) lo=mid;
+-            else hi=mid;
+-        }
+-        mapped=hp_path(c,gray,source,lo*(1-1e-7),p);
+-    }
+-    hp_vec dst=hp_mul(c.to_target,mapped);
+-    double maximum=fmax(dst.v[0],fmax(dst.v[1],dst.v[2]));
+-    if (maximum>c.peak) mapped=hp_scale(mapped,c.peak/maximum);
+-    return mapped;
+-}
+ #endif
+diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
+index 68e0e6be..b9575ee4 100644
+--- a/src/shaders/colorspace.c
++++ b/src/shaders/colorspace.c
+@@ -3011,13 +3011,12 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+         can_fast = true;
+         if (tone.function != &pl_tone_map_clip)
+             tone.function = &pl_tone_map_linear;
+-        if (gamut.function != &pl_gamut_map_clip &&
+-            gamut.function != &pl_gamut_map_ipt_path)
++        if (gamut.function != &pl_gamut_map_clip)
+             gamut.function = &pl_gamut_map_saturation;
+     }
+ 
+     pl_fmt gamut_fmt = pl_find_fmt(SH_GPU(sh), PL_FMT_UNORM, 4, 16, 16, PL_FMT_CAP_LINEAR);
+-    if (!gamut_fmt && gamut.function != &pl_gamut_map_ipt_path) {
++    if (!gamut_fmt) {
+         gamut.function = &pl_gamut_map_saturation;
+         can_fast = true;
+     }
+@@ -3370,10 +3369,14 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+         }
+     }
+ 
+-    if (need_gamut_map && gamut.function == &pl_gamut_map_ipt_path) {
+-        sh_describe(sh, "gamut map (ipt-path experimental)");
+-        emit_ipt_path(sh, &gamut, ipt2lms, lms2ipt);
+-    } else if (need_gamut_map) {
++    const bool p3d = need_gamut_map && gamut.function == &pl_gamut_map_ipt_path;
++    ident_t p3d_metric = {0}, p3d_brightness = {0};
++    if (p3d) {
++        sh_describe(sh, "P3D P brightness / RGB peak fit");
++        emit_p3d_brightness_save(sh, &p3d_metric, &p3d_brightness, ipt2lms);
++        gamut.function = &pl_gamut_map_softclip;
++    }
++    if (need_gamut_map && (!p3d || !pl_gamut_map_params_noop(&gamut))) {
+         const struct pl_gamut_map_function *fun = gamut.function;
+         sh_describef(sh, "gamut map (%s)", fun->name);
+ 
+@@ -3422,6 +3425,12 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+         }
+     }
+ 
++    if (p3d) {
++        emit_p3d_brightness_restore(sh, &gamut, p3d_metric, p3d_brightness,
++                                   ipt2lms, lms2ipt);
++        gamut.function = &pl_gamut_map_ipt_path;
++    }
++
+     if (ambient_active) {
+         // Apply ambient compensation after the ordinary tone/chroma and gamut
+         // reconstruction. Preserve the resulting P/T exactly when the lifted
+diff --git a/src/shaders/ipt_path.h b/src/shaders/ipt_path.h
+index c1f9745a..b0beb6b8 100644
+--- a/src/shaders/ipt_path.h
++++ b/src/shaders/ipt_path.h
+@@ -1,74 +1,64 @@
+-/* Experimental original-IPT hue-path mapper. SPDX-License-Identifier: LGPL-2.1-or-later */
++/* P3D: smooth gamut color plus headroom-preserving P brightness recovery.
++ * The option ID remains ipt-path for compatibility, but the old hard
++ * original-IPT projection is deliberately no longer used.
++ * SPDX-License-Identifier: LGPL-2.1-or-later */
+ #include "../gamut_mapping_pipt.h"
+ 
+-static void emit_ipt_path(pl_shader sh, const struct pl_gamut_map_params *gamut,
+-                          ident_t ipt2lms, ident_t lms2ipt)
++static ident_t emit_p3d_rgb(pl_shader sh, ident_t ipt2lms)
+ {
+-    const struct pl_raw_primaries *working = pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020);
+-    const pl_matrix3x3 target = pl_get_color_mapping_matrix(
+-        working, &gamut->output_gamut, PL_INTENT_RELATIVE_COLORIMETRIC);
+-    hp_ctx ctx = hp_context((hp_mat){{{1,0,0},{0,1,0},{0,0,1}}}, 1);
+-    pl_matrix3x3 to_lms, from_lms;
+-    for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) {
+-        to_lms.m[i][j] = ctx.to_lms.m[i][j];
+-        from_lms.m[i][j] = ctx.from_lms.m[i][j];
+-    }
+-    const hp_vec white = hp_lmsp(ctx, (hp_vec){{1,1,1}});
+-    ident_t metric = sh_fresh(sh, "ipt_path_p");
+-    ident_t path = sh_fresh(sh, "ipt_path_rgb");
+-    ident_t fits = sh_fresh(sh, "ipt_path_fits");
+-    // Linear P, identical polynomial to hp_p and the production P metric.
++    const struct pl_raw_primaries *working=pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020);
++    ident_t rgb=sh_fresh(sh,"p3d_rgb");
++    GLSL("vec3 "$"; { \n"
++         " vec3 q=pow(max("$"*ipt,0.0),vec3(1.0/%f)); \n"
++         " vec3 l=pow(max(q-vec3(%f),0.0)/(vec3(%f)-%f*q),vec3(1.0/%f)); \n"
++         " "$"="$"*l; } \n",rgb,ipt2lms,PQ_M2,PQ_C1,PQ_C2,PQ_C3,PQ_M1,rgb,SH_MAT3(pl_ipt_lms2rgb(working)));
++    return rgb;
++}
++
++static void emit_p3d_brightness_save(pl_shader sh, ident_t *metric,
++                                    ident_t *brightness, ident_t ipt2lms)
++{
++    *metric=sh_fresh(sh,"p3d_p");
++    *brightness=sh_fresh(sh,"p3d_input_p");
+     GLSLH("float "$"(vec3 rgb) { \n"
+-          " vec3 c=max(rgb,0.0); float total=c.r+c.g+c.b; \n"
+-          " if(total<=1e-30) return 0.0; \n"
+-          " vec3 n=c/total; float w=n.b, p=n.r*n.g; \n"
++          " vec3 c=max(rgb,0.0); float total=c.r+c.g+c.b; if(total<=1e-30) return 0.0; \n"
++          " vec3 n=c/total; float w=n.b,p=n.r*n.g; \n"
+           " float q0=(((((((14.5330356895*w-25.5682414785)*w-13.7465695335)*w+56.3828756991)*w-42.760790975)*w+13.1725257153)*w-2.51283511691)*w+1.0); \n"
+           " float q1=(((((-31.3753030053*w-16.6730639549)*w+125.654298402)*w-103.378434394)*w+22.7623461176)*w-1.53706708322); \n"
+           " float q2=(((140.435403979*w+97.2794791377)*w-114.074511803)*w+7.67118553227); \n"
+           " float q3=73.1408564899*w-38.0916687975; \n"
+-          " return total*(((q3*p+q2)*p+q1)*p+q0); \n"
+-          "} \n", metric);
+-    GLSLH("vec3 "$"(vec3 a,vec3 b,float t) { \n"
+-          " vec3 v=mix(a,b,t); \n"
+-          " return "$"*(sign(v)*pow(abs(v),vec3(1.0/0.43))); \n"
+-          "} \n"
+-          "bool "$"(vec3 v) {return all(greaterThanEqual("$"*v,vec3(0.0)));} \n",
+-          path, SH_MAT3(from_lms), fits, SH_MAT3(target));
++          " return total*(((q3*p+q2)*p+q1)*p+q0); } \n",*metric);
++    ident_t rgb=emit_p3d_rgb(sh,ipt2lms);
++    GLSL("float "$"="$"("$"); \n",*brightness,*metric,rgb);
++}
+ 
+-    const float peak = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, gamut->max_luma)/10000;
+-    GLSL("{ // exact original-IPT path; no interpolated 3D LUT \n"
+-         " vec3 q=pow(max("$"*ipt,0.0),vec3(1.0/%f)); \n"
+-         " vec3 l=pow(max(q-vec3(%f),0.0)/(vec3(%f)-%f*q),vec3(1.0/%f)); \n"
+-         " vec3 rgb="$"*l; vec3 dst="$"*rgb; \n"
+-         " float eps=1e-4*max(max(dst.r,dst.g),dst.b); \n"
+-         " bool chroma_ok=all(greaterThanEqual(dst,vec3(-eps))); \n"
+-         " bool peak_ok=all(lessThanEqual(dst,vec3("$")+eps)); \n"
+-         " if (!(chroma_ok && peak_ok)) { \n"
+-         "  if (!chroma_ok) { \n"
+-         "   float p="$"(rgb); \n"
+-         "   vec3 s="$"*rgb; s=sign(s)*pow(abs(s),vec3(0.43)); \n"
+-         "   vec3 g=pow(max(p,0.0),0.43)*vec3(%f,%f,%f); \n"
+-         "   float lo=0.0,hi=1.0; \n"
+-         "   for(int i=15;i>=0;i--) { \n"
+-         "    lo=float(i)/16.0; if("$"("$"(g,s,lo))) break; hi=lo; \n"
+-         "   } \n"
+-         "   for(int i=0;i<18;i++) { \n"
+-         "    float m=0.5*(lo+hi); if("$"("$"(g,s,m))) lo=m; else hi=m; \n"
+-         "   } \n"
+-         "   rgb="$"(g,s,lo*(1.0-1e-6)); \n"
+-         "   rgb*=p/max("$"(rgb),1e-30); \n"
+-         "  } \n"
+-         "  dst="$"*rgb; \n"
+-         "  rgb*=min(1.0,"$"/max(max(dst.r,dst.g),max(dst.b,1e-30))); \n"
+-         "  l=max("$"*rgb,vec3(0.0)); \n"
+-         "  q=pow(l,vec3(%f)); q=(vec3(%f)+%f*q)/(vec3(1.0)+%f*q); \n"
+-         "  ipt="$"*pow(q,vec3(%f)); \n"
++static void emit_p3d_brightness_restore(pl_shader sh, const struct pl_gamut_map_params *gamut,
++                                      ident_t metric, ident_t brightness,
++                                      ident_t ipt2lms, ident_t lms2ipt)
++{
++    const struct pl_raw_primaries *working=pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020);
++    const pl_matrix3x3 target=pl_get_color_mapping_matrix(working,&gamut->output_gamut,PL_INTENT_RELATIVE_COLORIMETRIC);
++    const pl_matrix3x3 inverse=pl_get_color_mapping_matrix(&gamut->output_gamut,working,PL_INTENT_RELATIVE_COLORIMETRIC);
++    const float peak=pl_hdr_rescale(PL_HDR_PQ,PL_HDR_NITS,gamut->max_luma)/10000;
++    ident_t rgb=emit_p3d_rgb(sh,ipt2lms);
++    GLSL("{ vec3 dst=max("$"*"$",vec3(0.0)); \n"
++         " vec3 rgb="$"*dst; float actual="$"(rgb); \n"
++         " float gain="$"/max(actual,1e-30); \n"
++         " float limit="$"/max(max(dst.r,dst.g),max(dst.b,1e-30)); \n"
++         /* Restore small P losses, but keep at least half of Softclip's
++          * remaining RGB headroom. A full-capacity asymptote can flatten
++          * gradients almost as badly as a hard cap when recovery is large.
++          * The rational shoulder is C1 at gain=1 and adds no chroma change. */
++         " if (gain>1.0) { \n"
++         "   float boost=gain-1.0, room=0.5*max(limit-1.0,0.0); \n"
++         "   gain=1.0+room*(boost/(room+boost)); \n"
+          " } \n"
+-         "} \n",
+-         ipt2lms, PQ_M2, PQ_C1, PQ_C2, PQ_C3, PQ_M1,
+-         SH_MAT3(pl_ipt_lms2rgb(working)), SH_MAT3(target), SH_FLOAT(peak),
+-         metric, SH_MAT3(to_lms), white.v[0], white.v[1], white.v[2],
+-         fits, path, fits, path, path, metric, SH_MAT3(target), SH_FLOAT(peak),
+-         SH_MAT3(pl_ipt_rgb2lms(working)), PQ_M1, PQ_C1, PQ_C2, PQ_C3,
+-         lms2ipt, PQ_M2);
++         /* Safety only: a Softclip result already beyond the target or
++          * conversion round-off still needs the ordinary uniform RGB fit. */
++         " gain=min(gain,limit); \n"
++         " rgb*=gain; \n"
++         " vec3 l=max("$"*rgb,vec3(0.0)); \n"
++         " vec3 q=pow(l,vec3(%f)); q=(vec3(%f)+%f*q)/(vec3(1.0)+%f*q); \n"
++         " ipt="$"*pow(q,vec3(%f)); } \n",SH_MAT3(target),rgb,SH_MAT3(inverse),metric,brightness,SH_FLOAT(peak),
++         SH_MAT3(pl_ipt_rgb2lms(working)),PQ_M1,PQ_C1,PQ_C2,PQ_C3,lms2ipt,PQ_M2);
+ }
