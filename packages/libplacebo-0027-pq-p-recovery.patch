@@ -1,0 +1,211 @@
+From: mpv-ht <mpv-ht@localhost>
+Date: Sun, 13 Sep 2026 00:00:00 -0400
+Subject: [PATCH] Recover detail consistently in PQ(P), bounded by RGB headroom
+
+Experimental addition after LP0026. Preserve Standard fallback in the R
+feature channel; P exclusively uses PQ(P) from G. Measure recovered first-pass
+RGB for Auto PQ and limit only the extra correction, not the baseline.
+
+---
+diff --git a/src/renderer.c b/src/renderer.c
+index abbcf37..4099f2a 100644
+--- a/src/renderer.c
++++ b/src/renderer.c
+@@ -2877,6 +2877,7 @@ static pl_tex get_feature_map(struct pass_state *pass)
+     pl_renderer rr = pass->rr;
+     const struct pl_color_map_params *cparams = params->color_map_params;
+     cparams = PL_DEF(cparams, &pl_color_map_default_params);
++    const bool p_features = cparams->tone_mapping_metric == PL_TONE_MAP_METRIC_BT2020_RGB;
+     if (!cparams->contrast_recovery || cparams->contrast_smoothness <= 1)
+         return NULL;
+     if (!pass->fbofmt[4])
+@@ -2885,8 +2886,16 @@ static pl_tex get_feature_map(struct pass_state *pass)
+         return NULL;
+     if (rr->errors & (PL_RENDER_ERR_SAMPLING | PL_RENDER_ERR_CONTRAST_RECOVERY))
+         return NULL;
+-    if (pass->img.color.hdr.max_luma <= pass->target.color.hdr.max_luma + 1e-6)
+-        return NULL; // no adaptation needed
++    if (pass->img.color.hdr.max_luma <= pass->target.color.hdr.max_luma + 1e-6) {
++        // Measured P can require compression despite a low mastering peak.
++        // Keep Standard's existing metadata gate unchanged.
++        float peak, average;
++        if (!p_features || !pl_get_detected_tone_map_range(rr->tone_map_state,
++                cparams->tone_mapping_metric, &peak, &average) ||
++            pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, peak) <=
++                pass->target.color.hdr.max_luma + 1e-6)
++            return NULL;
++    }
+     if (params->lut && params->lut_type == PL_LUT_CONVERSION)
+         return NULL; // LUT handles tone mapping
+ 
+@@ -2895,16 +2904,20 @@ static pl_tex get_feature_map(struct pass_state *pass)
+         return NULL;
+ 
+     const float ratio = cparams->contrast_smoothness;
++    const int feature_components = p_features ? 2 : 1;
+     const int cr_w = ceilf(abs(pl_rect_w(pass->dst_rect)) / ratio);
+     const int cr_h = ceilf(abs(pl_rect_h(pass->dst_rect)) / ratio);
+-    pl_tex inter_tex = get_fbo(pass, img->w, img->h, NULL, 1, PL_DEBUG_TAG);
+-    pl_tex out_tex   = get_fbo(pass, cr_w, cr_h, NULL, 1, PL_DEBUG_TAG);
++    pl_tex inter_tex = get_fbo(pass, img->w, img->h, NULL, feature_components, PL_DEBUG_TAG);
++    pl_tex out_tex   = get_fbo(pass, cr_w, cr_h, NULL, feature_components, PL_DEBUG_TAG);
+     if (!inter_tex || !out_tex)
+         goto error;
+ 
+     pl_shader sh = pl_dispatch_begin(rr->dp);
+     pl_shader_sample_direct(sh, pl_sample_src( .tex = img->tex ));
+-    pl_shader_extract_features(sh, img->color);
++    if (p_features)
++        sh_extract_p_features(sh, img->color);
++    else
++        pl_shader_extract_features(sh, img->color);
+     bool ok = pl_dispatch_finish(rr->dp, pl_dispatch_params(
+         .shader = &sh,
+         .target = inter_tex,
+@@ -2916,7 +2929,7 @@ static pl_tex get_feature_map(struct pass_state *pass)
+         .tex          = inter_tex,
+         .rect         = img->rect,
+         .address_mode = PL_TEX_ADDRESS_MIRROR,
+-        .components   = 1,
++        .components   = feature_components,
+         .new_w        = cr_w,
+         .new_h        = cr_h,
+     };
+@@ -2941,7 +2954,8 @@ error:
+ // Exact same-frame reduction. Never infer post-map peak from unrelated
+ // source maxima and never use filtered/downsampled samples that miss highlights.
+ static pl_tex measure_rgb_ray_peak(struct pass_state *pass,
+-                                  struct pl_color_space dst, bool linear)
++                                  struct pl_color_space dst, bool linear,
++                                  pl_tex feature_map)
+ {
+     const struct pl_color_map_params *cp = pass->params->color_map_params;
+     pl_renderer rr = pass->rr;
+@@ -2972,7 +2986,8 @@ static pl_tex measure_rgb_ray_peak(struct pass_state *pass,
+     sh_describe(sh, "auto PQ first-stage maxRGB");
+     pl_shader_color_map_ex(sh, cp, pl_color_map_args(
+         .src = pass->image.color, .dst = dst, .prelinearized = linear,
+-        .state = &rr->tone_map_state, .measure_rgb_ray = true));
++        .state = &rr->tone_map_state, .measure_rgb_ray = true,
++        .feature_map = feature_map));
+     if (!pl_dispatch_finish(rr->dp, pl_dispatch_params(.shader = &sh, .target = prev)))
+         goto error;
+ 
+@@ -3110,7 +3125,7 @@ static void pass_convert_colors(struct pass_state *pass)
+ 
+         // generate HDR feature map if required
+         pl_tex feature_map = get_feature_map(pass);
+-        pl_tex ray_peak = measure_rgb_ray_peak(pass, target_csp, prelinearized);
++        pl_tex ray_peak = measure_rgb_ray_peak(pass, target_csp, prelinearized, feature_map);
+         sh = img_sh(pass, img); // Feature/peak extraction may dispatch the input.
+ 
+         // current -> target
+diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
+index 61ead47..fa950c3 100644
+--- a/src/shaders/colorspace.c
++++ b/src/shaders/colorspace.c
+@@ -2687,6 +2687,76 @@ void pl_shader_extract_features(pl_shader sh, struct pl_color_space csp)
+          pl_ipt_lms2ipt.m[0][0], pl_ipt_lms2ipt.m[0][1], pl_ipt_lms2ipt.m[0][2]);
+ }
+ 
++void sh_extract_p_features(pl_shader sh, struct pl_color_space csp)
++{
++    // G is PQ(P), used exclusively by P recovery. Retain the old I in R only
++    // for Standard fallback if private peak detection is not yet available.
++    // A pending asynchronous peak result must never turn an I-only feature
++    // texture into a P lowpass reference within the same render.
++    if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
++        return;
++    ident_t metric = emit_bt2020_metric(sh, csp.primaries);
++    GLSL("{ vec4 p_feature_source = color; \n");
++    pl_shader_linearize(sh, &csp);
++    GLSL("float p_feature = "$"(color.rgb); \n"
++         "color = p_feature_source; \n", metric);
++    pl_shader_extract_features(sh, csp);
++    GLSL("color.g = p_feature; } \n");
++    sh_describe(sh, "P recovery feature extraction");
++}
++
++// Use the ordinary low-pass sampler and bicubic reconstruction, in PQ(P).
++static void emit_p_recovery(pl_shader sh, const struct pl_color_map_params *params,
++                            pl_tex feature, struct pl_color_space src,
++                            struct pl_color_space dst, float output_max)
++{
++    ident_t pos, pt;
++    ident_t tex = sh_bind(sh, feature, PL_TEX_ADDRESS_CLAMP, PL_TEX_SAMPLE_LINEAR,
++                         "p_recovery_feature", NULL, &pos, &pt);
++    GLSL("{ vec2 lpos = "$"; vec2 lpt = "$"; \n"
++         "vec2 lsize = vec2(textureSize("$",0)); \n"
++         "vec2 frac = fract(lpos*lsize+vec2(0.5)); \n"
++         "vec2 frac2 = frac*frac, inv = vec2(1.0)-frac; \n"
++         "vec2 inv2 = inv*inv; \n"
++         "vec2 w0 = 1.0/6.0*inv2*inv; \n"
++         "vec2 w1 = 2.0/3.0-0.5*frac2*(2.0-frac); \n"
++         "vec2 w2 = 2.0/3.0-0.5*inv2*(2.0-inv); \n"
++         "vec2 w3 = 1.0/6.0*frac2*frac; \n"
++         "vec4 g = vec4(w0+w1,w2+w3); \n"
++         "vec4 h = vec4(w1,w3)/g+inv.xyxy; h.xy -= vec2(2.0); \n"
++         "vec4 p = lpos.xyxy+lpt.xyxy*h; \n"
++         "float l00 = textureLod("$",p.xy,0.0).g; \n"
++         "float l01 = textureLod("$",p.xw,0.0).g; \n"
++         "float l10 = textureLod("$",p.zy,0.0).g; \n"
++         "float l11 = textureLod("$",p.zw,0.0).g; \n"
++         "float low = clamp(mix(mix(l11,l10,g.y),mix(l01,l00,g.y),g.x),0.0,1.0); \n"
++         "float delta = "$"*(tone_map(low)+(metric_in-low)-metric_out); \n",
++         pos, pt, tex, tex, tex, tex, tex,
++         SH_FLOAT(PL_CLAMP(params->contrast_recovery, 0.0f, 1.0f)));
++    const pl_matrix3x3 to_dst = pl_get_color_mapping_matrix(
++        pl_raw_primaries_get(src.primaries), pl_raw_primaries_get(dst.primaries),
++        PL_INTENT_RELATIVE_COLORIMETRIC);
++    const float target_max = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NORM, output_max);
++    // Bound only EXTRA recovery, not the underlying mapping. Existing overflow
++    // remains the second pass/ceiling's responsibility; recovery cannot raise
++    // the pre-second-pass maximum above max(base_peak, target).
++    GLSL("vec3 target_rgb = "$"*color.rgb; \n"
++         "float source_max = max(target_rgb.r,max(target_rgb.g,target_rgb.b)); \n"
++         "float v = pow(clamp(metric_in,0.0,1.0),1.0/%f); \n"
++         "float cap = pow(max(v-%f,0.0)/max(%f-%f*v,1e-9),1.0/%f); \n"
++         "cap *= min(1.0,"$"/max(source_max,1e-12)); \n"
++         "cap = pow(max(cap,0.0),%f); \n"
++         "cap = pow((%f+%f*cap)/(1.0+%f*cap),%f); \n"
++         "float upper = max(metric_out,min(metric_in,cap)); \n"
++         "float room = delta >= 0.0 ? upper-metric_out : max(metric_out-%f,0.0); \n"
++         "metric_out += room*tanh(clamp(delta/max(room,1e-8),-16.0,16.0)); \n"
++         "} \n",
++         SH_MAT3(to_dst), PQ_M2, PQ_C1, PQ_C2, PQ_C3, PQ_M1,
++         SH_FLOAT_DYN(target_max), PQ_M1, PQ_C1, PQ_C2, PQ_C3, PQ_M2,
++         powf(PQ_C1, PQ_M2));
++    sh_describe(sh, "P contrast recovery (bounded)");
++}
++
+ const struct pl_color_map_params pl_color_map_default_params = { PL_COLOR_MAP_DEFAULTS };
+ const struct pl_color_map_params pl_color_map_high_quality_params = { PL_COLOR_MAP_HQ_DEFAULTS };
+ 
+@@ -3368,6 +3438,11 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+             GLSL("float metric_in = "$"(color.rgb);                       \n"
+                  "float metric_out = tone_map(metric_in);                 \n",
+                  pixel_metric);
++            if (params->tone_mapping_metric == PL_TONE_MAP_METRIC_BT2020_RGB &&
++                need_recovery && params->contrast_recovery > 0 && args->feature_map)
++            {
++                emit_p_recovery(sh, params, args->feature_map, src, dst, tone.output_max);
++            }
+             GLSL(
+                  "float metric_in_v = pow(clamp(metric_in, 0.0, 1.0),    \n"
+                  "                          1.0/78.84375);                 \n"
+diff --git a/src/shaders.h b/src/shaders.h
+index d8c0f9c..ec72eb0 100644
+--- a/src/shaders.h
++++ b/src/shaders.h
+@@ -241,6 +241,11 @@ static inline void sh_describe(pl_shader sh, const char *desc)
+ // the given size requirements. Errors and returns false otherwise.
+ bool sh_require(pl_shader sh, enum pl_shader_sig insig, int w, int h);
+ 
++// Internal dual feature map: native intensity in R, PQ(Perceptual P) in G.
++// Keeping R intact permits the ordinary path when private peak data is absent.
++struct pl_color_space;
++void sh_extract_p_features(pl_shader sh, struct pl_color_space csp);
++
+ struct pl_dovi_metadata;
+ 
+ // Add the NLQ-decoded enhancement-layer residual to the (already reshaped)

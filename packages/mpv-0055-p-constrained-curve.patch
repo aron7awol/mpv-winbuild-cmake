@@ -1,0 +1,54 @@
+From: mpv-ht <mpv-ht@localhost>
+Date: Sun, 13 Sep 2026 00:00:00 -0400
+Subject: [PATCH] Add experimental contrast-protected common P overflow curve
+
+Apply after XY 0052, smooth P3D LP0025, HSTM 0053/LP0026 and the
+separate PQ(P) detail-recovery addition. Rebuild both mpv and FFmpeg
+against these libplacebo public headers. Not in the shipping CI selector.
+
+---
+diff --git a/video/out/gpu/video.c b/video/out/gpu/video.c
+index 1a30670..077e92d 100644
+--- a/video/out/gpu/video.c
++++ b/video/out/gpu/video.c
+@@ -481,6 +481,7 @@ const struct m_sub_options gl_video_conf = {
+         {"tone-mapping-hstm-strength", OPT_FLOAT(tone_map.hstm_strength), M_RANGE(0, 100)},
+         {"tone-mapping-hstm-overbrightening", OPT_FLOAT(tone_map.hstm_overbrightening), M_RANGE(0, 100)},
+         {"tone-mapping-auto-pq-second-pass", OPT_BOOL(tone_map.auto_pq_second_pass)},
++        {"tone-mapping-p-constrained-curve", OPT_BOOL(tone_map.p_constrained_curve)},
+         {"tone-mapping-adaptive-chroma-strength",
+             OPT_FLOAT(tone_map.adaptive_chroma_strength), M_RANGE(0.0, 100.0)},
+         {"tone-mapping-ambient-gamma",
+diff --git a/video/out/gpu/video.h b/video/out/gpu/video.h
+index f3df294..ebcf900 100644
+--- a/video/out/gpu/video.h
++++ b/video/out/gpu/video.h
+@@ -132,6 +132,7 @@ struct gl_tone_map_opts {
+     float hstm_strength, hstm_overbrightening;
+     float adaptive_chroma_strength;
+     bool auto_pq_second_pass;
++    bool p_constrained_curve;
+     float ambient_gamma;
+     float curve_param;
+     float max_boost;
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 1a7104e..f233198 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -2220,6 +2220,8 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
+         .rotation = par.rotate / 90,
+         .user_data = mpi,
+         .causal_scene_tag = fp->causal_scene_tag,
++        .p_curve_pts = mpi->pts,
++        .p_curve_pts_valid = mpi->pts != MP_NOPTS_VALUE && isfinite(mpi->pts),
+     };
+     fp->authored_scene_cut = detect_authored_scene_cut(p, &mpi->params);
+     frame->scene_cut = p->next_opts->authored_scene_reset &&
+@@ -4813,6 +4815,7 @@ AV_NOWARN_DEPRECATED(
+     pars->color_map_params.hlg_reference_peak = opts->tone_map.hlg_reference_peak;
+     pars->color_map_params.hard_clip_hdr_target = opts->target_peak > 0;
+     pars->color_map_params.auto_pq_second_pass = opts->tone_map.auto_pq_second_pass;
++    pars->color_map_params.p_constrained_curve = opts->tone_map.p_constrained_curve;
+     pars->color_map_params.inverse_tone_mapping = opts->tone_map.inverse;
+     pars->color_map_params.contrast_recovery = opts->tone_map.contrast_recovery;
+     pars->color_map_params.visualize_lut = opts->tone_map.visualize;
