@@ -1,0 +1,161 @@
+From: mpv-ht development <dev@mpv-ht.local>
+Date: Thu, 17 Sep 2026 12:00:00 -0400
+Subject: [PATCH] gpu-next: shape Analyzer backing and separate gamut guide opacity
+
+Mask only empty XY backing to the selected outer reference triangle.
+Keep measured out-of-gamut cells opaque and retain independent background opacity.
+Expose a separate inner-guide opacity and blend the strongest coverage at
+intersections in display RGB. Lua supplies saved appearance parameters.
+
+diff --git a/video/out/analyzer_async_bridge.h b/video/out/analyzer_async_bridge.h
+index b4eccc42c..5e167a706 100644
+--- a/video/out/analyzer_async_bridge.h
++++ b/video/out/analyzer_async_bridge.h
+@@ -20,7 +20,8 @@ struct async_probe {
+     struct pl_overlay *xy_overlays;
+     float xy_cap, xy_background, xy_opacity, wave_opacity;
+     float xy_outline[3], xy_outline_width;
+-    int xy_outlines;
++    float xy_outline_opacity, xy_outline_inner_opacity;
++    int xy_outlines, xy_background_mode;
+     bool xy_guides_valid;
+     pl_buf wave_buf;
+     pl_tex wave_tex;
+diff --git a/video/out/analyzer_chromaticity_bridge.h b/video/out/analyzer_chromaticity_bridge.h
+index 01cc5c381..58725da25 100644
+--- a/video/out/analyzer_chromaticity_bridge.h
++++ b/video/out/analyzer_chromaticity_bridge.h
+@@ -107,12 +107,20 @@ static bool analyzer_xy_update(struct priv *p, const struct pl_hook_params *hp,
+         {.var=pl_var_float("size"),.data=&size,.dynamic=true},
+         {.var=pl_var_float("background"),.data=&a->xy_background,.dynamic=true},
+         {.var=pl_var_float("opacity"),.data=&a->xy_opacity,.dynamic=true},
++        {.var=pl_var_int("background_mode"),.data=&a->xy_background_mode,.dynamic=true},
+     };
+     pl_shader sh=pl_dispatch_begin(hp->dispatch);
+     bool ok=pl_shader_custom(sh,&(struct pl_custom_shader){.description="Analyzer xy nearest-cell expansion",
++        .header="float side(vec2 p,vec2 a,vec2 b){return (b.x-a.x)*(p.y-a.y)-(b.y-a.y)*(p.x-a.x);}"
++                "bool inside(vec2 p,vec2 r,vec2 g,vec2 b){return side(p,r,g)>=0.&&side(p,g,b)>=0.&&side(p,b,r)>=0.;}",
+         .body="ivec2 grid=textureSize(cells,0);color=texelFetch(cells,clamp(ivec2(gl_FragCoord.xy/size*vec2(grid)),ivec2(0),grid-1),0);"
+-              "if(color.a==0.)color=vec4(vec3(background),opacity);",
+-        .input=PL_SHADER_SIG_NONE,.output=PL_SHADER_SIG_COLOR,.variables=vars,.num_variables=3,.descriptors=&image,.num_descriptors=1}) &&
++              // Mask empty backing only. Out-of-gamut measurements stay visible.
++              "if(color.a==0.){vec2 xy=vec2(gl_FragCoord.x/size*.8,(1.-gl_FragCoord.y/size)*.9);"
++              "bool fill=background_mode==0||(background_mode==1?"
++              "inside(xy,vec2(.640,.330),vec2(.300,.600),vec2(.150,.060)):"
++              "inside(xy,vec2(.708,.292),vec2(.170,.797),vec2(.131,.046)));"
++              "color=fill?vec4(vec3(background),opacity):vec4(0);}",
++        .input=PL_SHADER_SIG_NONE,.output=PL_SHADER_SIG_COLOR,.variables=vars,.num_variables=4,.descriptors=&image,.num_descriptors=1}) &&
+         pl_dispatch_finish(hp->dispatch,pl_dispatch_params(.shader=&sh,.target=a->xy_display));
+     if(!ok)pl_dispatch_abort(hp->dispatch,&sh);
+     return ok;
+@@ -134,8 +142,12 @@ static bool analyzer_xy_update_guides(struct priv *p, int raster)
+         {.var=pl_var_float("size"),.data=&size,.dynamic=true},
+         {.var=pl_var_int("outlines"),.data=&a->xy_outlines,.dynamic=true},
+         {.var=pl_var_float("outline_width"),.data=&a->xy_outline_width,.dynamic=true},
++        {.var=pl_var_float("outer_opacity"),.data=&a->xy_outline_opacity,.dynamic=true},
++        {.var=pl_var_float("inner_opacity"),.data=&a->xy_outline_inner_opacity,.dynamic=true},
+     };
+-    // Cache only coverage, independently of measured cells and OSD color.
++    // Cache coverage and separate line opacities, independently of measured
++    // cells and OSD color. Overlapping guides use the greater alpha, avoiding
++    // brighter shared vertices or double coverage along neighboring edges.
+     // A separate overlay color-maps the guide before alpha blending in the
+     // actual output encoding, preserving the displayed bin color underneath.
+     const char *lines=
+@@ -147,11 +159,12 @@ static bool analyzer_xy_update_guides(struct priv *p, int raster)
+     pl_shader sh=pl_dispatch_begin(p->bar_dispatch);
+     bool ok=pl_shader_custom(sh,&(struct pl_custom_shader){.description="Analyzer xy guide coverage",
+         .header=lines,
+-        .body="vec2 p=gl_FragCoord.xy;float d=triangle_distance(p,vec2(.640,.330),vec2(.300,.600),vec2(.150,.060));"
+-              "if(outlines>1){d=min(d,triangle_distance(p,vec2(.680,.320),vec2(.265,.690),vec2(.150,.060)));"
+-              "d=min(d,triangle_distance(p,vec2(.708,.292),vec2(.170,.797),vec2(.131,.046)));}"
+-              "color=vec4(clamp(outline_width+.5-d,0.,1.));",
+-        .input=PL_SHADER_SIG_NONE,.output=PL_SHADER_SIG_COLOR,.variables=vars,.num_variables=3}) &&
++        .body="vec2 p=gl_FragCoord.xy;float outer=triangle_distance(p,vec2(.640,.330),vec2(.300,.600),vec2(.150,.060));"
++              "float inner=0.;if(outlines>1){float d=min(outer,triangle_distance(p,vec2(.680,.320),vec2(.265,.690),vec2(.150,.060)));"
++              "inner=inner_opacity*clamp(outline_width+.5-d,0.,1.);"
++              "outer=triangle_distance(p,vec2(.708,.292),vec2(.170,.797),vec2(.131,.046));}"
++              "color=vec4(max(inner,outer_opacity*clamp(outline_width+.5-outer,0.,1.)));",
++        .input=PL_SHADER_SIG_NONE,.output=PL_SHADER_SIG_COLOR,.variables=vars,.num_variables=5}) &&
+         pl_dispatch_finish(p->bar_dispatch,pl_dispatch_params(.shader=&sh,.target=a->xy_guides));
+     if(!ok)pl_dispatch_abort(p->bar_dispatch,&sh);
+     a->xy_guides_valid=ok;
+@@ -171,8 +184,11 @@ static void analyzer_xy_prepare(struct priv *p, struct pl_frame *target, struct
+     // occupied cells retain fully opaque, color-managed source RGB.
+     float background=(8.f/255.f/12.92f)*osd.hdr.max_luma/203.f;
+     float opacity=p->next_opts->analyzer_background_opacity;
++    int background_mode=p->next_opts->analyzer_xy_background;
+     int outlines=p->next_opts->analyzer_xy_outlines;
+     float outline_width=p->next_opts->analyzer_xy_outline_width;
++    float outline_opacity=p->next_opts->analyzer_xy_outline_opacity;
++    float inner_opacity=p->next_opts->analyzer_xy_outline_inner_opacity;
+     int rgb=p->next_opts->analyzer_xy_outline_color;
+     float outline[3];
+     for(int i=0;i<3;i++){
+@@ -182,11 +198,14 @@ static void analyzer_xy_prepare(struct priv *p, struct pl_frame *target, struct
+     pl_matrix3x3 map=pl_get_color_mapping_matrix(pl_raw_primaries_get(PL_COLOR_PRIM_BT_709),
+         pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020),PL_INTENT_RELATIVE_COLORIMETRIC);
+     pl_matrix3x3_apply(&map,outline);
+-    if(cap!=a->xy_cap || background!=a->xy_background || opacity!=a->xy_opacity){
++    if(cap!=a->xy_cap || background!=a->xy_background || opacity!=a->xy_opacity || background_mode!=a->xy_background_mode){
+         a->xy_cap=cap;a->xy_background=background;a->xy_opacity=opacity;a->last_stats_revision=0;
++        a->xy_background_mode=background_mode;
+     }
+-    if(outlines!=a->xy_outlines || outline_width!=a->xy_outline_width){
++    if(outlines!=a->xy_outlines || outline_width!=a->xy_outline_width ||
++       outline_opacity!=a->xy_outline_opacity || inner_opacity!=a->xy_outline_inner_opacity){
+         a->xy_outlines=outlines;a->xy_outline_width=outline_width;
++        a->xy_outline_opacity=outline_opacity;a->xy_outline_inner_opacity=inner_opacity;
+         a->xy_guides_valid=false;
+     }
+     memcpy(a->xy_outline,outline,sizeof(outline));
+@@ -206,7 +225,7 @@ static void analyzer_xy_prepare(struct priv *p, struct pl_frame *target, struct
+     bool resized=!a->xy_display || a->xy_display->params.w!=raster;
+     if(resized){
+         if(!pl_tex_recreate(p->gpu,&a->xy_display,pl_tex_params(.w=raster,.h=raster,.format=fmt,.sampleable=true,.renderable=true,.blit_dst=true)))return;
+-        pl_tex_clear(p->gpu,a->xy_display,(float[4]){background,background,background,opacity});
++        pl_tex_clear(p->gpu,a->xy_display,(float[4]){0});
+         a->last_stats_revision=0;
+     }
+     if(fresh || resized)MP_VERBOSE(p,"Analyzer xy grid %d, cell %d px, raster %d\n",grid,cell,raster);
+@@ -239,7 +258,7 @@ static void analyzer_xy_prepare(struct priv *p, struct pl_frame *target, struct
+     if(guides){
+         a->xy_guide_part=a->xy_part;
+         memcpy(a->xy_guide_part.color,a->xy_outline,sizeof(a->xy_outline));
+-        a->xy_guide_part.color[3]=p->next_opts->analyzer_xy_outline_opacity;
++        a->xy_guide_part.color[3]=1.f; // Opacity is in the cached guide mask.
+         a->xy_overlays[1]=a->xy_overlays[0];
+         a->xy_overlays[1].tex=a->xy_guides;
+         a->xy_overlays[1].mode=PL_OVERLAY_MONOCHROME;
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 9ce367fea..683e6764a 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -266,8 +266,9 @@ struct gl_next_opts {
+     float analyzer_waveform_peak;
+     int analyzer_xy_x, analyzer_xy_y, analyzer_xy_size, analyzer_xy_intensity;
+     int analyzer_xy_cell_size;
+-    int analyzer_xy_outlines, analyzer_xy_outline_color;
++    int analyzer_xy_outlines, analyzer_xy_outline_color, analyzer_xy_background;
+     float analyzer_xy_outline_width, analyzer_xy_outline_opacity;
++    float analyzer_xy_outline_inner_opacity;
+     int analyzer_xy_clip_top, analyzer_xy_clip_height;
+     int analyzer_xy_clip_left, analyzer_xy_clip_width;
+     bool delayed_peak;
+@@ -335,6 +336,8 @@ const struct m_sub_options gl_next_conf = {
+         {"analyzer-xy-outlines", OPT_INT(analyzer_xy_outlines), M_RANGE(0, 2)},
+         {"analyzer-xy-outline-width", OPT_FLOAT(analyzer_xy_outline_width), M_RANGE(0, 8)},
+         {"analyzer-xy-outline-opacity", OPT_FLOAT(analyzer_xy_outline_opacity), M_RANGE(0, 1)},
++        {"analyzer-xy-outline-inner-opacity", OPT_FLOAT(analyzer_xy_outline_inner_opacity), M_RANGE(0, 1)},
++        {"analyzer-xy-background", OPT_INT(analyzer_xy_background), M_RANGE(0, 2)},
+         {"analyzer-xy-outline-color", OPT_INT(analyzer_xy_outline_color), M_RANGE(0, 0xffffff)},
+         {"analyzer-xy-clip-left", OPT_INT(analyzer_xy_clip_left), M_RANGE(0, 4096)},
+         {"analyzer-xy-clip-width", OPT_INT(analyzer_xy_clip_width), M_RANGE(0, 4096)},
+@@ -386,6 +389,7 @@ const struct m_sub_options gl_next_conf = {
+         .analyzer_xy_cell_size = 2,
+         .analyzer_xy_outline_width = .5f,
+         .analyzer_xy_outline_opacity = .7f,
++        .analyzer_xy_outline_inner_opacity = .3f,
+         .analyzer_xy_outline_color = 0xffffff,
+         .active_image_detection = true,
+         .border_background = BACKGROUND_COLOR,
