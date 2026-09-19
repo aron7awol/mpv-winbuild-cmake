@@ -1,0 +1,128 @@
+From: mpv-ht <mpv-ht@localhost>
+Date: Sat, 19 Sep 2026 17:00:00 -0400
+Subject: [PATCH] Make smooth shadow protection optional and invalidate cached shaping
+
+Preserve the smooth 0.1-1 nit protection by default. Allow shaping all
+the way to black when disabled, without changing endpoint constraints.
+Report the choice in tone-curve telemetry and refresh cached LUTs.
+
+---
+diff --git a/src/shaders/hstm.h b/src/shaders/hstm.h
+index aa8f491..fbef2a5 100644
+--- a/src/shaders/hstm.h
++++ b/src/shaders/hstm.h
+@@ -89,7 +89,8 @@ static inline float hstm_shadow_weight(float nits)
+ static inline void hstm_shape_curve(const float hist[HSTM_BINS],
+                                     const float *input, const float *base,
+                                     float *out, float *scratch, int n,
+-                                    float strength, float brightening)
++                                    float strength, float brightening,
++                                    bool protect_shadows)
+ {
+     if (n < 2) return;
+     strength = hstm_clamp(strength, 0, 1);
+@@ -99,7 +100,7 @@ static inline void hstm_shape_curve(const float hist[HSTM_BINS],
+         return;
+     }
+     int anchor = 0;
+-    while (anchor + 1 < n && input[anchor + 1] <= 0.1f) anchor++;
++    while (protect_shadows && anchor + 1 < n && input[anchor + 1] <= 0.1f) anchor++;
+     const float lower = hstm_coord(base[anchor]);
+     scratch[anchor] = 0;
+     float previous = lower, shaped_span = 0;
+@@ -110,7 +111,8 @@ static inline void hstm_shape_curve(const float hist[HSTM_BINS],
+         // Log softens large populations; clamp bounds local slope allocation.
+         const float weight = hstm_clamp(0.5f + log1pf(8.0f*density) / logf(9.0f),
+                                         0.5f, 4.0f);
+-        const float span = (current - previous) * hstm_shadow_weight(p);
++        const float span = (current - previous) *
++            (protect_shadows ? hstm_shadow_weight(p) : 1);
+         shaped_span += span;
+         scratch[i] = scratch[i - 1] + span * weight;
+         previous = current;
+@@ -128,7 +130,8 @@ static inline void hstm_shape_curve(const float hist[HSTM_BINS],
+             // Retain previous before writing out[i], since base may alias out.
+             const float current = fmaxf(previous, hstm_coord(base[i]));
+             const float p = sqrtf(fmaxf(input[i - 1], 0) * fmaxf(input[i], 0));
+-            fixed += (current - previous) * (1 - hstm_shadow_weight(p));
++            if (protect_shadows)
++                fixed += (current - previous) * (1 - hstm_shadow_weight(p));
+             const float target = fixed + scratch[i] * scale;
+             previous = current;
+             candidate = hstm_nits(hstm_coord(base[i]) * (1 - strength)
+diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
+index 22c8b8e..1194551 100644
+--- a/src/shaders/colorspace.c
++++ b/src/shaders/colorspace.c
+@@ -2941,6 +2941,7 @@ struct hstm_lut_data {
+     const struct pl_tone_map_params *tone;
+     const float *hist;
+     float strength, brightening;
++    bool protect_shadows;
+     struct sh_color_map_obj *record;
+ };
+ 
+@@ -2972,7 +2973,7 @@ static void fill_tone_lut(void *data, const struct sh_lut_params *params)
+         base[i] = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, out[i]);
+     }
+     hstm_shape_curve(ctx->hist, input, base, base, scratch, n,
+-                     ctx->strength, ctx->brightening);
++                     ctx->strength, ctx->brightening, ctx->protect_shadows);
+     for (int i = 0; i < n; i++)
+         out[i] = pl_hdr_rescale(PL_HDR_NITS, PL_HDR_PQ, base[i]);
+     pl_free(tmp);
+@@ -2995,6 +2996,7 @@ static void record_tone_curve(struct pl_tone_curve *out,
+     out->hstm_active = hstm;
+     out->strength = params->hstm_strength;
+     out->overbrightening = params->hstm_overbrightening;
++    out->near_black_protection = params->hstm_near_black_protection;
+     out->source_peak = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, tone->input_max);
+     out->target_peak = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, tone->output_max);
+     for (int i = 0; i < PL_TONE_CURVE_SAMPLES; i++) {
+@@ -3269,6 +3271,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+             pl_hash_merge(&hstm_signature, pl_var_hash(obj->peak.hstm_hist[i]));
+         pl_hash_merge(&hstm_signature, pl_var_hash(params->hstm_strength));
+         pl_hash_merge(&hstm_signature, pl_var_hash(params->hstm_overbrightening));
++        pl_hash_merge(&hstm_signature, pl_var_hash(params->hstm_near_black_protection));
+     }
+     bool can_fast = !params->force_tone_mapping_lut && !hstm_active;
+     if (!args->state) {
+@@ -3405,6 +3408,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+                 .tone = &tone, .hist = hstm_active ? obj->peak.hstm_hist : NULL,
+                 .strength = params->hstm_strength,
+                 .brightening = params->hstm_overbrightening,
++                .protect_shadows = params->hstm_near_black_protection,
+                 .record = curve ? obj : NULL,
+             };
+             if (hstm_active) sh_describe(sh, "HSTM(P)");
+diff --git a/src/include/libplacebo/shaders/colorspace.h b/src/include/libplacebo/shaders/colorspace.h
+index 72e485e..f0e9c9d 100644
+--- a/src/include/libplacebo/shaders/colorspace.h
++++ b/src/include/libplacebo/shaders/colorspace.h
+@@ -360,6 +360,9 @@ struct pl_color_map_params {
+     // Defaults off. At full retention above-source gain is bounded to 2x.
+     float hstm_strength;
+     float hstm_overbrightening;
++    // Retain the near-black base slope and fade shaping in from 0.1 to 1 nit.
++    // False allows redistribution down to black; source/peak limits still apply.
++    bool hstm_near_black_protection;
+ 
+     // --- Tone mapping options
+ 
+@@ -466,6 +469,7 @@ struct pl_color_map_params {
+     .tone_constants         = { PL_TONE_MAP_CONSTANTS },        \
+     .metadata               = PL_HDR_METADATA_ANY,              \
+     .adaptive_chroma_strength = 0.5f,                           \
++    .hstm_near_black_protection = true,                         \
+     .ambient_gamma          = 1.0f,                             \
+     .lut3d_size             = {48, 32, 256},                    \
+     .lut_size               = 256,                              \
+@@ -489,7 +493,7 @@ PL_API extern const struct pl_color_map_params pl_color_map_high_quality_params;
+ // or from the exact analytic fast path. This is not a final RGB transfer curve.
+ #define PL_TONE_CURVE_SAMPLES 256
+ struct pl_tone_curve {
+-    bool valid, identity, hstm_active;
++    bool valid, identity, hstm_active, near_black_protection;
+     enum pl_tone_map_metric metric;
+     const char *function;
+     float source_peak, target_peak, strength, overbrightening;

@@ -1,0 +1,80 @@
+From: mpv-ht <mpv-ht@localhost>
+Date: Sat, 19 Sep 2026 18:00:00 -0400
+Subject: [PATCH] Smooth the near-black entry into histogram contrast shaping
+
+Retain the base slope below 0.1 input nits and fade positive slope
+redistribution in through 1 nit. Normalize only the redistributed span
+so the protected slope and peak endpoint are both retained. Keep existing
+source-gain and Overbrightening limits. Support aliased base/output LUTs.
+
+---
+diff --git a/src/shaders/hstm.h b/src/shaders/hstm.h
+index 41f5bfb..aa8f491 100644
+--- a/src/shaders/hstm.h
++++ b/src/shaders/hstm.h
+@@ -67,9 +67,22 @@ static inline float hstm_density(const float hist[HSTM_BINS], float nits)
+     return (hist[lo] + (p - lo) * (hist[hi] - hist[lo])) * HSTM_BINS;
+ }
+ 
++/* Bring in slope redistribution over one decade of input brightness. Both
++ * derivatives of the quintic vanish at the ends, avoiding a new corner where
++ * near-black protection starts or ends. This blends positive slopes, not the
++ * completed curves: blending the latter can introduce a negative slope. */
++static inline float hstm_shadow_weight(float nits)
++{
++    if (nits <= 0.1f) return 0;
++    if (nits >= 1.0f) return 1;
++    const float t = log10f(nits / 0.1f);
++    return hstm_clamp(t*t*t * (t * (6*t - 15) + 10), 0, 1);
++}
++
+ /* input/base/out contain linear P in nits on the same monotonic input grid.
+  * Redistribute the base curve's log-brightness increments, then normalize its
+- * endpoints. Positive bounded weights preserve order. Near-black is anchored.
++ * endpoints. Positive bounded weights preserve order. Near-black retains its
++ * base slope, with a smooth transition to full redistribution from 0.1 to 1 nit.
+  * Above-source retention is a separate final operation and never affects an
+  * already dimmed value. At 100%, maximum above-source gain is 2x (one stop).
+  * The caller supplies scratch[n] and may alias base and out. */
+@@ -88,9 +101,8 @@ static inline void hstm_shape_curve(const float hist[HSTM_BINS],
+     int anchor = 0;
+     while (anchor + 1 < n && input[anchor + 1] <= 0.1f) anchor++;
+     const float lower = hstm_coord(base[anchor]);
+-    const float upper = hstm_coord(base[n - 1]);
+     scratch[anchor] = 0;
+-    float previous = lower;
++    float previous = lower, shaped_span = 0;
+     for (int i = anchor + 1; i < n; i++) {
+         const float current = fmaxf(previous, hstm_coord(base[i]));
+         const float p = sqrtf(fmaxf(input[i - 1], 0) * fmaxf(input[i], 0));
+@@ -98,16 +110,27 @@ static inline void hstm_shape_curve(const float hist[HSTM_BINS],
+         // Log softens large populations; clamp bounds local slope allocation.
+         const float weight = hstm_clamp(0.5f + log1pf(8.0f*density) / logf(9.0f),
+                                         0.5f, 4.0f);
+-        scratch[i] = scratch[i - 1] + (current - previous) * weight;
++        const float span = (current - previous) * hstm_shadow_weight(p);
++        shaped_span += span;
++        scratch[i] = scratch[i - 1] + span * weight;
+         previous = current;
+     }
++    // Normalize only the redistributed span. Scaling the complete curve would
++    // change the protected slope at the anchor and recreate the original kink.
+     const float scale = scratch[n - 1] > 1e-12f
+-        ? (upper - lower) / scratch[n - 1] : 0;
++        ? shaped_span / scratch[n - 1] : 0;
+     const float ceiling = base[n - 1];
++    float fixed = lower;
++    previous = lower;
+     for (int i = 0; i < n; i++) {
+         float candidate = base[i];
+         if (i > anchor) {
+-            const float target = lower + scratch[i] * scale;
++            // Retain previous before writing out[i], since base may alias out.
++            const float current = fmaxf(previous, hstm_coord(base[i]));
++            const float p = sqrtf(fmaxf(input[i - 1], 0) * fmaxf(input[i], 0));
++            fixed += (current - previous) * (1 - hstm_shadow_weight(p));
++            const float target = fixed + scratch[i] * scale;
++            previous = current;
+             candidate = hstm_nits(hstm_coord(base[i]) * (1 - strength)
+                                   + strength * target);
+         }

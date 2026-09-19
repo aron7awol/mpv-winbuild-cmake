@@ -1,0 +1,246 @@
+From: mpv-ht <mpv-ht@localhost>
+Date: Sat, 19 Sep 2026 18:00:00 -0400
+Subject: [PATCH] Recover constrained highlight detail with bounded local darkening
+
+Measure blocked positive PQ(P) detail with the actual first-stage curve,
+filter a same-frame local budget, and suppress hard-edge borrowing.
+Bound extra loss to 10% of ordinary recovered P times recovery strength.
+Keep existing upper bounds, inactive paths and fixed RGB chromaticity.
+Use the same budget before overflow measurement and final rendering.
+
+---
+diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
+index 1194551..a9ac0b3 100644
+--- a/src/shaders/colorspace.c
++++ b/src/shaders/colorspace.c
+@@ -2710,11 +2710,11 @@ void sh_extract_p_features(pl_shader sh, struct pl_color_space csp)
+ 
+ // Use the ordinary low-pass sampler and bicubic reconstruction, in PQ(P).
+ static void emit_p_recovery(pl_shader sh, const struct pl_color_map_params *params,
+-                            pl_tex feature, struct pl_color_space src,
++                            const struct pl_color_map_args *args, struct pl_color_space src,
+                             struct pl_color_space dst, float output_max)
+ {
+     ident_t pos, pt;
+-    ident_t tex = sh_bind(sh, feature, PL_TEX_ADDRESS_CLAMP, PL_TEX_SAMPLE_LINEAR,
++    ident_t tex = sh_bind(sh, args->feature_map, PL_TEX_ADDRESS_CLAMP, PL_TEX_SAMPLE_LINEAR,
+                          "p_recovery_feature", NULL, &pos, &pt);
+     GLSL("{ vec2 lpos = "$"; vec2 lpt = "$"; \n"
+          "vec2 lsize = vec2(textureSize("$",0)); \n"
+@@ -2750,13 +2750,70 @@ static void emit_p_recovery(pl_shader sh, const struct pl_color_map_params *para
+          "cap *= min(1.0,"$"/max(source_max,1e-12)); \n"
+          "cap = pow(max(cap,0.0),%f); \n"
+          "cap = pow((%f+%f*cap)/(1.0+%f*cap),%f); \n"
+-         "float upper = max(metric_out,min(metric_in,cap)); \n"
+-         "float room = delta >= 0.0 ? upper-metric_out : max(metric_out-%f,0.0); \n"
+-         "metric_out += room*tanh(clamp(delta/max(room,1e-8),-16.0,16.0)); \n"
+-         "} \n",
++         "float upper = max(metric_out,min(metric_in,cap)); \n",
+          SH_MAT3(to_dst), PQ_M2, PQ_C1, PQ_C2, PQ_C3, PQ_M1,
+-         SH_FLOAT_DYN(target_max), PQ_M1, PQ_C1, PQ_C2, PQ_C3, PQ_M2,
++         SH_FLOAT_DYN(target_max), PQ_M1, PQ_C1, PQ_C2, PQ_C3, PQ_M2);
++
++    if (args->measure_p_recovery) {
++        // Smooth onset, exact zero with enough headroom (including a constant
++        // field). Do not feed a soft limiter's ordinary compression back into
++        // recovery, or even well below the ceiling the whole frame would dim.
++        GLSL("float lost = max(delta-(upper-metric_out),0.0); \n"
++             "lost = lost*lost/(lost+1e-5); \n"
++             "lost *= 1.0-smoothstep(0.008,0.02,abs(metric_in-low)); \n"
++             "color = vec4(lost,metric_in,0.0,1.0); } \n");
++        *args->measure_p_recovery = true;
++        sh_describe(sh, "P recovery blocked-detail measurement");
++        return;
++    }
++
++    GLSL("float room = delta >= 0.0 ? upper-metric_out : max(metric_out-%f,0.0); \n"
++         "float recovered = metric_out+room*tanh(clamp(delta/max(room,1e-8),-16.0,16.0)); \n",
+          powf(PQ_C1, PQ_M2));
++    if (args->p_recovery_map) {
++        ident_t bp, bpt;
++        ident_t budget = sh_bind(sh, args->p_recovery_map, PL_TEX_ADDRESS_CLAMP,
++            PL_TEX_SAMPLE_LINEAR, "p_recovery_budget", NULL, &bp, &bpt);
++        // A compact, positive filter spreads blocked bright detail over its
++        // own neighborhood. Reject dissimilar PQ levels to avoid spreading
++        // the bias across a strong edge. There is no temporal accumulator.
++        GLSL("float lost_sum=0.0, weight_sum=0.0, edge=0.0; \n"
++             "for(int y=-1;y<=1;y++) for(int x=-1;x<=1;x++) { \n"
++             " vec2 b=textureLod("$", "$"+vec2(x,y)*"$",0.0).rg; \n"
++             " float w=float((2-abs(x))*(2-abs(y))); \n"
++             " edge=max(edge,abs(b.g-metric_in)); \n"
++             " w*=1.0-smoothstep(0.01,0.03,abs(b.g-metric_in)); \n"
++             " lost_sum+=w*max(b.r,0.0); weight_sum+=w; } \n"
++             // Look just outside the budget footprint too. A bright side's
++             // averaged guide can already look flat while its budget still
++             // contains blocked corrections from the adjacent hard edge.
++             "for(int i=0;i<4;i++) { \n"
++             " vec2 o=i==0 ? vec2(-3,0) : i==1 ? vec2(3,0) : i==2 ? vec2(0,-3) : vec2(0,3); \n"
++             " float q=textureLod("$", "$"+o*"$",0.0).g; \n"
++             " edge=max(edge,abs(q-metric_in)); } \n"
++             "float bias=2.0*lost_sum/max(weight_sum,1e-8); \n"
++             "bias*=1.0-smoothstep(0.01,0.03,edge); \n"
++             // Bound ADDITIONAL dimming relative to ordinary recovery, in
++             // linear P: at most 10% at strength 1, 2.5% at strength .25.
++             // The existing recovery curve is 1-Lipschitz in delta on either
++             // side of zero, so limiting the PQ bias also bounds its output.
++             "float rv=pow(clamp(recovered,0.0,1.0),1.0/%f); \n"
++             "float floor_p=pow(max(rv-%f,0.0)/max(%f-%f*rv,1e-9),1.0/%f); \n"
++             "floor_p*=1.0-"$"; \n"
++             "floor_p=pow(max(floor_p,0.0),%f); \n"
++             "floor_p=pow((%f+%f*floor_p)/(1.0+%f*floor_p),%f); \n"
++             "float allowance=max(recovered-floor_p,0.0); \n"
++             "bias=allowance*tanh(clamp(bias/max(allowance,1e-8),0.0,16.0)); \n"
++             "delta-=bias; \n"
++             "room=delta>=0.0 ? upper-metric_out : max(metric_out-%f,0.0); \n"
++             "float shifted=metric_out+room*tanh(clamp(delta/max(room,1e-8),-16.0,16.0)); \n"
++             "recovered=min(recovered,max(shifted,min(floor_p,recovered))); \n",
++             budget, bp, bpt, budget, bp, bpt, PQ_M2, PQ_C1, PQ_C2, PQ_C3, PQ_M1,
++             SH_FLOAT(0.10f * PL_CLAMP(params->contrast_recovery, 0.0f, 1.0f)),
++             PQ_M1, PQ_C1, PQ_C2, PQ_C3, PQ_M2, powf(PQ_C1, PQ_M2));
++        sh_describe(sh, "P recovery bounded local darkening");
++    }
++    GLSL("metric_out=recovered; } \n");
+     sh_describe(sh, "P contrast recovery (bounded)");
+ }
+ 
+@@ -3054,6 +3111,8 @@ static void fill_gamut_lut(void *data, const struct sh_lut_params *params)
+ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *params,
+                             const struct pl_color_map_args *args)
+ {
++    if (args->measure_p_recovery)
++        *args->measure_p_recovery = false;
+     if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
+         return;
+ 
+@@ -3536,7 +3595,11 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+             if (params->tone_mapping_metric == PL_TONE_MAP_METRIC_BT2020_RGB &&
+                 need_recovery && params->contrast_recovery > 0 && args->feature_map)
+             {
+-                emit_p_recovery(sh, params, args->feature_map, src, dst, tone.output_max);
++                emit_p_recovery(sh, params, args, src, dst, tone.output_max);
++                if (args->measure_p_recovery) {
++                    GLSL("#undef tone_map \n } \n");
++                    return;
++                }
+             }
+             GLSL(
+                  "float metric_in_v = pow(clamp(metric_in, 0.0, 1.0),    \n"
+diff --git a/src/renderer.c b/src/renderer.c
+index a81bb3a..68857a5 100644
+--- a/src/renderer.c
++++ b/src/renderer.c
+@@ -2964,11 +2964,68 @@ error:
+     return NULL;
+ }
+ 
++// Use the exact first-stage curve/headroom calculation to measure detail
++// that could not be brightened. Low-pass only this nonnegative budget and
++// its PQ(P) guide; never feed recovered output back into the source features.
++static pl_tex get_p_recovery_map(struct pass_state *pass,
++                                struct pl_color_space dst, bool linear,
++                                pl_tex feature_map)
++{
++    const struct pl_color_map_params *cp = pass->params->color_map_params;
++    pl_renderer rr = pass->rr;
++    float peak, avg;
++    if (!feature_map || !cp || cp->contrast_recovery <= 0 ||
++        cp->tone_mapping_metric != PL_TONE_MAP_METRIC_BT2020_RGB ||
++        !pl_get_detected_tone_map_range(rr->tone_map_state,
++                                       cp->tone_mapping_metric, &peak, &avg))
++        return NULL;
++
++    pl_tex src = img_tex(pass, &pass->img);
++    if (!src)
++        return NULL;
++    pl_tex measured = get_fbo(pass, src->params.w, src->params.h, NULL, 2, PL_DEBUG_TAG);
++    pl_tex out = get_fbo(pass, feature_map->params.w, feature_map->params.h,
++                         NULL, 2, PL_DEBUG_TAG);
++    pl_shader sh = NULL;
++    if (!measured || !out)
++        goto error;
++    sh = pl_dispatch_begin(rr->dp);
++    pl_shader_sample_direct(sh, pl_sample_src(.tex = src));
++    bool supported = false;
++    pl_shader_color_map_ex(sh, cp, pl_color_map_args(
++        .src = pass->image.color, .dst = dst, .prelinearized = linear,
++        .state = &rr->tone_map_state, .feature_map = feature_map,
++        .measure_p_recovery = &supported));
++    if (!supported) {
++        // Identity, inverse and unavailable-P paths keep ordinary recovery.
++        pl_dispatch_abort(rr->dp, &sh);
++        return NULL;
++    }
++    if (!pl_dispatch_finish(rr->dp, pl_dispatch_params(.shader = &sh, .target = measured)))
++        goto error;
++    const struct pl_sample_src sample = {
++        .tex = measured, .address_mode = PL_TEX_ADDRESS_MIRROR, .components = 2,
++        .rect = {0, 0, measured->params.w, measured->params.h},
++        .new_w = out->params.w, .new_h = out->params.h,
++    };
++    sh = pl_dispatch_begin(rr->dp);
++    sh_describe(sh, "P recovery local budget lowpass");
++    dispatch_sampler(pass, sh, &rr->sampler_contrast, SAMPLER_LOWPASS, out, &sample);
++    if (!pl_dispatch_finish(rr->dp, pl_dispatch_params(.shader = &sh, .target = out)))
++        goto error;
++    return out;
++
++error:
++    pl_dispatch_abort(rr->dp, &sh);
++    PL_ERR(rr, "P recovery budget unavailable; retaining ordinary bounded recovery");
++    return NULL;
++}
++
+ // Exact same-frame reduction. Never infer post-map peak from unrelated
+ // source maxima and never use filtered/downsampled samples that miss highlights.
+ static pl_tex measure_rgb_ray_peak(struct pass_state *pass,
+                                   struct pl_color_space dst, bool linear,
+-                                  pl_tex feature_map)
++                                  pl_tex feature_map, pl_tex p_recovery_map)
+ {
+     const struct pl_color_map_params *cp = pass->params->color_map_params;
+     pl_renderer rr = pass->rr;
+@@ -3005,7 +3062,7 @@ static pl_tex measure_rgb_ray_peak(struct pass_state *pass,
+         .src = pass->image.color, .dst = dst, .prelinearized = linear,
+         .state = &rr->tone_map_state, .measure_rgb_ray = true,
+         .measure_p_curve = p_curve,
+-        .feature_map = feature_map));
++        .feature_map = feature_map, .p_recovery_map = p_recovery_map));
+     if (!pl_dispatch_finish(rr->dp, pl_dispatch_params(.shader = &sh, .target = prev)))
+         goto error;
+ 
+@@ -3163,7 +3220,9 @@ static void pass_convert_colors(struct pass_state *pass)
+ 
+         // generate HDR feature map if required
+         pl_tex feature_map = get_feature_map(pass);
+-        pl_tex ray_peak = measure_rgb_ray_peak(pass, target_csp, prelinearized, feature_map);
++        pl_tex p_recovery_map = get_p_recovery_map(pass, target_csp, prelinearized, feature_map);
++        pl_tex ray_peak = measure_rgb_ray_peak(pass, target_csp, prelinearized,
++                                              feature_map, p_recovery_map);
+         sh = img_sh(pass, img); // Feature/peak extraction may dispatch the input.
+ 
+         // current -> target
+@@ -3175,6 +3234,7 @@ static void pass_convert_colors(struct pass_state *pass)
+             .tone_curve    = params->color_map_params && params->color_map_params->report_tone_curve
+                                 ? &rr->tone_curve : NULL,
+             .feature_map   = feature_map,
++            .p_recovery_map = p_recovery_map,
+             .rgb_ray_peak  = params->color_map_params && params->color_map_params->p_constrained_curve ? NULL : ray_peak,
+             .p_curve       = params->color_map_params && params->color_map_params->p_constrained_curve ? ray_peak : NULL,
+         ));
+diff --git a/src/include/libplacebo/shaders/colorspace.h b/src/include/libplacebo/shaders/colorspace.h
+index f0e9c9d..a35e106 100644
+--- a/src/include/libplacebo/shaders/colorspace.h
++++ b/src/include/libplacebo/shaders/colorspace.h
+@@ -531,6 +531,12 @@ struct pl_color_map_args {
+     pl_tex rgb_ray_peak;
+     bool measure_p_curve; // RG32: target-linear maxRGB (normalized), P nits
+     pl_tex p_curve;       // 128 clamped cubic B-spline log2-loss coefficients
++
++    // Renderer-private, same-frame P recovery budget. When non-NULL, request
++    // RG = blocked positive correction / source PQ(P), and report whether
++    // that path was emitted. Unsupported paths must not be used as a budget.
++    bool *measure_p_recovery;
++    pl_tex p_recovery_map;
+ };
+ 
+ #define pl_color_map_args(...) (&(struct pl_color_map_args) { __VA_ARGS__ })

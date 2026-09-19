@@ -1,0 +1,56 @@
+From: mpv-ht <mpv-ht@localhost>
+Date: Sat, 19 Sep 2026 00:00:00 -0400
+Subject: [PATCH] Keep histogram shaping separate from destination RGB fitting
+
+Remove the HSTM-only per-pixel RGB headroom cap from rendering and overflow
+measurement. It causes brightness-order reversals across saturated highlights
+and an abrupt change at arbitrarily small positive shaping strength. Keep the
+monotonic P curve and bounded above-source gain; the ordinary overflow and
+gamut stages retain their existing ownership.
+
+---
+diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
+index 85456a70..4f83d9c8 100644
+--- a/src/shaders/colorspace.c
++++ b/src/shaders/colorspace.c
+@@ -3465,6 +3465,10 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+ 
+             if (hstm_active) {
+                 // Bound final P gain even between interpolated LUT samples.
++                // Destination RGB fitting belongs to the ordinary overflow and
++                // gamut stages. A per-pixel RGB headroom cap here can reverse
++                // highlight ordering as chromaticity changes, and would hide
++                // the overflow from the measurement pass below.
+                 GLSL("metric_scale = min(metric_scale, "$"); \n",
+                      SH_FLOAT_DYN(1.0f + hstm_clamp(params->hstm_overbrightening, 0, 1)));
+             }
+@@ -3481,11 +3485,6 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+                         pl_raw_primaries_get(src.primaries),
+                         pl_raw_primaries_get(dst.primaries),
+                         PL_INTENT_RELATIVE_COLORIMETRIC);
+-                    if (hstm_active && (args->measure_p_curve || args->p_curve)) {
+-                        GLSL("vec3 pc_hstm_dst = "$" * color.rgb; \n"
+-                             "metric_scale = min(metric_scale, "$" / max(max(max(pc_hstm_dst.r,pc_hstm_dst.g),pc_hstm_dst.b),1e-12)); \n",
+-                             SH_MAT3(to_dst), SH_FLOAT_DYN(pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NORM, tone.output_max)));
+-                    }
+                     GLSL("vec3 ray_dst = "$" * (color.rgb * metric_scale); \n"
+                          "float ray_max = max(max(ray_dst.r, ray_dst.g), ray_dst.b); \n",
+                          SH_MAT3(to_dst));
+@@ -3531,17 +3530,6 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+                          PQ_M2, PQ_C1, PQ_C2, PQ_C3, PQ_M1, 10000/PL_COLOR_SDR_WHITE);
+                     }
+                 }
+-                if (hstm_active) {
+-                    const pl_matrix3x3 hstm_to_dst = pl_get_color_mapping_matrix(
+-                        pl_raw_primaries_get(src.primaries),
+-                        pl_raw_primaries_get(dst.primaries),
+-                        PL_INTENT_RELATIVE_COLORIMETRIC);
+-                    GLSL("vec3 hstm_dst = "$" * color.rgb; \n"
+-                         "float hstm_max = max(max(hstm_dst.r, hstm_dst.g), hstm_dst.b); \n"
+-                         "metric_scale = min(metric_scale, "$" / max(hstm_max, 1e-12)); \n",
+-                         SH_MAT3(hstm_to_dst),
+-                         SH_FLOAT_DYN(pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NORM, tone.output_max)));
+-                }
+                 if (args->p_curve && !base_need_tone_map && !need_gamut_map &&
+                     !ambient_active && !params->show_clipping && !params->visualize_lut)
+                 {
