@@ -1,0 +1,189 @@
+From: mpv-ht <mpv-ht@localhost>
+Date: Sun, 20 Sep 2026 12:00:00 -0400
+Subject: [PATCH] Measure clipped Analyzer Output after late video processing
+
+Sample OUTPUT after native target LUTs and user OUTPUT shaders. Mirror
+normalized framebuffer channel clipping before decoding measurement RGB;
+do not cap derived Y/P/maxRGB independently or clamp floating targets.
+Share clipped values across pixel, frame statistics, histograms and waveform.
+Account for output rotation/flips and target representation. Keep Source
+and rendered playback unchanged; exclude overlays and final dithering.
+
+---
+diff --git a/video/out/analyzer_async_bridge.h b/video/out/analyzer_async_bridge.h
+index 5e167a7..d8867ce 100644
+--- a/video/out/analyzer_async_bridge.h
++++ b/video/out/analyzer_async_bridge.h
+@@ -35,6 +35,9 @@ struct async_probe {
+     uint64_t source_revision;
+     struct pl_hook_params output;
+     bool output_valid;
++    struct pl_color_repr output_repr;
++    enum pl_fmt_type output_format_type;
++    float output_repr_scale;
+     uint64_t render_revision, last_render_revision;
+     struct pl_color_space last_output_color;
+     pl_rect2df last_output_rect;
+@@ -142,12 +145,21 @@ static struct pl_hook_res async_probe_hook(void *priv, const struct pl_hook_para
+     struct vo *vo = priv;
+     struct priv *p = vo->priv;
+     struct async_probe *a = p->async_probe;
+-    if (hp->stage == PL_HOOK_PRE_OUTPUT) {
+-        // Borrowed only until OUTPUT in this same render; never between frames.
+-        a->output = *hp;
+-        a->output_valid = true;
+-        return (struct pl_hook_res){0};
++    // OUTPUT is after native target LUTs and all user OUTPUT shaders, but
++    // before native/ASS overlays. Borrow only for this render. Do not return
++    // an altered texture: range clipping below is measurement-only.
++    a->output = *hp;
++    a->output.repr = a->output_repr;
++    a->output.rect = (pl_rect2df){0, 0, hp->tex->params.w, hp->tex->params.h};
++    bool flip_x = hp->dst_rect.x1 < hp->dst_rect.x0;
++    bool flip_y = hp->dst_rect.y1 < hp->dst_rect.y0;
++    int rotation = vo->params ? (vo->params->rotate % 360 + 360) % 360 : 0;
++    if (rotation == 90 || rotation == 270) {
++        bool tmp = flip_x; flip_x = flip_y; flip_y = tmp;
+     }
++    if (flip_x) MPSWAP(float, a->output.rect.x0, a->output.rect.x1);
++    if (flip_y) MPSWAP(float, a->output.rect.y0, a->output.rect.y1);
++    a->output_valid = true;
+     async_probe_collect(p);
+     int x, y, hover;
+     mp_input_get_mouse_pos(vo->input_ctx, &x, &y, &hover);
+@@ -301,7 +313,7 @@ static const struct pl_hook *async_probe_init(struct vo *vo)
+         p->async_probe = talloc_zero(p, struct async_probe);
+         p->async_probe->frame_hook = (struct pl_hook){.stages = PL_HOOK_RGB,
+             .input = PL_HOOK_SIG_NONE, .priv = vo, .hook = async_probe_frame_hook};
+-        p->async_probe->hook = (struct pl_hook){.stages = PL_HOOK_PRE_OUTPUT | PL_HOOK_OUTPUT,
++        p->async_probe->hook = (struct pl_hook){.stages = PL_HOOK_OUTPUT,
+             .input = PL_HOOK_SIG_TEX, .priv = vo, .hook = async_probe_hook};
+     }
+     return &p->async_probe->hook;
+diff --git a/video/out/analyzer_output_bridge.h b/video/out/analyzer_output_bridge.h
+index 3837149..f98391a 100644
+--- a/video/out/analyzer_output_bridge.h
++++ b/video/out/analyzer_output_bridge.h
+@@ -1,5 +1,45 @@
+ #include <libplacebo/shaders/colorspace.h>
+ #include <libplacebo/shaders/sampling.h>
++// Record the actual framebuffer representation, not an SDR/HDR target-nit
++// ceiling. In particular, float/scRGB targets must retain values above one.
++static void analyzer_output_prepare(struct priv *p, const struct pl_frame *target)
++{
++    struct async_probe *a = p->async_probe;
++    if (!a || !target->num_planes) return;
++    struct pl_color_repr repr = target->repr;
++    float scale = pl_color_repr_normalize(&repr);
++    enum pl_fmt_type type = target->planes[0].texture->params.format->type;
++    if (!pl_color_repr_equal(&repr, &a->output_repr) ||
++        scale != a->output_repr_scale || type != a->output_format_type)
++        a->last_stats_revision = 0;
++    a->output_repr = repr;
++    a->output_repr_scale = scale;
++    a->output_format_type = type;
++}
++
++static void analyzer_output_decode(struct priv *p, pl_shader sh,
++                                   const struct pl_hook_params *hp)
++{
++    struct async_probe *a = p->async_probe;
++    // OUTPUT is still floating point. The final render-target write clips
++    // normalized storage per encoded channel, after representation scaling.
++    // Mirror that write before decoding; capping derived Y/P/maxRGB would
++    // give incorrect colors, averages, histograms and waveform populations.
++    if (a->output_format_type == PL_FMT_UNORM ||
++        a->output_format_type == PL_FMT_SNORM) {
++        float bounds[] = {a->output_format_type == PL_FMT_SNORM ?
++                         -a->output_repr_scale : 0.f, a->output_repr_scale};
++        struct pl_shader_var var = {
++            .var=pl_var_vec2("output_storage_bounds"), .data=bounds, .dynamic=true};
++        pl_shader_custom(sh, &(struct pl_custom_shader){
++            .body="color.rgb=clamp(color.rgb,vec3(output_storage_bounds.x),vec3(output_storage_bounds.y));",
++            .input=PL_SHADER_SIG_COLOR, .output=PL_SHADER_SIG_COLOR,
++            .variables=&var, .num_variables=1});
++    }
++    struct pl_color_repr repr = hp->repr;
++    pl_shader_decode_color_ex(sh, pl_color_decode_args(.repr=&repr));
++}
++
+ /* Interpret decoded SDR signal values as a hypothetical display response.
+  * This private analysis pass never replaces playback pixels. Keep HDR on the
+  * effective renderer EOTF (PQ absolute / HLG renderer interpretation).
+@@ -37,29 +77,22 @@ static bool async_output_frame(struct priv *p,const struct pl_hook_params *hp,
+     pl_tex tex=slot->output_linear;
+     pl_shader sh=pl_dispatch_begin(hp->dispatch);
+     bool ok=pl_shader_sample_direct(sh,pl_sample_src(.tex=hp->tex,.rect=hp->rect,.new_w=w,.new_h=h));
+-    struct pl_color_repr repr=hp->repr;
+-    pl_shader_decode_color_ex(sh,pl_color_decode_args(.repr=&repr));
++    analyzer_output_decode(p,sh,hp);
+     analyzer_output_linearize(p,sh,&hp->color);
+     ok=ok && pl_dispatch_finish(hp->dispatch,pl_dispatch_params(.shader=&sh,.target=tex));
+     if(!ok){pl_dispatch_abort(hp->dispatch,&sh);return false;}
+     return async_frame_dispatch(p,hp,slot,hook,tex,560);
+ }
+-/* Decode the post-color-management signal, before overlays/rotation/dither.
++/* Decode clipped post-processing RGB, after LUTs/rotation, before overlays/dither.
+  * SDR uses the user's display assumption; HDR uses the effective TARGET EOTF.
+  * Both retain effective target primaries. */
+ static bool async_output_pixel(struct priv *p, const struct pl_hook_params *hp,
+                                struct async_probe_slot *slot, int x, int y)
+ {
+-    struct vo *vo=p->async_probe->hook.priv;
+     float u=(x-p->dst.x0+.5f)/mp_rect_w(p->dst),v=(y-p->dst.y0+.5f)/mp_rect_h(p->dst);
+-    int rotation=vo->params ? (vo->params->rotate%360+360)%360 : 0;
+-    float ox=u,oy=v;
+-    if(rotation==90){ox=v;oy=1-u;}
+-    if(rotation==180){ox=1-u;oy=1-v;}
+-    if(rotation==270){ox=1-v;oy=u;}
+     float pos[2] = {
+-        (hp->rect.x0+ox*(hp->rect.x1-hp->rect.x0))/hp->tex->params.w,
+-        (hp->rect.y0+oy*(hp->rect.y1-hp->rect.y0))/hp->tex->params.h};
++        (hp->rect.x0+u*(hp->rect.x1-hp->rect.x0))/hp->tex->params.w,
++        (hp->rect.y0+v*(hp->rect.y1-hp->rect.y0))/hp->tex->params.h};
+     const struct pl_raw_primaries *prim=pl_raw_primaries_get(hp->color.primaries);
+     pl_matrix3x3 xyz=pl_get_rgb2xyz_matrix(prim);
+     pl_matrix3x3 map=pl_get_color_mapping_matrix(prim,pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020),PL_INTENT_RELATIVE_COLORIMETRIC);
+@@ -78,8 +111,7 @@ static bool async_output_pixel(struct priv *p, const struct pl_hook_params *hp,
+         .description="Analyzer output pixel decode",.body="color=textureLod(out_tex,out_pos,0.0);",
+         .input=PL_SHADER_SIG_NONE,.output=PL_SHADER_SIG_COLOR,
+         .compute=true,.compute_group_size={1,1},.variables=vars,.num_variables=3,.descriptors=desc,.num_descriptors=2});
+-    struct pl_color_repr repr=hp->repr;
+-    pl_shader_decode_color_ex(sh,pl_color_decode_args(.repr=&repr));
++    analyzer_output_decode(p,sh,hp);
+     analyzer_output_linearize(p,sh,&hp->color);
+     ok=ok && pl_shader_custom(sh,&(struct pl_custom_shader){
+         .header=frame_math,
+diff --git a/video/out/analyzer_waveform_bridge.h b/video/out/analyzer_waveform_bridge.h
+index 4f96ffd..e60edf4 100644
+--- a/video/out/analyzer_waveform_bridge.h
++++ b/video/out/analyzer_waveform_bridge.h
+@@ -4,7 +4,7 @@ static bool analyzer_waveform_reduce(struct priv *p, const struct pl_hook_params
+ {
+     struct async_probe *a=p->async_probe;
+     if (!tex || !a->wave_tex || a->wave_w<1) return false;
+-    int width=a->wave_w, rotation=a->wave_rotation;
++    int width=a->wave_w, rotation=output ? 0 : a->wave_rotation;
+     int channels=p->next_opts->analyzer_waveform==4 ? 3 : 1;
+     int bins=256*channels;
+     int columns=(rotation==90 || rotation==270) ? tex->params.h : tex->params.w;
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index ea8a3f4..f76c4b4 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -3221,6 +3221,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+         libass_overlay_color(p,&(struct sub_bitmaps){0},frame->current,get_ref_luma(p)));
+ 
+     // Render frame
++    analyzer_output_prepare(p, &target);
+     stats_time_start(p->stats, "render");
+     bool render_ok = pl_render_image_mix(p->rr, &mix, &target, &params);
+     stats_time_end(p->stats, "render");
+@@ -3798,6 +3799,7 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
+         vo->params ? (vo->params->rotate%360+360)%360 : 0);
+     if (args->osd) analyzer_xy_prepare(p,&target,
+         libass_overlay_color(p,&(struct sub_bitmaps){0},mpi,get_ref_luma(p)));
++    analyzer_output_prepare(p, &target);
+     if (!pl_render_image(p->rr, &image, &target, &params)) {
+         MP_ERR(vo, "Failed rendering frame!\n");
+         goto done;
