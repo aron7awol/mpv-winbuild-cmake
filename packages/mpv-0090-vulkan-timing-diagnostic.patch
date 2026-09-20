@@ -1,0 +1,520 @@
+From b886b880646b9e2f40e4d5032fd5c3764a4985d2 Mon Sep 17 00:00:00 2001
+From: mpv-ht diagnostic preparation <diagnostic@mpv-ht.invalid>
+Date: Sat, 19 Sep 2026 19:59:54 -0400
+Subject: [PATCH] diagnostic only: bounded Vulkan frame, audio and queue timing
+ trace
+
+---
+ meson.build                 |   1 +
+ player/audio.c              |  11 ++-
+ player/core.h               |   2 +
+ player/video.c              |  31 ++++++-
+ video/out/ht_timing_trace.c | 161 ++++++++++++++++++++++++++++++++++++
+ video/out/ht_timing_trace.h |  43 ++++++++++
+ video/out/vo.c              |  28 +++++++
+ video/out/vo.h              |   3 +
+ video/out/vo_gpu_next.c     |  15 +++-
+ 9 files changed, 292 insertions(+), 3 deletions(-)
+ create mode 100644 video/out/ht_timing_trace.c
+ create mode 100644 video/out/ht_timing_trace.h
+
+diff --git a/meson.build b/meson.build
+index 3ad7cb176..8c2feac89 100644
+--- a/meson.build
++++ b/meson.build
+@@ -251,6 +251,7 @@ sources = files(
+     'video/out/gpu/video_shaders.c',
+     'video/out/libmpv_sw.c',
+     'video/out/vo.c',
++    'video/out/ht_timing_trace.c',
+     'video/out/vo_gpu.c',
+     'video/out/vo_image.c',
+     'video/out/vo_lavc.c',
+diff --git a/player/audio.c b/player/audio.c
+index 64e5326f4..7e55b4fb2 100644
+--- a/player/audio.c
++++ b/player/audio.c
+@@ -633,9 +633,18 @@ double written_audio_pts(struct MPContext *mpctx)
+ double playing_audio_pts(struct MPContext *mpctx)
+ {
+     double pts = written_audio_pts(mpctx);
++    bool trace = mpctx->video_out && mpctx->video_out->ht_timing;
++    if (trace) mpctx->ht_audio = (struct ht_audio_sample){0};
+     if (pts == MP_NOPTS_VALUE || !mpctx->ao)
+         return pts;
+-    return pts - mpctx->audio_speed * ao_get_delay(mpctx->ao);
++    int64_t before = trace ? ht_timing_qpc() : 0;
++    double delay = ao_get_delay(mpctx->ao);
++    double playing = pts - mpctx->audio_speed * delay;
++    if (trace) mpctx->ht_audio = (struct ht_audio_sample){
++        .valid = 1, .begin = before, .end = ht_timing_qpc(),
++        .written = pts, .delay = delay, .speed = mpctx->audio_speed, .playing = playing,
++    };
++    return playing;
+ }
+ 
+ // This garbage is needed for untimed AOs. These consume audio infinitely fast,
+diff --git a/player/core.h b/player/core.h
+index 323c54213..909695af1 100644
+--- a/player/core.h
++++ b/player/core.h
+@@ -383,6 +383,8 @@ typedef struct MPContext {
+     // the same value if the status line is updated at a time where no new
+     // video frame is shown.
+     double last_av_difference;
++    struct ht_audio_sample ht_audio;
++    struct ht_av_sample ht_av;
+     /* timestamp of video frame currently visible on screen
+      * (or at least queued to be flipped by VO) */
+     double video_pts;
+diff --git a/player/video.c b/player/video.c
+index 29b5bc6bc..1d542665e 100644
+--- a/player/video.c
++++ b/player/video.c
+@@ -647,6 +647,8 @@ static void update_avsync_before_frame(struct MPContext *mpctx)
+ static void update_av_diff(struct MPContext *mpctx, double offset)
+ {
+     struct MPOpts *opts = mpctx->opts;
++    bool trace = mpctx->video_out && mpctx->video_out->ht_timing;
++    if (trace) mpctx->ht_av = (struct ht_av_sample){0};
+ 
+     mpctx->last_av_difference = 0;
+ 
+@@ -661,6 +663,11 @@ static void update_av_diff(struct MPContext *mpctx, double offset)
+     if (a_pos != MP_NOPTS_VALUE && mpctx->video_pts != MP_NOPTS_VALUE) {
+         mpctx->last_av_difference = a_pos - mpctx->video_pts
+                                   + opts->audio_delay + offset;
++        if (trace) mpctx->ht_av = (struct ht_av_sample){
++            .valid = 1, .audio = mpctx->ht_audio, .video_pts = mpctx->video_pts,
++            .user_delay = opts->audio_delay, .offset = offset,
++            .difference = mpctx->last_av_difference,
++        };
+     }
+ 
+     if (fabs(mpctx->last_av_difference) > 0.5 && !mpctx->drop_message_shown) {
+@@ -847,6 +854,11 @@ static void handle_display_sync_frame(struct MPContext *mpctx,
+     int num_vsyncs = MPMAX(lrint(ratio), 0);
+     double prev_error = mpctx->display_sync_error;
+     mpctx->display_sync_error += frame_duration - num_vsyncs * vsync;
++    if (vo->ht_timing) {
++        frame->ht_schedule.planned = num_vsyncs;
++        frame->ht_schedule.rounding_before = prev_error;
++        frame->ht_schedule.rounding_after = mpctx->display_sync_error;
++    }
+ 
+     MP_TRACE(mpctx, "s=%f vsyncs=%d dur=%f ratio=%f err=%.20f (%f/%f)\n",
+             mpctx->speed_factor_v, num_vsyncs, adjusted_duration, ratio,
+@@ -876,7 +888,12 @@ static void handle_display_sync_frame(struct MPContext *mpctx,
+ 
+     // Estimate the video position, so we can calculate a good A/V difference
+     // value below. This is used to estimate A/V drift.
+-    double time_left = vo_get_delay(vo);
++    double time_left = vo->ht_timing
++        ? vo_get_delay_trace(vo, &frame->ht_schedule.delay) : vo_get_delay(vo);
++    if (vo->ht_timing) {
++        frame->ht_schedule.raw_vo_delay = time_left;
++        frame->ht_schedule.correction = drop_repeat;
++    }
+ 
+     // We also know that the timing is (necessarily) off, because we have to
+     // align frame timings on the vsync boundaries. This is unavoidable, and
+@@ -935,6 +952,12 @@ static void handle_display_sync_frame(struct MPContext *mpctx,
+ 
+ static void schedule_frame(struct MPContext *mpctx, struct vo_frame *frame)
+ {
++    bool trace = mpctx->video_out->ht_timing;
++    if (trace) frame->ht_schedule = (struct ht_schedule_sample){
++        .valid = 1, .begin = ht_timing_qpc(), .mode = mpctx->video_out->opts->video_sync,
++        .previous_av = mpctx->last_av_difference,
++        .audio_status = mpctx->audio_status, .video_status = mpctx->video_status,
++    };
+     handle_display_sync_frame(mpctx, frame);
+ 
+     if (mpctx->num_past_frames > 1 &&
+@@ -954,6 +977,12 @@ static void schedule_frame(struct MPContext *mpctx, struct vo_frame *frame)
+         update_av_diff(mpctx, mpctx->time_frame > 0 ?
+             mpctx->time_frame * mpctx->video_speed : 0);
+     }
++    if (trace) {
++        frame->ht_schedule.av = mpctx->ht_av;
++        frame->ht_schedule.time_frame = mpctx->time_frame;
++        frame->ht_schedule.playback_speed = mpctx->opts->playback_speed;
++        frame->ht_schedule.end = ht_timing_qpc();
++    }
+ }
+ 
+ // Determine the mpctx->past_frames[0] frame duration.
+diff --git a/video/out/ht_timing_trace.c b/video/out/ht_timing_trace.c
+new file mode 100644
+index 000000000..8db8ee96d
+--- /dev/null
++++ b/video/out/ht_timing_trace.c
+@@ -0,0 +1,161 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#include <stdio.h>
++#include <stdlib.h>
++#include <inttypes.h>
++#ifdef _WIN32
++#include <windows.h>
++#endif
++#include "vo.h"
++#include "video/mp_image.h"
++#include "common/msg.h"
++#include "osdep/io.h"
++#include "osdep/timer.h"
++#include "mpv_talloc.h"
++
++// Single writer (VO). Fixed, pre-touched storage. No allocation, disk I/O,
++// formatting, GPU readback, or additional audio-clock queries while capturing.
++#define HT_CAPACITY 131072
++struct ht_row {
++    uint64_t id, selected_id, token;
++    double pts, selected_pts, vsync, duration;
++    int kind, planned_remaining, repeat, still, ds, mixed, render_ok, dropped, submit_ok;
++    int64_t begin, submit_begin, submit_end, throttle_begin, throttle_end, end;
++    int64_t raw_feedback, applied_feedback, base, interval;
++    struct ht_schedule_sample schedule;
++};
++struct ht_timing_trace {
++    FILE *file;
++    struct ht_row *rows, pending;
++    unsigned count, omitted;
++    int active;
++};
++int64_t ht_timing_qpc(void)
++{
++#ifdef _WIN32
++    LARGE_INTEGER q; QueryPerformanceCounter(&q); return q.QuadPart;
++#else
++    return mp_time_ns();
++#endif
++}
++void ht_timing_init(struct vo *vo)
++{
++    const char *prefix = getenv("MPV_HT_VULKAN_TRACE");
++    if (!prefix || !prefix[0]) return;
++    struct ht_timing_trace *t = talloc_zero(vo, struct ht_timing_trace);
++    t->rows = calloc(HT_CAPACITY, sizeof(*t->rows));
++    if (!t->rows) { talloc_free(t); MP_ERR(vo, "Timing trace allocation failed\n"); return; }
++    volatile unsigned char *pages = (volatile unsigned char *)t->rows;
++    for (size_t i = 0; i < HT_CAPACITY * sizeof(*t->rows); i += 4096) pages[i] = 0;
++    char *file = talloc_asprintf(t, "%s-%d-%"PRId64".csv", prefix, (int)getpid(), ht_timing_qpc());
++    t->file = fopen(file, "wx");
++    if (!t->file) { free(t->rows); talloc_free(t); MP_ERR(vo, "Cannot create timing trace\n"); return; }
++    int64_t frequency = 1000000000;
++#ifdef _WIN32
++    LARGE_INTEGER q; QueryPerformanceFrequency(&q); frequency = q.QuadPart;
++#endif
++    int64_t before = ht_timing_qpc(), ns = mp_time_ns(), after = ht_timing_qpc();
++    fprintf(t->file, "# ht-vulkan-timing-v1 pid=%d qpc_frequency=%"PRId64" capacity=%d depth=%d anchor_before=%"PRId64" anchor_ns=%"PRId64" anchor_after=%"PRId64"\n",
++            (int)getpid(), frequency, HT_CAPACITY, vo->opts->swapchain_depth, before, ns, after);
++    fflush(t->file);
++    vo->ht_timing = t;
++    MP_INFO(vo, "Private timing trace armed: %s (flushes on normal exit)\n", file);
++}
++void ht_timing_begin(struct vo *vo, const struct vo_frame *f, int kind)
++{
++    struct ht_timing_trace *t = vo->ht_timing;
++    if (!t) return;
++    if (t->count == HT_CAPACITY) { t->omitted++; t->active = 0; return; }
++    t->pending = (struct ht_row) {
++        .id = f->current ? f->frame_id : 0, .pts = f->current ? f->current->pts : MP_NOPTS_VALUE,
++        .selected_pts = MP_NOPTS_VALUE, .kind = kind, .planned_remaining = f->num_vsyncs,
++        .repeat = f->repeat, .still = f->still, .ds = f->display_synced,
++        .vsync = f->vsync_interval, .duration = f->ideal_frame_duration,
++        .begin = ht_timing_qpc(), .submit_ok = -1, .render_ok = -1,
++        .raw_feedback = -1, .applied_feedback = -1, .schedule = f->ht_schedule,
++    };
++    t->active = 1;
++}
++void ht_timing_mix(struct vo *vo, uint64_t id, double pts, int count, int ok)
++{
++    struct ht_timing_trace *t = vo->ht_timing;
++    if (!t || !t->active) return;
++    t->pending.selected_id = id; t->pending.selected_pts = pts;
++    t->pending.mixed = count; t->pending.render_ok = ok;
++}
++void ht_timing_submit(struct vo *vo, int64_t begin, int64_t end, int ok, uint64_t token)
++{
++    struct ht_timing_trace *t = vo->ht_timing;
++    if (!t || !t->active) return;
++    t->pending.submit_begin = begin; t->pending.submit_end = end;
++    t->pending.submit_ok = ok; t->pending.token = token;
++}
++void ht_timing_throttle(struct vo *vo, int64_t begin, int64_t end)
++{
++    struct ht_timing_trace *t = vo->ht_timing;
++    if (!t || !t->active) return;
++    t->pending.throttle_begin = begin; t->pending.throttle_end = end;
++}
++void ht_timing_end(struct vo *vo, int dropped, int64_t raw, int64_t applied,
++                   int64_t base, int64_t interval)
++{
++    struct ht_timing_trace *t = vo->ht_timing;
++    if (!t || !t->active) return;
++    t->pending.end = ht_timing_qpc(); t->pending.dropped = dropped;
++    t->pending.raw_feedback = raw; t->pending.applied_feedback = applied;
++    t->pending.base = base; t->pending.interval = interval;
++    t->rows[t->count++] = t->pending; t->active = 0;
++}
++void ht_timing_close(struct vo *vo)
++{
++    struct ht_timing_trace *t = vo->ht_timing;
++    if (!t) return;
++    // Macros keep header/data ordering together. Write rows only at teardown.
++    const struct ht_row zero = {0};
++    for (unsigned i = 0; i <= t->count; i++) {
++        const struct ht_row *r = i ? &t->rows[i-1] : &zero;
++        const struct ht_schedule_sample *s = &r->schedule;
++        const struct ht_av_sample *a = &s->av;
++        const struct ht_audio_sample *q = &a->audio;
++        const struct ht_delay_sample *d = &s->delay;
++        int first = 1;
++#define COL(name, format, value) do { if (!first) fputc(',', t->file); first = 0; \
++    if (!i) fputs(name, t->file); else fprintf(t->file, format, value); } while (0)
++#define I(n,v) COL(n, "%"PRId64, (int64_t)(v))
++#define D(n,v) COL(n, "%.12f", (double)(v))
++        I("kind",r->kind); I("frame_id",r->id); D("source_pts",r->pts);
++        I("selected_id",r->selected_id); D("selected_pts",r->selected_pts);
++        I("mix_frames",r->mixed); I("render_ok",r->render_ok); I("vo_dropped",r->dropped);
++        I("remaining_vsyncs",r->planned_remaining); I("repeat",r->repeat); I("still",r->still);
++        I("display_sync",r->ds); D("vsync_s",r->vsync); D("frame_duration_s",r->duration);
++        I("draw_begin_qpc",r->begin); I("submit_begin_qpc",r->submit_begin); I("submit_end_qpc",r->submit_end);
++        I("submit_ok",r->submit_ok); I("throttle_begin_qpc",r->throttle_begin); I("throttle_end_qpc",r->throttle_end);
++        I("end_qpc",r->end); I("pl_swapchain_token",r->token);
++        I("raw_feedback_ns",r->raw_feedback); I("applied_feedback_ns",r->applied_feedback);
++        I("base_after_ns",r->base); I("interval_after_ns",r->interval);
++        I("schedule_valid",s->valid); I("mode_enum",s->mode);
++        I("schedule_begin_qpc",s->begin); I("schedule_end_qpc",s->end);
++        I("planned_vsyncs",s->planned); I("correction_vsyncs",s->correction);
++        I("audio_status",s->audio_status); I("video_status",s->video_status);
++        D("previous_av_s",s->previous_av); D("raw_vo_delay_s",s->raw_vo_delay);
++        D("rounding_before_s",s->rounding_before); D("rounding_after_s",s->rounding_after);
++        D("time_frame_s",s->time_frame); D("playback_speed",s->playback_speed);
++        I("av_valid",a->valid); D("av_s",a->difference); D("av_video_pts",a->video_pts);
++        D("user_audio_delay_s",a->user_delay); D("av_offset_s",a->offset);
++        I("audio_query_valid",q->valid); I("audio_query_begin_qpc",q->begin); I("audio_query_end_qpc",q->end);
++        D("audio_written_pts",q->written); D("audio_buffer_s",q->delay);
++        D("audio_speed",q->speed); D("audio_playing_pts",q->playing);
++        I("vo_delay_valid",d->valid); I("vo_delay_frame_id",d->id);
++        I("vo_delay_base_ns",d->base); I("vo_delay_interval_ns",d->interval);
++        I("vo_delay_end_ns",d->end); I("vo_delay_now_ns",d->now);
++        I("vo_delay_remaining",d->remaining); I("vo_delay_rendering",d->rendering);
++        I("vo_delay_display_sync",d->display_synced);
++        fputc('\n', t->file);
++#undef D
++#undef I
++#undef COL
++    }
++    fprintf(t->file, "# complete rows=%u omitted=%u\n", t->count, t->omitted);
++    int failed = ferror(t->file); if (fclose(t->file)) failed = 1;
++    if (failed) MP_ERR(vo, "Timing trace write failed\n");
++    free(t->rows); talloc_free(t); vo->ht_timing = NULL;
++}
+diff --git a/video/out/ht_timing_trace.h b/video/out/ht_timing_trace.h
+new file mode 100644
+index 000000000..870dc9526
+--- /dev/null
++++ b/video/out/ht_timing_trace.h
+@@ -0,0 +1,43 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++// PRIVATE diagnostic only. No timing decisions are changed.
++#ifndef MP_HT_TIMING_TRACE_H
++#define MP_HT_TIMING_TRACE_H
++#include <stdint.h>
++
++struct vo;
++struct vo_frame;
++struct ht_timing_trace;
++struct ht_audio_sample {
++    int valid;
++    int64_t begin, end;
++    double written, delay, speed, playing;
++};
++struct ht_av_sample {
++    int valid;
++    struct ht_audio_sample audio;
++    double video_pts, user_delay, offset, difference;
++};
++struct ht_delay_sample {
++    int valid, remaining, rendering, display_synced;
++    uint64_t id;
++    int64_t base, interval, end, now;
++};
++struct ht_schedule_sample {
++    int valid, mode, planned, correction, audio_status, video_status;
++    int64_t begin, end;
++    double previous_av, raw_vo_delay, rounding_before, rounding_after;
++    double time_frame, playback_speed;
++    struct ht_av_sample av;
++    struct ht_delay_sample delay;
++};
++int64_t ht_timing_qpc(void);
++void ht_timing_init(struct vo *vo);
++void ht_timing_close(struct vo *vo);
++void ht_timing_begin(struct vo *vo, const struct vo_frame *frame, int kind);
++void ht_timing_mix(struct vo *vo, uint64_t id, double pts, int count, int ok);
++void ht_timing_submit(struct vo *vo, int64_t begin, int64_t end, int ok, uint64_t token);
++void ht_timing_throttle(struct vo *vo, int64_t begin, int64_t end);
++void ht_timing_end(struct vo *vo, int dropped, int64_t raw_feedback,
++                   int64_t applied_feedback, int64_t base, int64_t interval);
++double vo_get_delay_trace(struct vo *vo, struct ht_delay_sample *sample);
++#endif
+diff --git a/video/out/vo.c b/video/out/vo.c
+index dfea9efc2..fd57860f5 100644
+--- a/video/out/vo.c
++++ b/video/out/vo.c
+@@ -991,9 +991,11 @@ static bool render_frame(struct vo *vo)
+ 
+     // Store the initial value before we unlock.
+     bool request_redraw = in->request_redraw;
++    if (vo->ht_timing) ht_timing_begin(vo, frame, 0);
+ 
+     if (in->dropped_frame) {
+         in->drop_count += 1;
++        ht_timing_end(vo, 1, -1, -1, in->base_vsync, in->vsync_interval);
+         wakeup_core(vo);
+     } else {
+         in->rendering = true;
+@@ -1026,6 +1028,7 @@ static bool render_frame(struct vo *vo)
+         };
+         if (vo->driver->get_vsync)
+             vo->driver->get_vsync(vo, &vsync);
++        int64_t raw_feedback = vsync.last_queue_display_time;
+ 
+         // Make up some crap if presentation feedback is missing.
+         if (vsync.last_queue_display_time <= 0)
+@@ -1038,6 +1041,8 @@ static bool render_frame(struct vo *vo)
+         in->rendering = false;
+ 
+         update_vsync_timing_after_swap(vo, &vsync);
++        ht_timing_end(vo, in->dropped_frame, raw_feedback,
++                      vsync.last_queue_display_time, in->base_vsync, in->vsync_interval);
+     }
+ 
+     if (vo->driver->caps & VO_CAP_NORETAIN) {
+@@ -1104,8 +1109,10 @@ static void do_redraw(struct vo *vo)
+     frame->duration = -1;
+     mp_mutex_unlock(&in->lock);
+ 
++    if (vo->ht_timing) ht_timing_begin(vo, frame, 1);
+     vo->driver->draw_frame(vo, frame);
+     vo->driver->flip_page(vo);
++    ht_timing_end(vo, 0, -1, -1, 0, 0);
+ 
+     if (frame != &dummy && !(vo->driver->caps & VO_CAP_FRAMEOWNER))
+         talloc_free(frame);
+@@ -1132,6 +1139,7 @@ static MP_THREAD_VOID vo_thread(void *ptr)
+     }
+ 
+     int r = vo->driver->preinit(vo) ? -1 : 0;
++    if (!r) ht_timing_init(vo);
+     mp_rendezvous(vo, r); // init barrier
+     if (r < 0)
+         goto done;
+@@ -1221,6 +1229,7 @@ static MP_THREAD_VOID vo_thread(void *ptr)
+     talloc_free(in->current_frame);
+     in->current_frame = NULL;
+     vo->driver->uninit(vo);
++    ht_timing_close(vo);
+ done:
+     TA_FREEP(&in->dr_helper);
+     MP_THREAD_RETURN();
+@@ -1410,6 +1419,25 @@ double vo_get_delay(struct vo *vo)
+     return res ? MP_TIME_NS_TO_S(res - mp_time_ns()) : 0;
+ }
+ 
++// Diagnostic variant records the SAME locked inputs and ONE clock read used
++// for the return value; it does not take a second, differently timed sample.
++double vo_get_delay_trace(struct vo *vo, struct ht_delay_sample *s)
++{
++    struct vo_internal *in = vo->in;
++    mp_mutex_lock(&in->lock);
++    int64_t res = get_display_synced_frame_end(vo);
++    *s = (struct ht_delay_sample){
++        .valid = 1, .base = in->base_vsync, .interval = in->vsync_interval, .end = res,
++        .rendering = in->rendering,
++        .remaining = in->current_frame ? in->current_frame->num_vsyncs : 0,
++        .id = in->current_frame ? in->current_frame->frame_id : 0,
++        .display_synced = in->current_frame && in->current_frame->display_synced,
++    };
++    mp_mutex_unlock(&in->lock);
++    s->now = res ? mp_time_ns() : 0;
++    return res ? MP_TIME_NS_TO_S(res - s->now) : 0;
++}
++
+ void vo_discard_timing_info(struct vo *vo)
+ {
+     struct vo_internal *in = vo->in;
+diff --git a/video/out/vo.h b/video/out/vo.h
+index e68a63234..73ebd9958 100644
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -31,6 +31,7 @@
+ #include "options/options.h"
+ #include "osdep/threads.h"
+ #include "player/clipboard/clipboard.h"
++#include "ht_timing_trace.h"
+ 
+ enum {
+     // VO needs to redraw
+@@ -289,6 +290,7 @@ struct vo_extra {
+ };
+ 
+ struct vo_frame {
++    struct ht_schedule_sample ht_schedule;
+     // If > 0, realtime when frame should be shown, in mp_time_ns() units.
+     // If 0, present immediately.
+     int64_t pts;
+@@ -521,6 +523,7 @@ struct vo_driver {
+ };
+ 
+ struct vo {
++    struct ht_timing_trace *ht_timing;
+     mp_mutex async_probe_mutex;
+     struct voctrl_async_probe async_probe_snapshot;
+     struct analyzer_property_cache *async_probe_property_cache; // core thread only
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 683e6764a..b326a7f6b 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -3221,6 +3221,13 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+     // Render frame
+     stats_time_start(p->stats, "render");
+     bool render_ok = pl_render_image_mix(p->rr, &mix, &target, &params);
++    if (vo->ht_timing) {
++        const struct pl_frame *selected = pl_frame_mix_current(&mix);
++        struct mp_image *mpi = selected ? selected->user_data : NULL;
++        struct frame_priv *fp = mpi ? mpi->priv : NULL;
++        ht_timing_mix(vo, fp ? fp->causal_scene_tag - 1 : 0,
++                      mpi ? mpi->pts : MP_NOPTS_VALUE, mix.num_frames, render_ok);
++    }
+     stats_time_end(p->stats, "render");
+     if (!render_ok) {
+         MP_ERR(vo, "Failed rendering frame!\n");
+@@ -3420,7 +3427,11 @@ static void flip_page(struct vo *vo)
+         p->hdrdiag_swapchain_rearm_frames > 0 && p->frame_pending;
+ 
+     if (p->frame_pending) {
+-        if (!pl_swapchain_submit_frame(p->sw))
++        int64_t before = vo->ht_timing ? ht_timing_qpc() : 0;
++        bool ok = pl_swapchain_submit_frame(p->sw);
++        if (vo->ht_timing)
++            ht_timing_submit(vo, before, ht_timing_qpc(), ok, (uintptr_t)p->sw);
++        if (!ok)
+             MP_ERR(vo, "Failed presenting frame!\n");
+         p->frame_pending = false;
+     }
+@@ -3430,7 +3441,9 @@ static void flip_page(struct vo *vo)
+             p->sw, p->hdrdiag_last_hint_valid ? &p->hdrdiag_last_hint : NULL);
+     }
+ 
++    int64_t throttle_begin = vo->ht_timing ? ht_timing_qpc() : 0;
+     sw->fns->swap_buffers(sw);
++    if (vo->ht_timing) ht_timing_throttle(vo, throttle_begin, ht_timing_qpc());
+ 
+     if (presented_rearm_frame) {
+         p->hdrdiag_swapchain_rearm_frames--;
+-- 
+2.54.0.windows.1
+
