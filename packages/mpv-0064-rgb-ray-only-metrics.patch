@@ -1,0 +1,191 @@
+From: mpv-ht <mpv-ht@localhost>
+Date: Fri, 25 Sep 2026 14:00:00 -0400
+Subject: [PATCH] Always apply Perceptual and maxRGB along the RGB ray
+
+Remove the private ITP and adaptive-chroma rendering branches and strength
+control. Keep Standard, RGB-ray math, recovery and overflow behavior intact.
+mpv accepts legacy metric names as canonical RGB aliases. Retain the enum
+IDs and a reserved libplacebo struct slot for existing binary clients.
+
+---
+diff --git a/video/out/gpu/video.h b/video/out/gpu/video.h
+index 77ae980..73f423e 100644
+--- a/video/out/gpu/video.h
++++ b/video/out/gpu/video.h
+@@ -102,13 +102,9 @@ enum tone_mapping {
+ };
+ 
+ enum tone_mapping_metric {
+-    TONE_MAPPING_METRIC_STANDARD,
+-    TONE_MAPPING_METRIC_BT2020_ITP,
+-    TONE_MAPPING_METRIC_BT2020_ADAPTIVE,
+-    TONE_MAPPING_METRIC_BT2020_RGB,
+-    TONE_MAPPING_METRIC_MAXRGB_ITP,
+-    TONE_MAPPING_METRIC_MAXRGB_ADAPTIVE,
+-    TONE_MAPPING_METRIC_MAXRGB_RGB,
++    TONE_MAPPING_METRIC_STANDARD = 0,
++    TONE_MAPPING_METRIC_BT2020_RGB = 3,
++    TONE_MAPPING_METRIC_MAXRGB_RGB = 6,
+ };
+ 
+ enum gamut_mode {
+@@ -131,7 +127,6 @@ struct gl_tone_map_opts {
+     int metric;
+     float hstm_strength, hstm_overbrightening;
+     bool hstm_near_black_protection;
+-    float adaptive_chroma_strength;
+     bool auto_pq_second_pass;
+     bool p_constrained_curve;
+     float ambient_gamma;
+diff --git a/video/out/gpu/video.c b/video/out/gpu/video.c
+index f00d5fd..af22417 100644
+--- a/video/out/gpu/video.c
++++ b/video/out/gpu/video.c
+@@ -400,7 +400,6 @@ static const struct gl_video_opts gl_video_opts_def = {
+     .tone_map = {
+         .curve = TONE_MAPPING_AUTO,
+         .hstm_near_black_protection = true,
+-        .adaptive_chroma_strength = 50.0,
+         .ambient_gamma = 1.0,
+         .curve_param = NAN,
+         .max_boost = 1.0,
+@@ -473,19 +472,18 @@ const struct m_sub_options gl_video_conf = {
+         {"tone-mapping-param", OPT_FLOATDEF(tone_map.curve_param)},
+         {"tone-mapping-metric", OPT_CHOICE(tone_map.metric,
+             {"standard",   TONE_MAPPING_METRIC_STANDARD},
+-            {"bt2020-itp", TONE_MAPPING_METRIC_BT2020_ITP},
+-            {"bt2020-adaptive", TONE_MAPPING_METRIC_BT2020_ADAPTIVE},
+             {"bt2020-rgb", TONE_MAPPING_METRIC_BT2020_RGB},
+-            {"maxrgb-itp", TONE_MAPPING_METRIC_MAXRGB_ITP},
+-            {"maxrgb-adaptive", TONE_MAPPING_METRIC_MAXRGB_ADAPTIVE},
+-            {"maxrgb-rgb", TONE_MAPPING_METRIC_MAXRGB_RGB})},
++            {"maxrgb-rgb", TONE_MAPPING_METRIC_MAXRGB_RGB},
++            // Read-only compatibility names: all selections resolve to RGB ray.
++            {"bt2020-itp", TONE_MAPPING_METRIC_BT2020_RGB},
++            {"bt2020-adaptive", TONE_MAPPING_METRIC_BT2020_RGB},
++            {"maxrgb-itp", TONE_MAPPING_METRIC_MAXRGB_RGB},
++            {"maxrgb-adaptive", TONE_MAPPING_METRIC_MAXRGB_RGB})},
+         {"tone-mapping-hstm-strength", OPT_FLOAT(tone_map.hstm_strength), M_RANGE(0, 100)},
+         {"tone-mapping-hstm-overbrightening", OPT_FLOAT(tone_map.hstm_overbrightening), M_RANGE(0, 100)},
+         {"tone-mapping-hstm-near-black-protection", OPT_BOOL(tone_map.hstm_near_black_protection)},
+         {"tone-mapping-auto-pq-second-pass", OPT_BOOL(tone_map.auto_pq_second_pass)},
+         {"tone-mapping-p-constrained-curve", OPT_BOOL(tone_map.p_constrained_curve)},
+-        {"tone-mapping-adaptive-chroma-strength",
+-            OPT_FLOAT(tone_map.adaptive_chroma_strength), M_RANGE(0.0, 100.0)},
+         {"tone-mapping-ambient-gamma",
+             OPT_FLOAT(tone_map.ambient_gamma), M_RANGE(0.5, 1.5)},
+         {"inverse-tone-mapping", OPT_BOOL(tone_map.inverse)},
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index f76c4b4..57cca52 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -4834,21 +4834,9 @@ AV_NOWARN_DEPRECATED(
+         pars->color_map_params.tone_mapping_param = 0.0;
+ )
+     switch (opts->tone_map.metric) {
+-    case TONE_MAPPING_METRIC_BT2020_ITP:
+-        pars->color_map_params.tone_mapping_metric = PL_TONE_MAP_METRIC_BT2020_ITP;
+-        break;
+-    case TONE_MAPPING_METRIC_BT2020_ADAPTIVE:
+-        pars->color_map_params.tone_mapping_metric = PL_TONE_MAP_METRIC_BT2020_ADAPTIVE;
+-        break;
+     case TONE_MAPPING_METRIC_BT2020_RGB:
+         pars->color_map_params.tone_mapping_metric = PL_TONE_MAP_METRIC_BT2020_RGB;
+         break;
+-    case TONE_MAPPING_METRIC_MAXRGB_ITP:
+-        pars->color_map_params.tone_mapping_metric = PL_TONE_MAP_METRIC_MAXRGB_ITP;
+-        break;
+-    case TONE_MAPPING_METRIC_MAXRGB_ADAPTIVE:
+-        pars->color_map_params.tone_mapping_metric = PL_TONE_MAP_METRIC_MAXRGB_ADAPTIVE;
+-        break;
+     case TONE_MAPPING_METRIC_MAXRGB_RGB:
+         pars->color_map_params.tone_mapping_metric = PL_TONE_MAP_METRIC_MAXRGB_RGB;
+         break;
+@@ -4856,8 +4844,6 @@ AV_NOWARN_DEPRECATED(
+         pars->color_map_params.tone_mapping_metric = PL_TONE_MAP_METRIC_STANDARD;
+         break;
+     }
+-    pars->color_map_params.adaptive_chroma_strength =
+-        opts->tone_map.adaptive_chroma_strength / 100.0f;
+     pars->color_map_params.hstm_strength = opts->tone_map.hstm_strength / 100.0f;
+     pars->color_map_params.hstm_overbrightening = opts->tone_map.hstm_overbrightening / 100.0f;
+     pars->color_map_params.hstm_near_black_protection = opts->tone_map.hstm_near_black_protection;
+diff --git a/player/command.c b/player/command.c
+index dde9f97..8bc64bb 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -2559,10 +2559,8 @@ static int property_imgparams(const struct mp_image_params *p, int action, void
+         (MP_SCENE_CUT_DOVI | MP_SCENE_CUT_HDR10PLUS) ? "dv+hdr10plus" : "none";
+     const char *causal_active_metric_branch = peak->causal_active_metric_branch ==
+         PL_TONE_MAP_METRIC_STANDARD ? "standard" :
+-        peak->causal_active_metric_branch >= PL_TONE_MAP_METRIC_BT2020_ITP &&
+-        peak->causal_active_metric_branch <= PL_TONE_MAP_METRIC_BT2020_RGB ?
+-        "perceptual" : peak->causal_active_metric_branch >=
+-        PL_TONE_MAP_METRIC_MAXRGB_ITP && peak->causal_active_metric_branch <=
++        peak->causal_active_metric_branch == PL_TONE_MAP_METRIC_BT2020_RGB ?
++        "perceptual" : peak->causal_active_metric_branch ==
+         PL_TONE_MAP_METRIC_MAXRGB_RGB ? "maxrgb" : "unknown";
+     const char *pixelformat_name = p->imgfmt_name ? p->imgfmt_name :
+                                                    mp_imgfmt_to_name(p->imgfmt);
+@@ -2814,8 +2812,7 @@ static int mp_property_tone_curve(void *ctx, struct m_property *prop, int action
+         bx += snprintf(base + bx, sizeof(base) - bx, "%s%.9g", i ? "," : "", v.base[i]);
+         ox += snprintf(output + ox, sizeof(output) - ox, "%s%.9g", i ? "," : "", v.output[i]);
+     }
+-    const char *metric = v.metric == PL_TONE_MAP_METRIC_BT2020_RGB ||
+-        v.metric == PL_TONE_MAP_METRIC_BT2020_ITP || v.metric == PL_TONE_MAP_METRIC_BT2020_ADAPTIVE
++    const char *metric = v.metric == PL_TONE_MAP_METRIC_BT2020_RGB
+         ? "P" : v.metric == PL_TONE_MAP_METRIC_STANDARD ? "Intensity" : "maxRGB";
+     struct m_sub_property props[] = {
+         {"valid", SUB_PROP_BOOL(v.valid)}, {"sequence", SUB_PROP_INT64(v.sequence)},
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index cc988a3..3581fd1 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -7749,23 +7749,20 @@ them.
+     st2094-10
+         Specifies the contrast (slope) at the knee point. Defaults to 1.0.
+ 
+-``--tone-mapping-metric=<standard|bt2020-itp|bt2020-adaptive|bt2020-rgb|maxrgb-itp|maxrgb-adaptive|maxrgb-rgb>``
++``--tone-mapping-metric=<standard|bt2020-rgb|maxrgb-rgb>``
+     Selects the brightness metric for renderer-generated dynamic tone mapping.
+     ``standard`` uses libplacebo's normal brightness metric.
+-    The three ``bt2020`` modes use mpv-ht's smooth, homogeneous approximation of
+-    the selected literal p=1 BT.2020 perceptual coordinate. ``bt2020-itp``
+-    applies the metric-derived compression to I while retaining libplacebo's
+-    normal conservative ITP chroma processing. ``bt2020-adaptive`` retains
+-    progressively more source IPT chroma for saturated pixels while keeping
+-    the same metric-derived I coordinate. ``bt2020-rgb`` applies the exact
++    ``bt2020-rgb`` uses mpv-ht's smooth, homogeneous approximation of the
++    selected literal p=1 BT.2020 perceptual coordinate. It applies the exact
+     fixed-hue inverse along the linear RGB ray.
+ 
+-    The three ``maxrgb`` modes use per-pixel ``max(R,G,B)`` for both the
++    ``maxrgb-rgb`` uses per-pixel ``max(R,G,B)`` for both the
+     percentile/average frame statistics that generate the curve and the
+-    per-pixel curve lookup. ``maxrgb-itp`` applies the resulting compression
+-    to I with conservative chroma processing, ``maxrgb-adaptive`` uses the
+-    same adaptive chroma retention, and ``maxrgb-rgb`` applies it exactly
+-    along the linear RGB ray.
++    per-pixel curve lookup, applying it along the linear RGB ray.
++
++    The retired ``bt2020-itp``/``bt2020-adaptive`` and
++    ``maxrgb-itp``/``maxrgb-adaptive`` names are accepted as compatibility
++    aliases for the corresponding RGB-ray metric. Adaptive chroma is removed.
+ 
+     These modes are used only for generic, pixel-measured DTM. If tone mapping is
+     inactive, peak measurement is disabled or unavailable, HDR10+ authored
+@@ -7800,14 +7797,6 @@ them.
+     and retain the normal source-gain and peak limits. Has no effect when
+     Contrast Shaping is inactive. (``--vo=gpu-next`` only)
+ 
+-``--tone-mapping-adaptive-chroma-strength=<0..100>``
+-    Controls how strongly the ``bt2020-adaptive`` and ``maxrgb-adaptive``
+-    modes restore chroma removed by libplacebo's normal ITP hull processing.
+-    ``0`` is identical to the corresponding ``itp`` mode, while ``100``
+-    reproduces the full adaptive formula. The default is ``50``. This option
+-    does not alter the selected brightness metric, peak measurements, temporal
+-    smoothing, tone curve, or final gamut mapping. (``--vo=gpu-next`` only)
+-
+ ``--tone-mapping-ambient-gamma=<0.5..1.5>``
+     Applies an exponent to the mapped target-PQ brightness coordinate after
+     normal tone mapping. The coordinate is normalized to the configured output
