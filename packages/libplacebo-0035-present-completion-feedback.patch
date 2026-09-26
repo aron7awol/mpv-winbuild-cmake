@@ -1,0 +1,144 @@
+From 4300bcbc94e3e0f98b7e829eadd616c0c11cf91d Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Sat, 26 Sep 2026 11:32:11 -0400
+Subject: [PATCH] Add opt-in nonblocking Vulkan present-completion accounting
+
+---
+ src/include/libplacebo/vulkan.h | 10 +++++
+ src/vulkan/swapchain.c          | 67 +++++++++++++++++++++++++++++++++
+ 2 files changed, 77 insertions(+)
+
+diff --git a/src/include/libplacebo/vulkan.h b/src/include/libplacebo/vulkan.h
+index a121da30..732901a4 100644
+--- a/src/include/libplacebo/vulkan.h
++++ b/src/include/libplacebo/vulkan.h
+@@ -647,6 +647,16 @@ struct pl_vulkan_sem_params {
+ PL_API VkSemaphore pl_vulkan_sem_create(pl_gpu gpu, const struct pl_vulkan_sem_params *params);
+ PL_API void pl_vulkan_sem_destroy(pl_gpu gpu, VkSemaphore *semaphore);
+ 
++// mpv-ht experimental, Vulkan-only. Opt in before submitting any images.
++// Completion counts are NOT scanout timestamps. Timeout-zero polling only;
++// pending is an upper bound when completion notification is delayed.
++struct pl_vulkan_present_feedback {
++    uint64_t epoch, submitted, completed;
++    bool available;
++};
++PL_API bool pl_vulkan_swapchain_enable_feedback(pl_swapchain sw);
++PL_API struct pl_vulkan_present_feedback pl_vulkan_swapchain_feedback(pl_swapchain sw);
++
+ PL_API_END
+ 
+ #endif // LIBPLACEBO_VULKAN_H_
+diff --git a/src/vulkan/swapchain.c b/src/vulkan/swapchain.c
+index 90f5da31..13dfd0c2 100644
+--- a/src/vulkan/swapchain.c
++++ b/src/vulkan/swapchain.c
+@@ -25,6 +25,8 @@
+ 
+ struct vk_swapchain {
+     VkSwapchainKHR swapchain;
++    uint64_t submitted, completed;
++    bool feedback_failed;
+     // state of the images:
+     PL_ARRAY(VkImage) vkimages;     // VkImages waiting to be wrapped
+     PL_ARRAY(pl_tex) images;        // pl_tex wrappers for the VkImages
+@@ -55,6 +57,8 @@ struct priv {
+     bool suboptimal;                // true once VK_SUBOPTIMAL_KHR is returned
+     bool needs_recreate;            // swapchain needs to be recreated
+     bool has_swapchain_maintenance1;
++    PFN_vkWaitForPresentKHR wait_for_present;
++    uint64_t feedback_epoch;
+     struct pl_color_repr color_repr;
+     struct pl_color_space color_space;
+     struct pl_hdr_metadata hdr_metadata;
+@@ -796,6 +800,7 @@ static bool vk_sw_recreate(pl_swapchain sw, int w, int h)
+         sinfo.oldSwapchain = VK_NULL_HANDLE;
+     }
+     p->current = current = pl_zalloc_ptr(NULL, p->current);
++    p->feedback_epoch++;
+     current->last_imgidx = -1;
+     VkResult res = vk->CreateSwapchainKHR(vk->dev, &sinfo, PL_VK_ALLOC, &current->swapchain);
+     PL_VK_ASSERT(res, "vk->CreateSwapchainKHR(...)");
+@@ -1016,10 +1021,26 @@ static bool vk_sw_submit_frame(pl_swapchain sw)
+         pinfo.pNext = &fenceInfo;
+     }
+ 
++    uint64_t present_id = current->submitted + 1;
++    VkPresentIdKHR id_info = {
++        .sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR,
++        .pNext = pinfo.pNext,
++        .swapchainCount = 1,
++        .pPresentIds = &present_id,
++    };
++    if (p->wait_for_present && !current->feedback_failed)
++        pinfo.pNext = &id_info;
++
+     PL_TRACE(vk, "vkQueuePresentKHR waits on 0x%"PRIx64, (uint64_t) sem_out);
+     vk->lock_queue(vk->queue_ctx, pool->qf, qidx);
+     VkResult res = vk->QueuePresentKHR(queue, &pinfo);
+     vk->unlock_queue(vk->queue_ctx, pool->qf, qidx);
++    if (p->wait_for_present) {
++        if (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)
++            current->submitted = present_id;
++        else
++            current->feedback_failed = true;
++    }
+     pl_mutex_unlock(&p->lock);
+ 
+     switch (res) {
+@@ -1105,6 +1126,52 @@ bool pl_vulkan_swapchain_suboptimal(pl_swapchain sw)
+     return p->suboptimal;
+ }
+ 
++bool pl_vulkan_swapchain_enable_feedback(pl_swapchain sw)
++{
++    struct priv *p = PL_PRIV(sw);
++    struct vk_ctx *vk = p->vk;
++    const VkPhysicalDevicePresentIdFeaturesKHR *id =
++        vk_find_struct(vk->features.pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR);
++    const VkPhysicalDevicePresentWaitFeaturesKHR *wait =
++        vk_find_struct(vk->features.pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR);
++    if (!id || !id->presentId || !wait || !wait->presentWait ||
++        p->protoInfo.presentMode != VK_PRESENT_MODE_FIFO_KHR)
++        return false;
++    p->wait_for_present = (PFN_vkWaitForPresentKHR)
++        vk->GetDeviceProcAddr(vk->dev, "vkWaitForPresentKHR");
++    return p->wait_for_present != NULL;
++}
++
++struct pl_vulkan_present_feedback pl_vulkan_swapchain_feedback(pl_swapchain sw)
++{
++    struct priv *p = PL_PRIV(sw);
++    struct pl_vulkan_present_feedback result = {0};
++    pl_mutex_lock(&p->lock);
++    struct vk_swapchain *c = p->current;
++    result.epoch = p->feedback_epoch;
++    if (!p->wait_for_present || !c || c->feedback_failed)
++        goto done;
++    // Bound query overhead even after a stalled consumer. Never wait for the
++    // GPU or presentation engine, and never query a retired swapchain.
++    for (int n = 0; n < 64 && c->completed < c->submitted; n++) {
++        VkResult res = p->wait_for_present(p->vk->dev, c->swapchain,
++                                           c->completed + 1, 0);
++        if (res == VK_TIMEOUT)
++            break;
++        if (res != VK_SUCCESS) {
++            c->feedback_failed = true;
++            goto done;
++        }
++        c->completed++;
++    }
++    result.available = true;
++    result.submitted = c->submitted;
++    result.completed = c->completed;
++done:
++    pl_mutex_unlock(&p->lock);
++    return result;
++}
++
+ static const struct pl_sw_fns vulkan_swapchain = {
+     .destroy            = vk_sw_destroy,
+     .latency            = vk_sw_latency,
+-- 
+2.54.0.windows.1
+

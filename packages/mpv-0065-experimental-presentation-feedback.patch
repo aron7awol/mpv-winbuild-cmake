@@ -1,0 +1,734 @@
+From c52429cd61dc131e7fcf159978c67a66a2405455 Mon Sep 17 00:00:00 2001
+From: Aaron <aaronmedeiros@gmail.com>
+Date: Sat, 26 Sep 2026 11:32:10 -0400
+Subject: [PATCH] Add default-off presentation feedback and guarded
+ display-vdrop timing
+
+---
+ DOCS/man/options.rst              |  14 +++
+ options/options.c                 |   2 +
+ options/options.h                 |   1 +
+ player/audio.c                    |   1 +
+ player/command.c                  |  34 +++++++
+ player/core.h                     |   2 +
+ player/video.c                    |  18 +++-
+ video/filter/vf_gpu_vulkan.c      |   2 +-
+ video/out/d3d11/context.c         |  36 +++++++-
+ video/out/presentation_feedback.h | 146 ++++++++++++++++++++++++++++++
+ video/out/vo.c                    |  76 +++++++++++++++-
+ video/out/vo.h                    |  14 +++
+ video/out/vulkan/context.c        |  35 ++++++-
+ video/out/vulkan/context.h        |   2 +-
+ 14 files changed, 374 insertions(+), 9 deletions(-)
+ create mode 100644 video/out/presentation_feedback.h
+
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index 3581fd1b1..0d9301656 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -8316,6 +8316,20 @@ Video Sync
+     :desync:            Sync video according to system clock, and let audio play
+                         on its own.
+ 
++``--video-sync-experiment=<off|feedback|guarded>``
++    mpv-ht experimental presentation feedback and drift correction (default:
++    ``off``). ``feedback`` validates D3D11 timing and tracks optional Vulkan
++    present-completion counts, retaining the existing drift-correction policy.
++    ``guarded`` additionally filters and bounds corrections with
++    ``--video-sync=display-vdrop``. Inconsistent or unavailable timing falls
++    back to the existing policy. Changing this option recreates the video output.
++
++    Vulkan completion counts are not precise display timestamps. Neither this
++    option nor the ``video-sync-feedback`` property measures acoustic lip-sync.
++    Encoded audio is not resampled. The normal ``off`` path keeps existing
++    timing behavior. This option is experimental and is not a guaranteed cure
++    for stuttering or insufficient rendering performance.
++
+ ``--video-sync-max-factor=<value>``
+     Maximum multiple for which to try to fit the video's FPS to the display's
+     FPS (default: 5).
+diff --git a/options/options.c b/options/options.c
+index 15e1dee31..30153d902 100644
+--- a/options/options.c
++++ b/options/options.c
+@@ -190,6 +190,8 @@ static const m_option_t mp_vo_opt_list[] = {
+     {"display-fps-override", OPT_DOUBLE(display_fps_override),
+         M_RANGE(0, DBL_MAX)},
+     {"video-timing-offset", OPT_DOUBLE(timing_offset), M_RANGE(0.0, 1.0)},
++    {"video-sync-experiment", OPT_CHOICE(video_sync_experiment,
++        {"off", 0}, {"feedback", 1}, {"guarded", 2}), .flags = UPDATE_VO},
+     {"video-sync", OPT_CHOICE(video_sync,
+         {"audio", VS_DEFAULT},
+         {"display-resample", VS_DISP_RESAMPLE},
+diff --git a/options/options.h b/options/options.h
+index 15324915d..e596a3f4e 100644
+--- a/options/options.h
++++ b/options/options.h
+@@ -84,6 +84,7 @@ typedef struct mp_vo_opts {
+     double display_fps_override;
+     double timing_offset;
+     int video_sync;
++    int video_sync_experiment; // 0 legacy, 1 feedback, 2 guarded vdrop
+ 
+     struct m_geometry android_surface_size;
+ 
+diff --git a/player/audio.c b/player/audio.c
+index 64e5326f4..c8a962dfe 100644
+--- a/player/audio.c
++++ b/player/audio.c
+@@ -229,6 +229,7 @@ static void ao_chain_reset_state(struct ao_chain *ao_c)
+ 
+ void reset_audio_state(struct MPContext *mpctx)
+ {
++    ht_drift_reset(&mpctx->drift_guard);
+     secondary_audio_reset(mpctx);
+     if (mpctx->ao_chain) {
+         ao_chain_reset_state(mpctx->ao_chain);
+diff --git a/player/command.c b/player/command.c
+index 8bc64bb8e..8e97b33d5 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -3189,6 +3189,39 @@ static int mp_property_estimated_display_fps(void *ctx, struct m_property *prop,
+     return m_property_double_ro(action, arg, 1.0 / interval);
+ }
+ 
++static int mp_property_video_sync_feedback(void *ctx, struct m_property *prop,
++                                           int action, void *arg)
++{
++    MPContext *mpctx = ctx;
++    if (!mpctx->video_out) return M_PROPERTY_UNAVAILABLE;
++    struct vo_timing_state s = vo_get_timing_state(mpctx->video_out);
++    struct vo_vsync_info f = s.feedback;
++    const char *source = f.feedback_source == HT_FEEDBACK_DXGI ? "dxgi" :
++        f.feedback_source == HT_FEEDBACK_VK_COMPLETION ? "vulkan-completion" : "submission-time";
++    const char *trust = f.feedback_valid ? "validated-prediction" : "submission-time-estimate";
++    struct ht_drift_guard *g = &mpctx->drift_guard;
++    struct m_sub_property props[] = {
++        {"source", SUB_PROP_STR(source)},
++        {"timing", SUB_PROP_STR(trust)},
++        {"epoch", SUB_PROP_INT64(s.epoch)},
++        {"backend-epoch", SUB_PROP_INT64(f.feedback_epoch)},
++        {"valid", SUB_PROP_BOOL(f.feedback_valid)},
++        {"guard-ready", SUB_PROP_BOOL(s.guard_ready)},
++        {"pending", SUB_PROP_INT(f.queued), .unavailable = f.queued < 0},
++        {"submitted", SUB_PROP_INT64(f.submitted)},
++        {"completed", SUB_PROP_INT64(f.completed)},
++        {"period-ms", SUB_PROP_DOUBLE(f.vsync_duration / 1e6), .unavailable = !f.feedback_valid},
++        {"queue-estimate-ms", SUB_PROP_DOUBLE(s.queue_seconds * 1000)},
++        {"samples", SUB_PROP_INT64(s.samples)},
++        {"fallbacks", SUB_PROP_INT64(s.fallbacks)},
++        {"small-corrections", SUB_PROP_INT64(g->small_corrections)},
++        {"recovery-corrections", SUB_PROP_INT64(g->recovery_corrections)},
++        {"signed-refreshes", SUB_PROP_INT64(g->signed_refreshes)},
++        {0}
++    };
++    return m_property_read_sub(props, action, arg);
++}
++
+ static int mp_property_vsync_jitter(void *ctx, struct m_property *prop,
+                                     int action, void *arg)
+ {
+@@ -5141,6 +5174,7 @@ static const struct m_property mp_properties_base[] = {
+     {"display-fps", mp_property_display_fps},
+     {"estimated-display-fps", mp_property_estimated_display_fps},
+     {"vsync-jitter", mp_property_vsync_jitter},
++    {"video-sync-feedback", mp_property_video_sync_feedback},
+     {"display-hidpi-scale", mp_property_hidpi_scale},
+     {"ambient-light", mp_property_ambient_light},
+ 
+diff --git a/player/core.h b/player/core.h
+index 323c54213..462f80295 100644
+--- a/player/core.h
++++ b/player/core.h
+@@ -31,6 +31,7 @@
+ #include "sub/osd.h"
+ #include "video/mp_image.h"
+ #include "video/out/vo.h"
++#include "video/out/presentation_feedback.h"
+ #include "osdep/als.h"
+ #include "demux/stheader.h"
+ 
+@@ -383,6 +384,7 @@ typedef struct MPContext {
+     // the same value if the status line is updated at a time where no new
+     // video frame is shown.
+     double last_av_difference;
++    struct ht_drift_guard drift_guard;
+     /* timestamp of video frame currently visible on screen
+      * (or at least queued to be flipped by VO) */
+     double video_pts;
+diff --git a/player/video.c b/player/video.c
+index 29b5bc6bc..cf41b2021 100644
+--- a/player/video.c
++++ b/player/video.c
+@@ -98,6 +98,7 @@ static void vo_chain_reset_state(struct vo_chain *vo_c)
+ 
+ void reset_video_state(struct MPContext *mpctx)
+ {
++    ht_drift_reset(&mpctx->drift_guard);
+     if (mpctx->vo_chain) {
+         vo_chain_reset_state(mpctx->vo_chain);
+         struct track *t = mpctx->vo_chain->track;
+@@ -805,6 +806,7 @@ static void handle_display_sync_frame(struct MPContext *mpctx,
+     int mode = vo->opts->video_sync;
+ 
+     if (!mpctx->display_sync_active) {
++        ht_drift_reset(&mpctx->drift_guard);
+         mpctx->display_sync_error = 0.0;
+         mpctx->audio_drift_compensation = 0.0;
+         mpctx->avd_filtered = 0;
+@@ -861,7 +863,21 @@ static void handle_display_sync_frame(struct MPContext *mpctx,
+ 
+     // If we are too far ahead/behind, attempt to drop/repeat frames.
+     // Tolerate some desync to avoid frame dropping due to jitter.
+-    if (drop && fabs(av_diff) >= 0.020 && fabs(av_diff) / vsync >= 1)
++    bool use_guard = false;
++    if (vo->opts->video_sync_experiment == 2 && mode == VS_DISP_VDROP) {
++        struct vo_timing_state s = vo_get_timing_state(vo);
++        use_guard = s.guard_ready;
++        if (use_guard) {
++            drop_repeat = ht_drift_step(&mpctx->drift_guard, s.epoch,
++                mp_time_sec(), av_diff, vsync, frame_duration,
++                fmax(0, s.queue_seconds), num_vsyncs,
++                drop && mpctx->audio_status == STATUS_PLAYING &&
++                mpctx->video_status == STATUS_PLAYING && !mpctx->paused);
++        } else {
++            ht_drift_reset(&mpctx->drift_guard);
++        }
++    }
++    if (!use_guard && drop && fabs(av_diff) >= 0.020 && fabs(av_diff) / vsync >= 1)
+         drop_repeat = -av_diff / vsync; // round towards 0
+ 
+     // We can only drop all frames at most. We can repeat much more frames,
+diff --git a/video/filter/vf_gpu_vulkan.c b/video/filter/vf_gpu_vulkan.c
+index 71628fe91..53c4fcf25 100644
+--- a/video/filter/vf_gpu_vulkan.c
++++ b/video/filter/vf_gpu_vulkan.c
+@@ -77,7 +77,7 @@ static struct offscreen_ctx *vk_offscreen_ctx_create(struct mpv_global *global,
+ 
+     struct vulkan_opts *vk_opts = mp_get_config_group(ctx, global, &vulkan_conf);
+     vk->vulkan = mppl_create_vulkan(vk_opts, vk->vkinst, vk->pllog, VK_NULL_HANDLE,
+-                                    ctx_opts->allow_sw);
++                                    ctx_opts->allow_sw, false);
+     if (!vk->vulkan)
+         goto error;
+ 
+diff --git a/video/out/d3d11/context.c b/video/out/d3d11/context.c
+index 8bac900b2..74ac184be 100644
+--- a/video/out/d3d11/context.c
++++ b/video/out/d3d11/context.c
+@@ -27,6 +27,7 @@
+ #include "context.h"
+ #include "ra_d3d11.h"
+ #include "vsync_estimator.h"
++#include "video/out/presentation_feedback.h"
+ 
+ #ifdef PL_HAVE_D3D11
+ #include <libplacebo/d3d11.h>
+@@ -124,6 +125,9 @@ struct priv {
+     int64_t perf_freq;
+     struct d3d11_vsync_estimator vsync;
+     int64_t last_submit_qpc;
++    struct ht_dxgi_state feedback;
++    uint64_t feedback_epoch;
++    HRESULT last_present_result;
+ 
+     struct mp_dxgi_factory_ctx dxgi_ctx;
+ };
+@@ -166,6 +170,8 @@ static bool resize(struct ra_ctx *ctx)
+     }
+ 
+     d3d11_vsync_reset(&p->vsync);
++    p->feedback = (struct ht_dxgi_state){0};
++    p->feedback_epoch++;
+     return true;
+ }
+ 
+@@ -289,7 +295,7 @@ static void d3d11_swap_buffers(struct ra_swapchain *sw)
+     QueryPerformanceCounter(&perf_count);
+     p->last_submit_qpc = perf_count.QuadPart;
+ 
+-    IDXGISwapChain_Present(p->swapchain, p->opts->sync_interval, 0);
++    p->last_present_result = IDXGISwapChain_Present(p->swapchain, p->opts->sync_interval, 0);
+ }
+ 
+ static void d3d11_get_vsync(struct ra_swapchain *sw, struct vo_vsync_info *info)
+@@ -297,6 +303,15 @@ static void d3d11_get_vsync(struct ra_swapchain *sw, struct vo_vsync_info *info)
+     struct priv *p = sw->priv;
+     HRESULT hr;
+ 
++    bool experimental = sw->ctx->vo->opts->video_sync_experiment;
++    if (experimental) {
++        info->feedback_source = HT_FEEDBACK_DXGI;
++        info->feedback_epoch = p->feedback_epoch;
++        // Occluded presents and driver errors are not new display feedback.
++        if (p->last_present_result != S_OK)
++            return;
++    }
++
+     m_config_cache_update(p->opts_cache);
+ 
+     // The calculations below are only valid if mpv presents on every vsync
+@@ -328,6 +343,9 @@ static void d3d11_get_vsync(struct ra_swapchain *sw, struct vo_vsync_info *info)
+     hr = IDXGISwapChain_GetFrameStatistics(p->swapchain, &stats);
+     if (hr == DXGI_ERROR_FRAME_STATISTICS_DISJOINT) {
+         d3d11_vsync_reset(&p->vsync);
++        p->feedback = (struct ht_dxgi_state){0};
++        p->feedback_epoch++;
++        info->feedback_epoch = p->feedback_epoch;
+     }
+     if (FAILED(hr))
+         return;
+@@ -342,6 +360,22 @@ static void d3d11_get_vsync(struct ra_swapchain *sw, struct vo_vsync_info *info)
+     if (p->vsync.duration)
+         info->vsync_duration = qpc_to_ns(sw, p->vsync.duration);
+ 
++    if (experimental) {
++        int64_t now_qpc = qpc_ns_now(sw);
++        struct ht_dxgi_result f = ht_dxgi_validate(&p->feedback, submit_count,
++            stats.PresentCount, stats.PresentRefreshCount, stats.SyncRefreshCount,
++            qpc_to_ns(sw, stats.SyncQPCTime.QuadPart), now_qpc,
++            info->vsync_duration, 0);
++        info->feedback_valid = f.valid;
++        info->submitted = submit_count;
++        info->completed = stats.PresentCount;
++        info->queued = f.queued;
++        info->skipped_vsyncs = f.skipped;
++        if (f.valid)
++            info->last_queue_display_time = mp_time_ns() + f.predicted - now_qpc;
++        return;
++    }
++
+     // If the physical frame rate is known and the other members of
+     // DXGI_FRAME_STATISTICS are non-0, estimate the timing of the next frame
+     if (p->vsync.duration && stats.PresentCount &&
+diff --git a/video/out/presentation_feedback.h b/video/out/presentation_feedback.h
+new file mode 100644
+index 000000000..daf7cc125
+--- /dev/null
++++ b/video/out/presentation_feedback.h
+@@ -0,0 +1,146 @@
++#pragma once
++
++// Pure policy helpers: no driver calls, sleeps, allocation or logging.
++#include <stdbool.h>
++#include <stdint.h>
++#include <math.h>
++
++enum ht_feedback_source { HT_FEEDBACK_FALLBACK, HT_FEEDBACK_DXGI,
++                          HT_FEEDBACK_VK_COMPLETION };
++
++struct ht_dxgi_state {
++    uint32_t present, refresh;
++    int64_t last_advance;
++    bool initialized, blocked;
++};
++
++struct ht_dxgi_result {
++    bool valid;
++    int queued;
++    int64_t predicted, skipped;
++};
++
++static inline struct ht_dxgi_result ht_dxgi_validate(
++    struct ht_dxgi_state *s, uint32_t submitted, uint32_t presented,
++    uint32_t present_refresh, uint32_t sync_refresh, int64_t sync_time,
++    int64_t now, int64_t period, int64_t nominal)
++{
++    struct ht_dxgi_result r = {.queued = -1, .skipped = -1};
++    // Counter differences are modulo 2^32. The bounded queue also rejects
++    // unexplained counter regression/reset instead of extrapolating it.
++    uint32_t pending = submitted - presented;
++    int32_t age = (int32_t)(sync_refresh - present_refresh);
++    if (!presented || !present_refresh || !sync_refresh || sync_time <= 0 ||
++        period < 2500000 || period > 50000000 || pending > 64 ||
++        age < -2 || age > 64 || sync_time > now + period ||
++        now - sync_time > 500000000 ||
++        (nominal > 0 && fabs((double)period / nominal - 1) > 0.05))
++        goto invalid;
++    if (s->blocked && presented == s->present && present_refresh == s->refresh)
++        goto invalid;
++    if (!s->initialized) {
++        s->initialized = true;
++        s->blocked = false;
++        s->last_advance = now;
++    } else {
++        uint32_t dp = presented - s->present, dr = present_refresh - s->refresh;
++        if (dp > 128 || dr > 128 || (dp == 0 && dr != 0))
++            goto invalid;
++        if (dp) {
++            s->last_advance = now;
++            // Only the caller knows whether every refresh was intended.
++            r.skipped = dr >= dp ? dr - dp : -1;
++        } else {
++            r.skipped = 0; // repeated statistics are not additional misses
++        }
++    }
++    s->present = presented;
++    s->refresh = present_refresh;
++    if (now - s->last_advance > (period * 8 > 250000000 ? period * 8 : 250000000))
++        goto invalid;
++    r.predicted = sync_time + ((int64_t)pending - age) * period;
++    if (r.predicted < now - period * 2 ||
++        r.predicted > now + (pending + 2) * period)
++        goto invalid;
++    r.valid = true;
++    r.queued = pending;
++    return r;
++invalid:
++    *s = (struct ht_dxgi_state){.present = presented, .refresh = present_refresh,
++        .last_advance = now, .blocked = true};
++    return (struct ht_dxgi_result){.queued = -1, .skipped = -1};
++}
++
++struct ht_drift_guard {
++    uint64_t epoch;
++    double filtered, persistence, cooldown_until, last_time;
++    int direction;
++    int64_t small_corrections, recovery_corrections, signed_refreshes;
++};
++
++static inline bool ht_guard_timing_ready(bool validated, int samples,
++    double chosen_period, double measured_period, double jitter, double age)
++{
++    if (!isfinite(age) || age < 0 || age > 0.25) return false;
++    if (validated) return true;
++    return samples >= 32 && chosen_period > 0 && measured_period > 0 &&
++        isfinite(jitter) && jitter >= 0 && jitter < 0.05 &&
++        fabs(measured_period / chosen_period - 1) < 0.05;
++}
++
++static inline void ht_drift_reset(struct ht_drift_guard *g)
++{
++    *g = (struct ht_drift_guard){0};
++}
++
++// avdiff already includes the scheduler's queued correction offset. Never
++// subtract that correction a second time. Cooldown permits it to reach output.
++static inline int ht_drift_step(struct ht_drift_guard *g, uint64_t epoch,
++    double now, double error, double period, double frame_duration,
++    double queue_seconds, int holds, bool eligible)
++{
++    if (!eligible || !isfinite(error) || !isfinite(period) || period <= 0 ||
++        !isfinite(queue_seconds) || !isfinite(frame_duration)) {
++        ht_drift_reset(g);
++        return 0;
++    }
++    if (g->epoch != epoch || now <= g->last_time || now - g->last_time > 0.5) {
++        // Keep diagnostic totals for this scheduler lifetime across epochs.
++        g->epoch = epoch;
++        g->filtered = g->persistence = 0;
++        g->direction = 0;
++        g->cooldown_until = now + fmax(0.25, queue_seconds + 2 * frame_duration);
++    }
++    double dt = fmin(fmax(now - g->last_time, 0), 0.1);
++    g->last_time = now;
++    if (now < g->cooldown_until)
++        return 0;
++    g->filtered += (1 - exp(-dt / 0.1)) * (error - g->filtered);
++    double threshold = fmax(0.020, period);
++    int sign = error > 0 ? 1 : -1;
++    bool large = fabs(error) >= fmax(0.150, 4 * period);
++    if (fabs(error) < threshold || (!large && fabs(g->filtered) < threshold) ||
++        error * g->filtered <= 0) {
++        g->persistence = 0;
++        g->direction = 0;
++        return 0;
++    }
++    if (g->direction != sign) {
++        g->direction = sign;
++        g->persistence = 0;
++    }
++    g->persistence += dt;
++    if (g->persistence < (large ? fmax(frame_duration, 0.04) : 0.15))
++        return 0;
++    int count = large ? fmin(4, fabs(error) / period) : 1;
++    int correction = -sign * count;
++    if (correction < -holds) correction = -holds;
++    if (correction > holds * 10) correction = holds * 10;
++    if (!correction) return 0;
++    g->cooldown_until = now + fmax(0.15, queue_seconds + 2 * period);
++    g->filtered = g->persistence = 0;
++    g->direction = 0;
++    g->signed_refreshes += correction;
++    if (large) g->recovery_corrections++; else g->small_corrections++;
++    return correction;
++}
+diff --git a/video/out/vo.c b/video/out/vo.c
+index dfea9efc2..3c7b9e7f9 100644
+--- a/video/out/vo.c
++++ b/video/out/vo.c
+@@ -26,6 +26,7 @@
+ #include "mpv_talloc.h"
+ 
+ #include "config.h"
++#include "presentation_feedback.h"
+ #include "osdep/timer.h"
+ #include "osdep/threads.h"
+ #include "misc/dispatch.h"
+@@ -120,6 +121,7 @@ static const struct vo_driver *const video_out_drivers[] =
+ };
+ 
+ struct vo_internal {
++    struct vo_timing_state timing;
+     mp_thread thread;
+     struct mp_dispatch_queue *dispatch;
+     struct dr_helper *dr_helper;
+@@ -389,6 +391,13 @@ static void wakeup_core(struct vo *vo)
+ static void reset_vsync_timings(struct vo *vo)
+ {
+     struct vo_internal *in = vo->in;
++    if (vo->opts->video_sync_experiment) {
++        in->timing.epoch = mp_time_ns();
++        in->num_vsync_samples = in->num_total_vsync_samples = 0;
++        in->estimated_vsync_interval = in->estimated_vsync_jitter = 0;
++        in->prev_vsync = 0;
++        in->vsync_interval = MPMAX(in->nominal_vsync_interval, 1);
++    }
+     in->drop_point = 0;
+     in->base_vsync = 0;
+     in->expecting_vsync = false;
+@@ -477,7 +486,7 @@ static void vsync_skip_detection(struct vo *vo)
+ }
+ 
+ // Always called locked.
+-static void update_vsync_timing_after_swap(struct vo *vo,
++static void update_vsync_timing_legacy(struct vo *vo,
+                                            struct vo_vsync_info *vsync)
+ {
+     struct vo_internal *in = vo->in;
+@@ -534,6 +543,48 @@ static void update_vsync_timing_after_swap(struct vo *vo,
+     MP_STATS(vo, "value %f vsync-diff", MP_TIME_NS_TO_S(in->vsync_samples[0]));
+ }
+ 
++static void update_vsync_timing_after_swap(struct vo *vo, struct vo_vsync_info *v)
++{
++    struct vo_internal *in = vo->in;
++    if (!vo->opts->video_sync_experiment) {
++        update_vsync_timing_legacy(vo, v);
++        return;
++    }
++    struct vo_vsync_info *old = &in->timing.feedback;
++    // The hardware epoch, trust changes and a refresh-rate change must not
++    // share a phase history. Preserve whether the scheduler expects VSync.
++    bool expecting = in->expecting_vsync;
++    bool valid = v->feedback_valid && v->vsync_duration >= 2500000 &&
++        v->vsync_duration <= 50000000 && v->last_queue_display_time > 0 &&
++        (in->nominal_vsync_interval <= 0 ||
++         fabs(v->vsync_duration / in->nominal_vsync_interval - 1) <= 0.05);
++    v->feedback_valid = valid;
++    if (v->feedback_epoch != old->feedback_epoch ||
++        v->feedback_source != old->feedback_source || valid != old->feedback_valid) {
++        reset_vsync_timings(vo);
++        in->expecting_vsync = expecting;
++    }
++    in->timing.feedback = *v;
++    in->timing.updated = mp_time_ns();
++    in->timing.samples++;
++    if (!valid || !expecting) {
++        in->timing.fallbacks += !valid;
++        // Do not use rejected backend forecasts. Submission-time estimation
++        // remains the legacy fallback, explicitly marked as such in telemetry.
++        if (!valid) v->last_queue_display_time = in->timing.updated;
++        update_vsync_timing_legacy(vo, v);
++        return;
++    }
++    // The DXGI duration is already estimated from physical refresh/QPC pairs.
++    // Queue-depth changes must not be mistaken for refresh-period changes.
++    in->vsync_interval = v->vsync_duration;
++    in->estimated_vsync_interval = v->vsync_duration;
++    in->base_vsync = in->prev_vsync = v->last_queue_display_time;
++    in->num_successive_vsyncs++;
++    if (in->num_successive_vsyncs > 10 && v->skipped_vsyncs > 0)
++        in->delayed_count += v->skipped_vsyncs;
++}
++
+ // to be called from VO thread only
+ static void update_display_fps(struct vo *vo)
+ {
+@@ -561,6 +612,9 @@ static void update_display_fps(struct vo *vo)
+         in->vsync_interval = MPMAX(in->nominal_vsync_interval, 1);
+         in->display_fps = display_fps;
+ 
++        if (vo->opts->video_sync_experiment)
++            reset_vsync_timings(vo);
++
+         MP_VERBOSE(vo, "Assuming %f FPS for display sync.\n", display_fps);
+ 
+         // make sure to update the player
+@@ -1023,6 +1077,7 @@ static bool render_frame(struct vo *vo)
+         struct vo_vsync_info vsync = {
+             .last_queue_display_time = -1,
+             .skipped_vsyncs = -1,
++            .queued = -1,
+         };
+         if (vo->driver->get_vsync)
+             vo->driver->get_vsync(vo, &vsync);
+@@ -1410,6 +1465,25 @@ double vo_get_delay(struct vo *vo)
+     return res ? MP_TIME_NS_TO_S(res - mp_time_ns()) : 0;
+ }
+ 
++struct vo_timing_state vo_get_timing_state(struct vo *vo)
++{
++    struct vo_internal *in = vo->in;
++    mp_mutex_lock(&in->lock);
++    struct vo_timing_state s = in->timing;
++    int64_t end = get_display_synced_frame_end(vo);
++    int64_t now = mp_time_ns();
++    s.queue_seconds = end ? MP_TIME_NS_TO_S(end - now) : 0;
++    if (!s.samples) s.feedback.queued = -1;
++    if (now - s.updated > 250000000)
++        s.feedback.feedback_valid = false;
++    s.guard_ready = in->expecting_vsync && ht_guard_timing_ready(
++        s.feedback.feedback_valid, in->num_vsync_samples,
++        in->vsync_interval, in->estimated_vsync_interval,
++        in->estimated_vsync_jitter, MP_TIME_NS_TO_S(now - s.updated));
++    mp_mutex_unlock(&in->lock);
++    return s;
++}
++
+ void vo_discard_timing_info(struct vo *vo)
+ {
+     struct vo_internal *in = vo->in;
+diff --git a/video/out/vo.h b/video/out/vo.h
+index f7a72a5f6..e3243365b 100644
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -348,6 +348,11 @@ struct vo_frame {
+ // Presentation feedback. See get_vsync() for how backends should fill this
+ // struct.
+ struct vo_vsync_info {
++    // mpv-ht opt-in feedback metadata. Queue counts alone do not imply timing.
++    int feedback_source;
++    uint64_t feedback_epoch, submitted, completed;
++    int queued; // -1 unavailable; completion notification can lag scanout
++    bool feedback_valid;
+     // mp_time_ns() timestamp at which the last queued frame will likely be
+     // displayed (this is in the future, unless the frame is instantly output).
+     // 0 or lower if unset or unsupported.
+@@ -374,6 +379,15 @@ struct vo_vsync_info {
+     int64_t skipped_vsyncs;
+ };
+ 
++struct vo_timing_state {
++    struct vo_vsync_info feedback;
++    uint64_t epoch;
++    int64_t samples, fallbacks, updated;
++    double queue_seconds;
++    bool guard_ready;
++};
++struct vo_timing_state vo_get_timing_state(struct vo *vo);
++
+ struct vo_driver {
+     // Encoding functionality, which can be invoked via --o only.
+     bool encode;
+diff --git a/video/out/vulkan/context.c b/video/out/vulkan/context.c
+index 4fcdf1156..80b48787e 100644
+--- a/video/out/vulkan/context.c
++++ b/video/out/vulkan/context.c
+@@ -24,6 +24,7 @@
+ #include "video/out/placebo/utils.h"
+ 
+ #include "context.h"
++#include "video/out/presentation_feedback.h"
+ 
+ struct vulkan_opts {
+     char *device; // force a specific GPU
+@@ -185,7 +186,7 @@ pl_vulkan mppl_create_vulkan(struct vulkan_opts *opts,
+                              pl_vk_inst vkinst,
+                              pl_log pllog,
+                              VkSurfaceKHR surface,
+-                             bool allow_software)
++                             bool allow_software, bool present_feedback)
+ {
+     VkPhysicalDeviceFeatures2 features = {
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+@@ -240,6 +241,9 @@ pl_vulkan mppl_create_vulkan(struct vulkan_opts *opts,
+ #ifdef VK_KHR_video_decode_vp9
+         VK_KHR_VIDEO_DECODE_VP9_EXTENSION_NAME, /* 1.4.317 */
+ #endif
++        // The final two entries are requested only for the opt-in prototype.
++        VK_KHR_PRESENT_ID_EXTENSION_NAME,
++        VK_KHR_PRESENT_WAIT_EXTENSION_NAME,
+     };
+ 
+     /*
+@@ -388,7 +392,17 @@ pl_vulkan mppl_create_vulkan(struct vulkan_opts *opts,
+         },
+     };
+ 
+-    features.pNext = &recommended_features;
++    VkPhysicalDevicePresentIdFeaturesKHR present_id = {
++        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
++        .pNext = &recommended_features,
++        .presentId = true,
++    };
++    VkPhysicalDevicePresentWaitFeaturesKHR present_wait = {
++        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR,
++        .pNext = &present_id,
++        .presentWait = true,
++    };
++    features.pNext = present_feedback ? (void *)&present_wait : &recommended_features;
+ 
+     AVUUID param_uuid = { 0 };
+     bool is_uuid = opts->device &&
+@@ -406,7 +420,7 @@ pl_vulkan mppl_create_vulkan(struct vulkan_opts *opts,
+         .queue_count = opts->queue_count,
+         .extra_queues = VK_QUEUE_VIDEO_DECODE_BIT_KHR,
+         .opt_extensions = opt_extensions,
+-        .num_opt_extensions = MP_ARRAY_SIZE(opt_extensions),
++        .num_opt_extensions = MP_ARRAY_SIZE(opt_extensions) - (present_feedback ? 0 : 2),
+         .features = &features,
+         .device_name = is_uuid ? NULL : opts->device,
+     };
+@@ -431,7 +445,7 @@ bool ra_vk_ctx_init(struct ra_ctx *ctx, struct mpvk_ctx *vk,
+     p->opts = mp_get_config_group(p, ctx->global, &vulkan_conf);
+ 
+     vk->vulkan = mppl_create_vulkan(p->opts, vk->vkinst, vk->pllog, vk->surface,
+-                                    ctx->opts.allow_sw);
++                                    ctx->opts.allow_sw, ctx->vo->opts->video_sync_experiment);
+     if (!vk->vulkan)
+         goto error;
+ 
+@@ -455,6 +469,9 @@ bool ra_vk_ctx_init(struct ra_ctx *ctx, struct mpvk_ctx *vk,
+     if (!vk->swapchain)
+         goto error;
+ 
++    if (ctx->vo->opts->video_sync_experiment)
++        pl_vulkan_swapchain_enable_feedback(vk->swapchain);
++
+     return true;
+ 
+ error:
+@@ -540,6 +557,16 @@ static void get_vsync(struct ra_swapchain *sw,
+                       struct vo_vsync_info *info)
+ {
+     struct priv *p = sw->priv;
++    if (sw->ctx->vo->opts->video_sync_experiment) {
++        struct pl_vulkan_present_feedback f = pl_vulkan_swapchain_feedback(p->vk->swapchain);
++        info->feedback_source = HT_FEEDBACK_VK_COMPLETION;
++        info->feedback_epoch = f.epoch;
++        info->submitted = f.submitted;
++        info->completed = f.completed;
++        info->queued = f.available && f.submitted - f.completed <= INT_MAX
++            ? f.submitted - f.completed : -1;
++        // Deliberately leave timing invalid: completion has no precise time.
++    }
+     if (p->params.get_vsync)
+         p->params.get_vsync(sw->ctx, info);
+ }
+diff --git a/video/out/vulkan/context.h b/video/out/vulkan/context.h
+index c3013edbd..12306a848 100644
+--- a/video/out/vulkan/context.h
++++ b/video/out/vulkan/context.h
+@@ -14,7 +14,7 @@ pl_vulkan mppl_create_vulkan(struct vulkan_opts *opts,
+                              pl_vk_inst vkinst,
+                              pl_log pllog,
+                              VkSurfaceKHR surface,
+-                             bool allow_software);
++                             bool allow_software, bool present_feedback);
+ 
+ // Handles a resize request, and updates ctx->vo->dwidth/dheight
+ bool ra_vk_ctx_resize(struct ra_ctx *ctx, int width, int height);
+-- 
+2.54.0.windows.1
+
