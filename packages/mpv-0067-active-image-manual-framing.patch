@@ -1,0 +1,315 @@
+From: mpv-ht development <mpv-ht@localhost>
+Date: Wed, 30 Sep 2026 12:00:00 -0400
+Subject: [PATCH] gpu-next: reject asymmetric mattes and compose manual framing
+
+Veto a centered crop when independent edge evidence proves a full-width
+matte opposite full-width picture. Preserve localized breakout handling.
+
+Intersect detected and explicit source crops before rotation and fitting.
+Honor unscaled, pan, stretch, scale and margins without double-applying
+the ordinary pre-clipped source rectangle. Share live/screenshot geometry.
+Depends on the existing Fill/zoom geometry fixes; follows patch 0066.
+
+---
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 30a0a9b..ae28e12 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -1193,6 +1193,57 @@ static int bar_paired_matte_tiles(const struct bar_gpu_data *data, int y,
+     return matte;
+ }
+ 
++static bool bar_asymmetric_mattes(struct priv *p,
++                                  const struct bar_gpu_data *data, int height,
++                                  int boundary, uint32_t black)
++{
++    // A paired vote alone can mistake a one-sided matte for two matching bars.
++    // Reject that aperture when either edge independently shows a full-width
++    // matte opposite full-width picture. Localized subtitles/breakouts do not
++    // meet this deliberately strong veto. Two adjacent rows avoid single-row
++    // codec noise; this is spatial evidence, not a temporal debounce.
++    // Both outer edges can be genuine matte while a few rows at the picture
++    // boundary differ because of codec residue or a tiny authored offset.
++    // Keep the existing eight-row boundary tolerance in that case. Do not
++    // grant it to one-sided mattes, even very thin ones.
++    bool common_outer_matte = true;
++    for (int y = 0; y < 2; y++) {
++        for (int edge = 0; edge < 2; edge++) {
++            int matte = 0;
++            for (int t = 0; t < BAR_ANALYSIS_TILES; t++)
++                matte += bar_tile_is_matte(
++                    data->tiles[edge ? height - 1 - y : y][t], black);
++            common_outer_matte &= matte * 10 >= BAR_ANALYSIS_TILES * 9;
++        }
++    }
++    int end = common_outer_matte ? MPMAX(0, boundary - 8) : boundary;
++    int run[2] = {0};
++    for (int y = 0; y < end; y++) {
++        int matte[2] = {0}, picture[2] = {0};
++        for (int t = 0; t < BAR_ANALYSIS_TILES; t++) {
++            for (int edge = 0; edge < 2; edge++) {
++                uint32_t tile = data->tiles[edge ? height - 1 - y : y][t];
++                matte[edge] += bar_tile_is_matte(tile, black);
++                // Failing the tight matte test is not proof of picture:
++                // compressed black can be nonuniform while remaining dark.
++                picture[edge] += (tile & 0xffffu) > black + 2048;
++            }
++        }
++        for (int edge = 0; edge < 2; edge++) {
++            bool asymmetric = matte[edge] * 10 >= BAR_ANALYSIS_TILES * 9 &&
++                              picture[1 - edge] * 10 >= BAR_ANALYSIS_TILES * 9;
++            run[edge] = asymmetric ? run[edge] + 1 : 0;
++            if (run[edge] >= 2) {
++                MP_TRACE(p, "Active image asymmetric matte veto edge=%d "
++                         "rows=%d..%d boundary=%d.\n",
++                         edge, y - run[edge] + 1, y, boundary);
++                return true;
++            }
++        }
++    }
++    return false;
++}
++
+ static bool find_spatial_bar_boundary(const struct bar_gpu_data *data,
+                                       int height, uint32_t black,
+                                       int *boundary, int *support)
+@@ -1438,7 +1489,15 @@ static void store_bar_result(struct priv *p, uint64_t tag, int width, int height
+                 boundary_found = legacy_found;
+             }
+             result.boundary_exact = legacy_found;
+-            if (result.breakout && have_previous)
++            bool asymmetric = boundary_found &&
++                bar_asymmetric_mattes(p, data, height, centered, black);
++            if (asymmetric) {
++                // This is positive evidence against a centered crop, not an
++                // indeterminate black frame: clear even a previous aperture.
++                centered = 0;
++                result.breakout = false;
++            }
++            if (!asymmetric && result.breakout && have_previous)
+             {
+                 centered = previous.top;
+             }
+@@ -1447,7 +1506,8 @@ static void store_bar_result(struct priv *p, uint64_t tag, int width, int height
+             // that matte on both sides across the width. Breakout effects leave
+             // a substantial portion of the old matte line intact, even when
+             // their total envelope reaches the encoded frame edges.
+-            if (boundary_found && have_previous && centered < previous.top)
++            if (!asymmetric && boundary_found && have_previous &&
++                centered < previous.top)
+             {
+                 int prior_top = previous.top;
+                 if (result.breakout)
+@@ -1814,22 +1874,72 @@ static double active_display_ratio(const struct mp_image_params *params,
+     return ratio;
+ }
+ 
+-static struct mp_rect rotated_active_source_rect(struct priv *p, uint64_t tag,
++static struct mp_rect user_source_rect(const struct mp_image_params *params)
++{
++    return mp_image_crop_valid(params) ? params->crop
++        : (struct mp_rect) {0, 0, params->w, params->h};
++}
++
++static struct mp_rect cropped_active_source_rect(struct priv *p, uint64_t tag,
+                                                   const struct mp_image_params *params)
++{
++    struct mp_rect src = active_source_rect(p, tag, params->w, params->h);
++    struct mp_rect user = user_source_rect(params);
++    // Compose in unrotated source coordinates, before pan/zoom clipping. An
++    // explicit crop selecting only a matte must not restore excluded picture.
++    if (!mp_rect_intersection(&src, &user))
++        src = user;
++    return src;
++}
++
++static struct mp_rect rotate_source_rect(struct mp_rect src,
++                                         const struct mp_image_params *params)
+ {
+     int width = params->w, height = params->h;
+-    struct mp_rect src = active_source_rect(p, tag, width, height);
+     if (params->rotate % 180 == 90)
+         MPSWAP(int, width, height);
+     mp_rect_rotate(&src, width, height, params->rotate);
+     return src;
+ }
+ 
++static struct mp_rect rotated_active_source_rect(struct priv *p, uint64_t tag,
++                                                  const struct mp_image_params *params)
++{
++    return rotate_source_rect(cropped_active_source_rect(p, tag, params), params);
++}
++
++static int active_coord(double value)
++{
++    // Leave room for rectangle differences, even with extreme manual pan/zoom.
++    return lrint(MPCLAMP(value, -INT_MAX / 4.0, INT_MAX / 4.0));
++}
++
++static void active_canvas_margin(int *start, int *end, const float margin[2])
++{
++    int size = *end - *start;
++    int a = MPCLAMP((int) (size * margin[0]), 0, size);
++    int b = MPCLAMP((int) (size * margin[1]), 0, size);
++    if (a + b >= size) {
++        a = 0;
++        b = MPMAX(0, size - 1);
++    }
++    *start += a;
++    *end -= b;
++}
++
+ static struct mp_rect fit_active_destination(struct mp_rect canvas,
+-                                             double source_ar,
+-                                             float align_x, float align_y,
+-                                             float panscan, float zoom)
++                                             const struct mp_image_params *params,
++                                             const struct mp_vo_opts *opts,
++                                             double monitor_par)
+ {
++    // Stretch deliberately ignores aspect, pan and zoom, just as aspect.c does.
++    if (!opts->keepaspect)
++        return canvas;
++    active_canvas_margin(&canvas.x0, &canvas.x1, opts->margin_x);
++    active_canvas_margin(&canvas.y0, &canvas.y1, opts->margin_y);
++    struct mp_rect aperture = user_source_rect(params);
++    double source_ar = active_display_ratio(params, mp_rect_w(aperture),
++                                             mp_rect_h(aperture)) * monitor_par;
+     int cw = mp_rect_w(canvas), ch = mp_rect_h(canvas);
+     if (cw < 1 || ch < 1 || !isfinite(source_ar) || source_ar <= 0)
+         return canvas;
+@@ -1839,14 +1949,36 @@ static struct mp_rect fit_active_destination(struct mp_rect canvas,
+     // uniform scale, including Fullscreen UI's fixed Video scale adjustment.
+     double fit_h = MPMIN(ch, cw / source_ar);
+     double fill_h = MPMAX(ch, cw / source_ar);
+-    double scaled_h = (fit_h + (fill_h - fit_h) * panscan) * exp2(zoom);
++    double panscan = opts->unscaled ? 0 : opts->panscan;
++    double scaled_h = fit_h + (fill_h - fit_h) * panscan;
++    double scaled_w = scaled_h * source_ar;
++    if (opts->unscaled) {
++        int dw, dh;
++        mp_image_params_get_dsize(params, &dw, &dh);
++        if (params->rotate % 180 == 90)
++            MPSWAP(int, dw, dh);
++        if (opts->unscaled != 2 || (dw <= cw && dh <= ch)) {
++            scaled_w = dw * monitor_par;
++            scaled_h = dh;
++        }
++    }
++    scaled_w *= exp2(opts->zoom) * opts->scale_x;
++    scaled_h *= exp2(opts->zoom) * opts->scale_y;
+     // Keep integer rectangles representable even at video-zoom's +/-20 limits.
+-    scaled_h = MPMIN(scaled_h, (INT_MAX / 4.0) / MPMAX(1.0, source_ar));
+-    int w = MPMAX(1, lrint(scaled_h * source_ar));
+-    int h = MPMAX(1, lrint(scaled_h));
+-    int x = canvas.x0 + lrint((cw - w) * (MPCLAMP(align_x, -1, 1) + 1) / 2);
+-    int y = canvas.y0 + lrint((ch - h) * (MPCLAMP(align_y, -1, 1) + 1) / 2);
+-    return (struct mp_rect) {x, y, x + w, y + h};
++    double limit = MPMAX(1.0, MPMAX(scaled_w, scaled_h) / (INT_MAX / 8.0));
++    int w = MPMAX(1, lrint(scaled_w / limit));
++    int h = MPMAX(1, lrint(scaled_h / limit));
++    float ax = opts->recenter && cw >= w ? 0 : opts->align_x;
++    float ay = opts->recenter && ch >= h ? 0 : opts->align_y;
++    double x = canvas.x0 + (cw - w) * (MPCLAMP(ax, -1, 1) + 1) / 2.0 +
++               (double) opts->pan_x * w;
++    double y = canvas.y0 + (ch - h) * (MPCLAMP(ay, -1, 1) + 1) / 2.0 +
++               (double) opts->pan_y * h;
++    // Round the origin once, then preserve the integer extent. Rounding both
++    // half-pixel endpoints separately can collapse a one-pixel zoom to zero.
++    int ix = active_coord(x), iy = active_coord(y);
++    return (struct mp_rect) {ix, iy, active_coord((double) ix + w),
++                             active_coord((double) iy + h)};
+ }
+ 
+ static struct mp_rect map_source_to_active_destination(
+@@ -1866,15 +1998,15 @@ static struct mp_rect map_source_to_active_destination(
+     double scale_x = (double) mp_rect_w(active_dst) / aw;
+     double scale_y = (double) mp_rect_h(active_dst) / ah;
+     return (struct mp_rect) {
+-        active_dst.x0 + lrint((sx0 - ax) * scale_x),
+-        active_dst.y0 + lrint((sy0 - ay) * scale_y),
+-        active_dst.x0 + lrint((sx1 - ax) * scale_x),
+-        active_dst.y0 + lrint((sy1 - ay) * scale_y),
++        active_coord(active_dst.x0 + (sx0 - ax) * scale_x),
++        active_coord(active_dst.y0 + (sy0 - ay) * scale_y),
++        active_coord(active_dst.x0 + (sx1 - ax) * scale_x),
++        active_coord(active_dst.y0 + (sy1 - ay) * scale_y),
+     };
+ }
+ 
+ struct active_geometry {
+-    struct mp_rect dst;
++    struct mp_rect src, dst;
+     bool automatic, crop;
+ };
+ 
+@@ -1884,9 +2016,11 @@ static struct active_geometry resolve_active_geometry(struct vo *vo,
+                                                        int width, int height)
+ {
+     struct priv *p = vo->priv;
+-    struct active_geometry geometry = {.dst = p->dst};
++    struct active_geometry geometry = {.src = p->src, .dst = p->dst};
+     if (!p->next_opts->active_image_detection || !vo->opts->fullscreen ||
+-        !vo->params)
++        !vo->params || !p->active_image_available ||
++        p->active_image.source_w != vo->params->w ||
++        p->active_image.source_h != vo->params->h)
+         return geometry;
+ 
+     struct mp_rect canvas = {0, 0, width, height};
+@@ -1901,26 +2035,22 @@ static struct active_geometry resolve_active_geometry(struct vo *vo,
+     geometry.automatic = p->next_opts->automatic_aspect_ratio &&
+         (int64_t) mp_rect_w(canvas) * 9 > (int64_t) mp_rect_h(canvas) * 16;
+     geometry.crop = p->next_opts->automatic_aspect_ratio_crop;
+-    if ((!geometry.automatic && !geometry.crop) || !p->active_image_available ||
+-        p->active_image.source_w != vo->params->w ||
+-        p->active_image.source_h != vo->params->h)
++    if (!geometry.automatic && !geometry.crop)
+         return geometry;
+ 
+-    int active_h = p->active_image.source_h - p->active_image.top -
+-                   p->active_image.bottom;
+-    double ratio = active_display_ratio(vo->params,
+-                                        p->active_image.source_w, active_h);
+-    // mpv's monitor PAR is the correction applied to destination pixel width.
+-    if (p->osd_res.display_par > 0)
+-        ratio *= p->osd_res.display_par;
+-    geometry.dst = fit_active_destination(canvas, ratio,
+-                                           vo->opts->align_x, vo->opts->align_y,
+-                                           vo->opts->panscan, vo->opts->zoom);
++    struct mp_image_params active = *vo->params;
++    active.crop = cropped_active_source_rect(p, p->active_image.tag, vo->params);
++    struct mp_rect aperture = rotate_source_rect(active.crop, &active);
++    geometry.src = aperture;
++    geometry.dst = fit_active_destination(canvas, &active, vo->opts,
++        p->osd_res.display_par > 0 ? p->osd_res.display_par : 1.0);
+     if (geometry.automatic && !geometry.crop) {
+-        struct mp_rect aperture = rotated_active_source_rect(
+-            p, p->active_image.tag, vo->params);
++        // Preserve authored overflow, but never resurrect pixels excluded by
++        // video-crop. p->src is already pan/zoom-clipped and would double-apply
++        // those controls when mapped through our transformed destination.
++        geometry.src = rotate_source_rect(user_source_rect(vo->params), vo->params);
+         geometry.dst = map_source_to_active_destination(geometry.dst,
+-                                                         p->src, aperture);
++                                                         geometry.src, aperture);
+     }
+     return geometry;
+ }
+@@ -3113,7 +3243,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+ #endif
+             struct mp_rect src = hard_crop_effective
+                 ? rotated_active_source_rect(p, fp->causal_scene_tag, vo->params)
+-                : p->src;
++                : geometry.src;
+             if (detected_framing_effective) {
+                 apply_active_crops(image, &target, src, geometry.dst,
+                                    vo->params->w, vo->params->h,
+@@ -3700,6 +3830,7 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
+         struct active_geometry geometry = resolve_active_geometry(
+             vo, fbo->params.w, fbo->params.h);
+         dst = geometry.dst;
++        src = geometry.src;
+         detected_framing = geometry.automatic || geometry.crop;
+         if (geometry.crop) {
+             struct frame_priv *fp = mpi->priv;

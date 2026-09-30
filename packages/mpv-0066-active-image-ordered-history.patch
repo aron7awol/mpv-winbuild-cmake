@@ -1,0 +1,255 @@
+From: mpv-ht development <mpv-ht@localhost>
+Date: Wed, 30 Sep 2026 01:00:00 -0400
+Subject: [PATCH] gpu-next: keep active-image history in source order
+
+Do not classify prefetched frames against current presentation state.
+Use a separate source-ordered aperture history and consume readbacks by
+frame tag rather than recycled slot index, without waiting for the GPU.
+A cleared aperture now terminates all following breakout holds instead
+of letting multiple stale histories perpetuate alternating crops.
+
+Invalidate prior-generation readbacks on seeks and detector toggles,
+without releasing GPU-owned buffers for premature reuse. Preserve
+the existing frame-exact cut and micro-motion presentation policies.
+
+---
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 4bb42ac..30a0a9b 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -128,6 +128,7 @@ struct bar_analysis_slot {
+     pl_buf buf;
+     bool pending;
+     uint64_t tag;
++    uint64_t generation;
+     int width, height;
+ };
+ 
+@@ -180,6 +181,10 @@ struct priv {
+     struct bar_analysis_slot bar_slots[BAR_ANALYSIS_SLOTS];
+     struct bar_result bar_results[BAR_RESULT_CACHE];
+     int bar_result_next;
++    // Analysis history belongs to source order, not to the currently displayed
++    // frame. Readback can lead presentation by several frames.
++    struct bar_result bar_history;
++    uint64_t bar_history_tag;
+     struct bar_gpu_data bar_readback;
+     uint64_t bar_timings[BAR_TIMING_SAMPLES];
+     int bar_timing_count, bar_timing_next;
+@@ -1218,6 +1223,19 @@ static bool find_spatial_bar_boundary(const struct bar_gpu_data *data,
+ static void store_bar_result(struct priv *p, uint64_t tag, int width, int height,
+                              const struct bar_gpu_data *data)
+ {
++    if (tag <= p->bar_history_tag)
++        return; // stale readback or an already analyzed paused redraw
++    struct bar_result previous = p->bar_history;
++    bool have_previous = previous.valid && previous.source_w == width &&
++                         previous.source_h == height;
++    // A skipped/unreadable measurement cannot prove a continuous breakout.
++    if (tag != p->bar_history_tag + 1) {
++        previous.breakout = false;
++        p->bar_history.breakout = false;
++    }
++    if (!have_previous)
++        p->bar_history = (struct bar_result) {0};
++    p->bar_history_tag = tag;
+     struct bar_result result = {
+         .tag = tag,
+         .source_w = width,
+@@ -1241,42 +1259,38 @@ static void store_bar_result(struct priv *p, uint64_t tag, int width, int height
+     result.black = black;
+ 
+     bool outer_breakout_hold = false;
+-    if (black > 6000 && p->active_image_available &&
+-        p->active_image.source_w == width &&
+-        p->active_image.source_h == height &&
+-        p->active_image.top > 0 && p->active_image.breakout)
++    if (black > 6000 && have_previous &&
++        previous.top > 0 && previous.breakout)
+     {
+         // Once a localized excursion has established that picture is breaking
+         // out of a stable aperture, retain that aperture through frames where
+         // the excursion momentarily covers every outer tile. Otherwise the
+         // middle of one continuous effect would masquerade as a fresh AR cut.
+-        result.top = result.bottom = p->active_image.top;
+-        result.black = p->active_image.black;
++        result.top = result.bottom = previous.top;
++        result.black = previous.black;
+         result.breakout = true;
+         outer_breakout_hold = true;
+-    } else if (black > 6000 && p->active_image_available &&
+-        p->active_image.source_w == width &&
+-        p->active_image.source_h == height &&
+-        p->active_image.top > 0 && p->active_image.black <= 6000)
++    } else if (black > 6000 && have_previous &&
++        previous.top > 0 && previous.black <= 6000)
+     {
+-        int previous = p->active_image.top;
+-        int first = MPMAX(0, previous - 8);
++        int prior_top = previous.top;
++        int first = MPMAX(0, prior_top - 8);
+         int matte = 0, samples = 0;
+-        for (int y = first; y < previous; y++) {
++        for (int y = first; y < prior_top; y++) {
+             matte += bar_paired_matte_tiles(
+-                data, y, height, p->active_image.black);
++                data, y, height, previous.black);
+             samples += BAR_ANALYSIS_TILES * 2;
+         }
+         if (samples && (uint64_t) matte * 20 >=
+                        (uint64_t) samples * 7)
+         {
+-            result.top = result.bottom = previous;
+-            result.black = p->active_image.black;
++            result.top = result.bottom = prior_top;
++            result.black = previous.black;
+             result.breakout = true;
+             outer_breakout_hold = true;
+             MP_TRACE(p, "Active image outer breakout hold frame=%" PRIu64
+                      " previous=%d matte=%d/%d.\n",
+-                     tag - 1, previous, matte, samples);
++                     tag - 1, prior_top, matte, samples);
+         }
+     }
+ 
+@@ -1424,28 +1438,23 @@ static void store_bar_result(struct priv *p, uint64_t tag, int width, int height
+                 boundary_found = legacy_found;
+             }
+             result.boundary_exact = legacy_found;
+-            if (result.breakout && p->active_image_available &&
+-                p->active_image.source_w == width &&
+-                p->active_image.source_h == height)
++            if (result.breakout && have_previous)
+             {
+-                centered = p->active_image.top;
++                centered = previous.top;
+             }
+             // When a candidate expands outward, test the narrow band directly
+             // outside the established aperture. A centered AR change removes
+             // that matte on both sides across the width. Breakout effects leave
+             // a substantial portion of the old matte line intact, even when
+             // their total envelope reaches the encoded frame edges.
+-            if (boundary_found && p->active_image_available &&
+-                p->active_image.source_w == width &&
+-                p->active_image.source_h == height &&
+-                centered < p->active_image.top)
++            if (boundary_found && have_previous && centered < previous.top)
+             {
+-                int previous = p->active_image.top;
++                int prior_top = previous.top;
+                 if (result.breakout)
+-                    centered = previous;
+-                int first = MPMAX(centered, previous - 8);
++                    centered = prior_top;
++                int first = MPMAX(centered, prior_top - 8);
+                 int matte = 0, samples = 0;
+-                for (int y = first; y < previous; y++) {
++                for (int y = first; y < prior_top; y++) {
+                     matte += bar_paired_matte_tiles(data, y, height, black);
+                     samples += BAR_ANALYSIS_TILES * 2;
+                 }
+@@ -1454,8 +1463,8 @@ static void store_bar_result(struct priv *p, uint64_t tag, int width, int height
+                 {
+                     MP_TRACE(p, "Active image breakout hold frame=%" PRIu64
+                              " candidate=%d previous=%d matte=%d/%d.\n",
+-                             tag - 1, centered, previous, matte, samples);
+-                    centered = previous;
++                             tag - 1, centered, prior_top, matte, samples);
++                    centered = prior_top;
+                     result.breakout = true;
+                 }
+             }
+@@ -1533,6 +1542,10 @@ static void store_bar_result(struct priv *p, uint64_t tag, int width, int height
+ 
+     p->bar_results[p->bar_result_next] = result;
+     p->bar_result_next = (p->bar_result_next + 1) % BAR_RESULT_CACHE;
++    if (result.valid && (result.width_spanning || !result.top ||
++        (have_previous && result.top == previous.top &&
++         result.bottom == previous.bottom)))
++        p->bar_history = result;
+ }
+ 
+ static void consume_bar_analysis(struct priv *p)
+@@ -1543,11 +1556,19 @@ static void consume_bar_analysis(struct priv *p)
+         p->bar_timing_count = MPMIN(p->bar_timing_count + 1,
+                                     BAR_TIMING_SAMPLES);
+     }
+-    for (int i = 0; i < BAR_ANALYSIS_SLOTS; i++) {
+-        struct bar_analysis_slot *slot = &p->bar_slots[i];
+-        if (!slot->pending || pl_buf_poll(p->gpu, slot->buf, 0))
+-            continue;
+-        if (pl_buf_read(p->gpu, slot->buf, 0, &p->bar_readback,
++    for (;;) {
++        struct bar_analysis_slot *slot = NULL;
++        for (int i = 0; i < BAR_ANALYSIS_SLOTS; i++) {
++            if (p->bar_slots[i].pending &&
++                (!slot || p->bar_slots[i].tag < slot->tag))
++                slot = &p->bar_slots[i];
++        }
++        // Do not let a recycled slot or out-of-order GPU completion branch
++        // the source history. This is a poll, never a presentation wait.
++        if (!slot || pl_buf_poll(p->gpu, slot->buf, 0))
++            break;
++        if (slot->generation == p->bar_generation &&
++            pl_buf_read(p->gpu, slot->buf, 0, &p->bar_readback,
+                         sizeof(p->bar_readback)))
+         {
+             store_bar_result(p, slot->tag, slot->width, slot->height,
+@@ -1557,6 +1578,19 @@ static void consume_bar_analysis(struct priv *p)
+     }
+ }
+ 
++static void reset_bar_analysis(struct priv *p)
++{
++    // Invalidate queued readbacks without reusing buffers still owned by the
++    // GPU. consume_bar_analysis drains them normally but ignores old epochs.
++    p->bar_generation++;
++    p->bar_history = (struct bar_result) {0};
++    p->bar_history_tag = 0;
++    p->active_image_available = false;
++    p->automatic_aspect_effective = false;
++    p->active_motion_top_step = p->active_motion_bottom_step = 0;
++    memset(p->bar_results, 0, sizeof(p->bar_results));
++}
++
+ static const struct bar_result *find_bar_result(struct priv *p, uint64_t tag)
+ {
+     for (int i = 0; i < BAR_RESULT_CACHE; i++) {
+@@ -2141,6 +2175,7 @@ static bool submit_bar_analysis(struct priv *p, struct pl_frame *frame,
+ 
+     slot->pending = true;
+     slot->tag = tag;
++    slot->generation = p->bar_generation;
+     slot->width = width;
+     slot->height = height;
+     return true;
+@@ -2155,6 +2190,7 @@ static void analyze_mapped_frame(struct priv *p, struct pl_frame *frame)
+     bool submitted = find_bar_result(p, fp->causal_scene_tag) != NULL;
+     for (int i = 0; i < BAR_ANALYSIS_SLOTS; i++) {
+         submitted |= p->bar_slots[i].pending &&
++            p->bar_slots[i].generation == p->bar_generation &&
+                      p->bar_slots[i].tag == fp->causal_scene_tag;
+     }
+     if (!submitted) {
+@@ -2372,8 +2408,8 @@ static void update_options(struct vo *vo)
+     bool detection_was_enabled = p->next_opts->active_image_detection;
+     bool changed = m_config_cache_update(p->opts_cache);
+     changed = m_config_cache_update(p->next_opts_cache) || changed;
+-    if (!detection_was_enabled && p->next_opts->active_image_detection)
+-        p->bar_generation++;
++    if (detection_was_enabled != p->next_opts->active_image_detection)
++        reset_bar_analysis(p);
+     if (changed) {
+         update_render_options(vo);
+         // Cached intermediates were produced with the previous options.
+@@ -2698,9 +2734,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+             p->last_pts = 0.0;
+             p->last_id = 0;
+             reset_authored_scene_state(p);
+-            p->active_image_available = false;
+-            p->automatic_aspect_effective = false;
+-            memset(p->bar_results, 0, sizeof(p->bar_results));
++            reset_bar_analysis(p);
+             p->want_reset = false;
+             pl_renderer_flush_cache(p->rr);
+         }
