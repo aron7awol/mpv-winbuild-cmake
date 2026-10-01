@@ -1,0 +1,84 @@
+From: mpv-ht <mpv-ht@localhost>
+Date: Thu, 1 Oct 2026 12:00:00 -0400
+Subject: [PATCH] Round histogram shaping gain limits without slope corners
+
+Use compact monotone C1 shoulders below the source and 2x-source limits.
+The symmetric rounding radius fades quadratically at the protected anchor
+and peak. Keep strength zero exact, preserve protected shadows/endpoints,
+and blend limited curves for monotonic above-source retention. No new GPU
+pass, sampling transaction, option, or ABI change is introduced.
+
+---
+diff --git a/src/shaders/hstm.h b/src/shaders/hstm.h
+index fbef2a5..a41cf5d 100644
+--- a/src/shaders/hstm.h
++++ b/src/shaders/hstm.h
+@@ -79,12 +79,40 @@ static inline float hstm_shadow_weight(float nits)
+     return hstm_clamp(t*t*t * (t * (6*t - 15) + 10), 0, 1);
+ }
+ 
++/* C1 soft minimum in log brightness, with compact support around a crossing.
++ * A hard min makes a corner whenever the shaped curve meets the source-gain
++ * limit. Round below that limit instead; never relax the brightness bound.
++ *
++ * The radius depends symmetrically on the mean, not min(a,b), which would put
++ * another cusp at a == b. Its value AND derivative vanish at the protected
++ * anchor and peak, retaining their values/slopes. With radius = span/2 *
++ * t^2*(1-t)^2, |dr/dmean| <= 0.097: both partial derivatives of this smooth min
++ * stay nonnegative. Thus two monotonic curves cannot produce a reversal.
++ * Outside this small neighborhood the original minimum is returned exactly. */
++static inline float hstm_soft_limit(float value, float limit, float lower,
++                                    float upper, float strength)
++{
++    const float minimum = fminf(value, limit);
++    const float a = hstm_coord(value), b = hstm_coord(limit);
++    if (fminf(a, b) <= lower || fmaxf(a, b) >= upper || upper <= lower)
++        return minimum;
++    const float span = upper - lower;
++    const float t = ((a + b) * 0.5f - lower) / span;
++    const float radius = 0.5f * strength * span * t*t * (1-t)*(1-t);
++    const float distance = fabsf(a - b);
++    if (distance >= radius)
++        return minimum;
++    const float h = 1 - distance / radius;
++    return fminf(minimum, hstm_nits(fminf(a, b) - 0.25f * radius * h*h));
++}
++
+ /* input/base/out contain linear P in nits on the same monotonic input grid.
+  * Redistribute the base curve's log-brightness increments, then normalize its
+  * endpoints. Positive bounded weights preserve order. Near-black retains its
+  * base slope, with a smooth transition to full redistribution from 0.1 to 1 nit.
+- * Above-source retention is a separate final operation and never affects an
+- * already dimmed value. At 100%, maximum above-source gain is 2x (one stop).
++ * Above-source retention is a separate final operation. Limits use smooth
++ * shoulders, slightly dimming either side of a crossing without changing
++ * values outside that neighborhood. At 100%, maximum gain is 2x (one stop).
+  * The caller supplies scratch[n] and may alias base and out. */
+ static inline void hstm_shape_curve(const float hist[HSTM_BINS],
+                                     const float *input, const float *base,
+@@ -122,6 +150,8 @@ static inline void hstm_shape_curve(const float hist[HSTM_BINS],
+     const float scale = scratch[n - 1] > 1e-12f
+         ? shaped_span / scratch[n - 1] : 0;
+     const float ceiling = base[n - 1];
++    const float limit_lower = hstm_coord(fminf(base[anchor], input[anchor]));
++    const float limit_upper = hstm_coord(ceiling);
+     float fixed = lower;
+     previous = lower;
+     for (int i = 0; i < n; i++) {
+@@ -137,9 +167,13 @@ static inline void hstm_shape_curve(const float hist[HSTM_BINS],
+             candidate = hstm_nits(hstm_coord(base[i]) * (1 - strength)
+                                   + strength * target);
+         }
+-        candidate = fminf(candidate, 2.0f * input[i]);
+-        const float below = fminf(candidate, input[i]);
+-        out[i] = fminf(ceiling, below + brightening * fmaxf(candidate - input[i], 0));
++        candidate = hstm_soft_limit(fminf(candidate, ceiling), 2.0f * input[i],
++                                    limit_lower, limit_upper, strength);
++        const float below = hstm_soft_limit(candidate, input[i],
++                                            limit_lower, limit_upper, strength);
++        // A convex blend retains monotonicity, including as brightening rises.
++        // below <= input, candidate <= 2*input, so out <= (1+brightening)*input.
++        out[i] = below + brightening * (candidate - below);
+         if (input[i] <= 0) out[i] = 0;
+     }
+ }

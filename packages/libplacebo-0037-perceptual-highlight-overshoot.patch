@@ -1,0 +1,119 @@
+From: mpv-ht <mpv-ht@localhost>
+Date: Thu, 1 Oct 2026 12:00:00 -0400
+Subject: [PATCH] color map: raise Perceptual endpoint before clipping to physical display
+
+Map measured forward Perceptual HDR to an optional higher endpoint, then clip
+RGB channels at the real display peak. Keep output metadata unchanged and
+report both the creative curve target and physical ceiling to the Analyzer.
+
+---
+diff --git a/src/include/libplacebo/shaders/colorspace.h b/src/include/libplacebo/shaders/colorspace.h
+index dda6c920..815c28de 100644
+--- a/src/include/libplacebo/shaders/colorspace.h
++++ b/src/include/libplacebo/shaders/colorspace.h
+@@ -411,6 +411,11 @@ struct pl_color_map_params {
+     // Takes precedence over auto_pq_second_pass; never runs both corrections.
+     bool p_constrained_curve;
+ 
++    // Local experiment: raise the P curve/overflow endpoint by this fraction
++    // (0..1), retaining the real output gamut, metadata and final RGB ceiling.
++    // Only explicit forward, measured Perceptual HDR mapping is eligible.
++    float highlight_overshoot;
++
+     // Tone mapping LUT size. Defaults to 256.
+     int lut_size;
+ 
+@@ -493,6 +498,7 @@ struct pl_tone_curve {
+     enum pl_tone_map_metric metric;
+     const char *function;
+     float source_peak, target_peak, strength, overbrightening;
++    float display_peak;
+     float input[PL_TONE_CURVE_SAMPLES];
+     float base[PL_TONE_CURVE_SAMPLES];
+     float output[PL_TONE_CURVE_SAMPLES];
+diff --git a/src/renderer.c b/src/renderer.c
+index 68857a57..76d28989 100644
+--- a/src/renderer.c
++++ b/src/renderer.c
+@@ -3080,7 +3080,10 @@ static pl_tex measure_rgb_ray_peak(struct pass_state *pass,
+         pl_hash_merge(&signature, pl_var_hash(pass->image.color.transfer));
+         pl_hash_merge(&signature, ((uint64_t) src->params.w << 32) | src->params.h);
+         return pcurve_fit(rr->gpu, rr->dp, &rr->p_curve_state, prev,
+-            dst.hdr.max_luma / PL_COLOR_SDR_WHITE, pass->image.causal_scene_tag,
++            PL_MIN(10000.0f, dst.hdr.max_luma *
++                (1.0f + (isfinite(cp->highlight_overshoot) ?
++                         PL_CLAMP(cp->highlight_overshoot, 0.0f, 1.0f) : 0.0f))) /
++                PL_COLOR_SDR_WHITE, pass->image.causal_scene_tag,
+             pass->image.p_curve_pts, pass->image.p_curve_pts_valid, signature,
+             pass->image.scene_cut);
+     }
+diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
+index 0d9db79e..6ae3eb6d 100644
+--- a/src/shaders/colorspace.c
++++ b/src/shaders/colorspace.c
+@@ -3054,6 +3054,7 @@ static void record_tone_curve(struct pl_tone_curve *out,
+     out->near_black_protection = params->hstm_near_black_protection;
+     out->source_peak = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, tone->input_max);
+     out->target_peak = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, tone->output_max);
++    out->display_peak = out->target_peak;
+     for (int i = 0; i < PL_TONE_CURVE_SAMPLES; i++) {
+         float x = PL_MIX(tone->input_min, tone->input_max,
+                         (float) i / (PL_TONE_CURVE_SAMPLES - 1));
+@@ -3137,7 +3138,12 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+     const bool hstm_requested = params->hstm_strength > 0 &&
+         params->tone_mapping_metric == PL_TONE_MAP_METRIC_BT2020_RGB &&
+         pl_color_space_is_hdr(&src);
++    const bool overshoot_requested = isfinite(params->highlight_overshoot) &&
++        params->highlight_overshoot > 0 && params->hard_clip_hdr_target &&
++        !params->inverse_tone_mapping && pl_color_space_is_hdr(&src) &&
++        params->tone_mapping_metric == PL_TONE_MAP_METRIC_BT2020_RGB;
+     if (pl_color_space_equal(&src, &dst) && !ambient_requested && !hstm_requested &&
++        !overshoot_requested &&
+         params->gamut_mapping != &pl_gamut_map_ipt_path &&
+         !args->measure_rgb_ray && !args->rgb_ray_peak && !args->p_curve) {
+         if (curve) {
+@@ -3230,6 +3236,19 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+         .out_max    = &tone.output_max,
+     ));
+ 
++    // Keep the physical display independent from the creative curve endpoint.
++    // A scene fitting the higher endpoint remains a no-op (no inverse gain),
++    // then intentionally loses over-range channel detail at the real ceiling.
++    const float display_output_max = tone.output_max;
++    const bool overshoot_active = overshoot_requested && metric_active;
++    if (overshoot_active) {
++        float peak;
++        pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
++            .color = &dst, .metadata = PL_HDR_METADATA_HDR10,
++            .scaling = PL_HDR_NITS, .out_max = &peak));
++        peak = PL_MIN(10000.0f, peak * (1.0f + PL_MIN(params->highlight_overshoot, 1.0f)));
++        tone.output_max = pl_hdr_rescale(PL_HDR_NITS, PL_HDR_PQ, peak);
++    }
+     pl_tone_map_params_infer(&tone);
+ 
+     // Round sufficiently similar values
+@@ -3878,17 +3897,20 @@ done:
+     // above the scalar tone-curve endpoint, so apply the final ceiling in
+     // destination-linear light immediately before transfer encoding. This is
+     // deliberately gated on an explicit target request, leaving HDR
+-    // passthrough and all SDR output paths unchanged.
+-    if (params->hard_clip_hdr_target &&
++    // passthrough unchanged. The opt-in overshoot experiment also clamps
++    // HDR-to-SDR at the real display ceiling; its curve endpoint is higher.
++    if (overshoot_active || (params->hard_clip_hdr_target &&
+         pl_color_transfer_is_hdr(src.transfer) &&
+-        pl_color_transfer_is_hdr(dst.transfer))
++        pl_color_transfer_is_hdr(dst.transfer)))
+     {
+         const float output_max = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NORM,
+-                                                tone.output_max);
++            overshoot_active ? display_output_max : tone.output_max);
+         GLSL("color.rgb = min(color.rgb, vec3("$")); \n",
+              SH_FLOAT_DYN(output_max));
+     }
+ 
++    if (curve && overshoot_active)
++        curve->display_peak = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, display_output_max);
+     pl_shader_delinearize(sh, &dst);
+     GLSL("}\n");
+ }

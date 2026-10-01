@@ -1,0 +1,77 @@
+From: mpv-ht <mpv-ht@localhost>
+Date: Thu, 1 Oct 2026 12:00:00 -0400
+Subject: [PATCH] gpu-next: expose Perceptual highlight overshoot and display ceiling
+
+Map measured forward Perceptual HDR to an optional higher endpoint, then clip
+RGB channels at the real display peak. Keep output metadata unchanged and
+report both the creative curve target and physical ceiling to the Analyzer.
+
+---
+diff --git a/player/command.c b/player/command.c
+index 8e97b33d5..405c69885 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -2820,6 +2820,7 @@ static int mp_property_tone_curve(void *ctx, struct m_property *prop, int action
+         {"shaping-active", SUB_PROP_BOOL(v.shaped)}, {"metric", SUB_PROP_STR(metric)},
+         {"function", SUB_PROP_STR(v.function)},
+         {"input-peak", SUB_PROP_DOUBLE(v.source_peak)}, {"target-peak", SUB_PROP_DOUBLE(v.target_peak)},
++        {"display-peak", SUB_PROP_DOUBLE(v.display_peak)},
+         {"strength", SUB_PROP_DOUBLE(v.strength)}, {"overbrightening", SUB_PROP_DOUBLE(v.overbrightening)},
+         {"near-black-protection", SUB_PROP_BOOL(v.near_black_protection)},
+         {"input", SUB_PROP_STR(input)}, {"base", SUB_PROP_STR(base)}, {"output", SUB_PROP_STR(output)},
+diff --git a/video/out/gpu/video.c b/video/out/gpu/video.c
+index af224173c..f60c8cb33 100644
+--- a/video/out/gpu/video.c
++++ b/video/out/gpu/video.c
+@@ -484,6 +484,7 @@ const struct m_sub_options gl_video_conf = {
+         {"tone-mapping-hstm-near-black-protection", OPT_BOOL(tone_map.hstm_near_black_protection)},
+         {"tone-mapping-auto-pq-second-pass", OPT_BOOL(tone_map.auto_pq_second_pass)},
+         {"tone-mapping-p-constrained-curve", OPT_BOOL(tone_map.p_constrained_curve)},
++        {"tone-mapping-highlight-overshoot", OPT_FLOAT(tone_map.highlight_overshoot), M_RANGE(0, 100)},
+         {"tone-mapping-ambient-gamma",
+             OPT_FLOAT(tone_map.ambient_gamma), M_RANGE(0.5, 1.5)},
+         {"inverse-tone-mapping", OPT_BOOL(tone_map.inverse)},
+diff --git a/video/out/gpu/video.h b/video/out/gpu/video.h
+index 73f423e6f..651e93d04 100644
+--- a/video/out/gpu/video.h
++++ b/video/out/gpu/video.h
+@@ -129,6 +129,7 @@ struct gl_tone_map_opts {
+     bool hstm_near_black_protection;
+     bool auto_pq_second_pass;
+     bool p_constrained_curve;
++    float highlight_overshoot;
+     float ambient_gamma;
+     float curve_param;
+     float max_boost;
+diff --git a/video/out/vo.h b/video/out/vo.h
+index e3243365b..b19614622 100644
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -544,6 +544,7 @@ struct vo_tone_curve {
+     double pts;
+     char function[32];
+     float source_peak, target_peak, strength, overbrightening;
++    float display_peak;
+     float input[MP_TONE_CURVE_SAMPLES], base[MP_TONE_CURVE_SAMPLES], output[MP_TONE_CURVE_SAMPLES];
+ };
+ 
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index d3662bea1..dba7bb8c3 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -3403,6 +3403,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+         snprintf(curve.function, sizeof(curve.function), "%s", native_curve.function);
+         curve.source_peak = native_curve.source_peak;
+         curve.target_peak = native_curve.target_peak;
++        curve.display_peak = native_curve.display_peak;
+         curve.strength = native_curve.strength;
+         curve.overbrightening = native_curve.overbrightening;
+         curve.near_black_protection = native_curve.near_black_protection;
+@@ -5017,6 +5018,7 @@ AV_NOWARN_DEPRECATED(
+     pars->color_map_params.hard_clip_hdr_target = opts->target_peak > 0;
+     pars->color_map_params.auto_pq_second_pass = opts->tone_map.auto_pq_second_pass;
+     pars->color_map_params.p_constrained_curve = opts->tone_map.p_constrained_curve;
++    pars->color_map_params.highlight_overshoot = opts->tone_map.highlight_overshoot / 100.0f;
+     pars->color_map_params.inverse_tone_mapping = opts->tone_map.inverse;
+     pars->color_map_params.contrast_recovery = opts->tone_map.contrast_recovery;
+     pars->color_map_params.visualize_lut = opts->tone_map.visualize;
