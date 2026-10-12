@@ -1,0 +1,1205 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <noreply@openai.com>
+Date: Mon, 12 Oct 2026 12:00:00 -0400
+Subject: [PATCH] d3d11: opt-in rolling blackout evidence on fullscreen exit
+
+Default-off config-only diagnostics. Freeze bounded pre-restore history,
+then save ten seconds of recovery asynchronously. Sample native backbuffer
+patches without shader changes, GPU waits or frame rerender. Never classify
+missing readbacks/feedback as black and never reset playback automatically.
+Requires mpv 0070 result logging; separately removable with no Lua/UI state.
+
+---
+diff --git a/video/out/d3d11/context.c b/video/out/d3d11/context.c
+--- a/video/out/d3d11/context.c
++++ b/video/out/d3d11/context.c
+@@ -27,4 +27,6 @@
+ #include "context.h"
+ #include "ra_d3d11.h"
+ #include "result_log.h"
++#include "blackout_recorder.h"
++#include "blackout_probe.h"
+ #include "vsync_estimator.h"
+@@ -43,6 +45,8 @@ struct d3d11_opts {
+     int color_space;
+     bool exclusive_fs;
+     int output_mode;
++    bool blackout_diagnostics;
++    char *blackout_dir;
+ };
+ 
+ #define OPT_BASE_STRUCT struct d3d11_opts
+@@ -68,6 +72,8 @@ const struct m_sub_options d3d11_conf = {
+         },
+         {"d3d11-flip", OPT_BOOL(flip), .flags = UPDATE_VO},
+         {"d3d11-sync-interval", OPT_INT(sync_interval), M_RANGE(0, 4)},
++        {"d3d11-blackout-diagnostics", OPT_BOOL(blackout_diagnostics), .flags = UPDATE_VO},
++        {"d3d11-blackout-dir", OPT_STRING(blackout_dir), .flags = UPDATE_VO},
+         {"d3d11-adapter",
+             OPT_STRING_VALIDATE(adapter_name, mp_dxgi_validate_adapter),
+             .flags = UPDATE_VO,
+@@ -106,6 +112,7 @@ const struct m_sub_options d3d11_conf = {
+         .output_format = DXGI_FORMAT_UNKNOWN,
+         .color_space = -1,
+         .output_mode = -1,
++        .blackout_dir = "~~/../user-data/logs/blackout",
+     },
+     .size = sizeof(struct d3d11_opts)
+ };
+@@ -128,6 +135,12 @@ struct priv {
+     struct d3d11_result_log result_log[RESULT_OPERATION_COUNT];
+     uint64_t present_calls;
+     uint64_t swapchain_generation;
++    struct bo_recorder *blackout;
++    struct bo_gpu blackout_gpu;
++    uint64_t blackout_frame_id;
++    int64_t blackout_next_state, blackout_next_feedback, blackout_last_advance;
++    DXGI_FRAME_STATISTICS blackout_last_stats;
++    struct bo_record blackout_feedback_snapshot;
+ 
+     struct ra_tex *backbuffer;
+     ID3D11Device *device;
+@@ -141,6 +154,131 @@ struct priv {
+     struct mp_dxgi_factory_ctx dxgi_ctx;
+ };
+ 
++static struct bo_record blackout_base(struct ra_ctx *ctx, enum bo_kind kind)
++{
++    struct priv *p = ctx->priv;
++    return (struct bo_record){
++        .kind = kind, .time_ns = mp_time_ns(), .generation = p->swapchain_generation,
++        .present = p->present_calls + (kind == BO_PRESENT_BEGIN || kind == BO_RENDER_BEGIN ||
++                   kind == BO_RENDER_END || kind == BO_RENDER_ABORT || kind == BO_FRAME_SUBMIT),
++        .frame_id = p->blackout_frame_id,
++    };
++}
++
++static void blackout_call(struct ra_ctx *ctx, enum bo_kind kind,
++                           HRESULT hr, int value, double duration_ms)
++{
++    struct priv *p = ctx->priv;
++    if (!p->blackout)
++        return;
++    struct bo_record r = blackout_base(ctx, kind);
++    r.u.call.hr = hr;
++    r.u.call.value = value;
++    r.u.call.duration_ms = duration_ms;
++    bo_record(p->blackout, r);
++}
++
++static void blackout_frame(struct ra_ctx *ctx, const struct vo_frame *frame,
++                           const struct mp_image *selected, uint64_t selected_id,
++                           int mixed, int stage, const struct pl_color_space *target)
++{
++    struct priv *p = ctx->priv;
++    p->blackout_frame_id = frame->current ? frame->frame_id : 0;
++    struct bo_record r = blackout_base(ctx, stage == 0 ? BO_RENDER_BEGIN :
++                                           stage == 1 ? BO_RENDER_END : BO_RENDER_ABORT);
++    r.u.frame.pts = frame->current ? frame->current->pts : MP_NOPTS_VALUE;
++    r.u.frame.selected_id = selected_id;
++    r.u.frame.selected_pts = selected ? selected->pts : MP_NOPTS_VALUE;
++    r.u.frame.scheduled_ns = frame->pts;
++    r.u.frame.repeats = frame->num_vsyncs;
++    r.u.frame.mixed = mixed;
++    r.u.frame.flags = frame->repeat | frame->still << 1 | frame->display_synced << 2 |
++                      frame->redraw << 3 | !!frame->current << 4;
++    if (target) {
++        r.u.frame.target_prim = target->primaries;
++        r.u.frame.target_trc = target->transfer;
++        r.u.frame.target_min = isfinite(target->hdr.min_luma) ? target->hdr.min_luma : 0;
++        r.u.frame.target_max = isfinite(target->hdr.max_luma) ? target->hdr.max_luma : 0;
++    }
++    bo_record(p->blackout, r);
++}
++
++static void blackout_state(struct ra_ctx *ctx)
++{
++    struct priv *p = ctx->priv;
++    if (!p->blackout || !p->swapchain)
++        return;
++    struct bo_record r = blackout_base(ctx, BO_STATE);
++    DXGI_SWAP_CHAIN_DESC desc = {0};
++    BOOL exclusive = FALSE;
++    r.u.state.desc_hr = IDXGISwapChain_GetDesc(p->swapchain, &desc);
++    r.u.state.fs_hr = IDXGISwapChain_GetFullscreenState(p->swapchain, &exclusive, NULL);
++    r.u.state.removed_hr = ID3D11Device_GetDeviceRemovedReason(p->device);
++    r.u.state.width = desc.BufferDesc.Width;
++    r.u.state.height = desc.BufferDesc.Height;
++    r.u.state.format = desc.BufferDesc.Format;
++    r.u.state.buffers = desc.BufferCount;
++    r.u.state.effect = desc.SwapEffect;
++    r.u.state.flags = desc.Flags;
++    r.u.state.fullscreen = p->vo_opts->fullscreen;
++    r.u.state.exclusive = SUCCEEDED(r.u.state.fs_hr) ? !!exclusive : -1;
++    HWND window = ctx->opts.composition ? NULL : vo_w32_hwnd(ctx->vo);
++    r.u.state.visible = window ? !!IsWindowVisible(window) : -1;
++    r.u.state.minimized = window ? !!IsIconic(window) : -1;
++    r.u.state.composition = ctx->opts.composition;
++    r.u.state.sync_interval = p->opts->sync_interval;
++    r.u.state.requested_csp = p->opts->color_space;
++    r.u.state.window = (uintptr_t)window;
++    r.u.state.swapchain = (uintptr_t)p->swapchain;
++    r.u.state.monitor = (uintptr_t)(window ? MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST) : NULL);
++    IDXGIOutput *output = NULL;
++    IDXGIOutput6 *output6 = NULL;
++    r.u.state.output_csp = r.u.state.bits = -1;
++    r.u.state.output_hr = IDXGISwapChain_GetContainingOutput(p->swapchain, &output);
++    if (SUCCEEDED(r.u.state.output_hr)) {
++        r.u.state.output_hr = IDXGIOutput_QueryInterface(output, &IID_IDXGIOutput6, (void **)&output6);
++        if (SUCCEEDED(r.u.state.output_hr)) {
++            DXGI_OUTPUT_DESC1 od;
++            r.u.state.output_hr = IDXGIOutput6_GetDesc1(output6, &od);
++            if (SUCCEEDED(r.u.state.output_hr)) {
++                r.u.state.output_csp = od.ColorSpace;
++                r.u.state.bits = od.BitsPerColor;
++            }
++        }
++    }
++    SAFE_RELEASE(output6);
++    SAFE_RELEASE(output);
++    bo_record(p->blackout, r);
++    p->blackout_next_state = r.time_ns + INT64_C(1000000000);
++}
++
++static void blackout_feedback(struct ra_ctx *ctx, struct bo_record r)
++{
++    struct priv *p = ctx->priv;
++    if (!p->blackout)
++        return;
++    r.u.feedback.populated = r.u.feedback.stats_hr == S_OK && r.u.feedback.displayed &&
++                            r.u.feedback.present_refresh && r.u.feedback.sync_refresh && r.u.feedback.sync_qpc;
++    if (r.u.feedback.stats_hr == DXGI_ERROR_FRAME_STATISTICS_DISJOINT) {
++        p->blackout_last_stats = (DXGI_FRAME_STATISTICS){0};
++        p->blackout_last_advance = 0;
++    }
++    r.u.feedback.advanced = r.u.feedback.populated &&
++        r.u.feedback.sync_qpc > p->blackout_last_stats.SyncQPCTime.QuadPart &&
++        r.u.feedback.displayed != p->blackout_last_stats.PresentCount;
++    if (r.u.feedback.advanced) {
++        p->blackout_last_stats.SyncQPCTime.QuadPart = r.u.feedback.sync_qpc;
++        p->blackout_last_stats.PresentCount = r.u.feedback.displayed;
++        p->blackout_last_advance = r.time_ns;
++    }
++    r.u.feedback.age_ns = p->blackout_last_advance ? r.time_ns - p->blackout_last_advance : -1;
++    if (r.time_ns < p->blackout_next_feedback &&
++        r.u.feedback.stats_hr != DXGI_ERROR_FRAME_STATISTICS_DISJOINT)
++        return;
++    p->blackout_next_feedback = r.time_ns + INT64_C(100000000);
++    bo_record(p->blackout, r);
++}
++
+ static void log_result(struct ra_ctx *ctx, enum result_operation operation,
+                        HRESULT result, double call_ms)
+ {
+@@ -231,11 +369,16 @@ static bool resize(struct ra_ctx *ctx)
+         return false;
+     }
+ 
++    blackout_call(ctx, BO_RESIZE_BEGIN, S_OK, 0, 0);
+     hr = IDXGISwapChain_ResizeBuffers(p->swapchain, 0, ctx->vo->dwidth,
+         ctx->vo->dheight, DXGI_FORMAT_UNKNOWN, 0);
++    blackout_call(ctx, BO_RESIZE_END, hr, 0, 0);
+     log_result(ctx, RESULT_RESIZE, hr, -1);
+     if (FAILED(hr)) {
+         return false;
+     }
+ 
++    p->blackout_last_stats = (DXGI_FRAME_STATISTICS){0};
++    p->blackout_last_advance = 0;
++    blackout_state(ctx);
+     d3d11_vsync_reset(&p->vsync);
+@@ -331,6 +474,7 @@ static bool d3d11_submit_frame(struct ra_swapchain *sw,
+ 
+     ra_d3d11_flush(sw->ctx->ra);
+     ra_tex_free(sw->ctx->ra, &p->backbuffer);
++    blackout_call(sw->ctx, BO_FRAME_SUBMIT, S_OK, 0, 0);
+     return true;
+ }
+ 
+@@ -358,6 +502,14 @@ static void d3d11_swap_buffers(struct ra_swapchain *sw)
+ 
+     m_config_cache_update(p->opts_cache);
+ 
++    if (p->blackout) {
++        struct bo_record r = blackout_base(sw->ctx, BO_PRESENT_BEGIN);
++        // The backbuffer is complete here and has not been handed to Present.
++        bo_gpu_sample(p->blackout, &p->blackout_gpu, p->device, p->swapchain, r);
++        if (r.time_ns >= p->blackout_next_state)
++            blackout_state(sw->ctx);
++        blackout_call(sw->ctx, BO_PRESENT_BEGIN, S_OK, p->opts->sync_interval, 0);
++    }
+     LARGE_INTEGER perf_count;
+     QueryPerformanceCounter(&perf_count);
+     p->last_submit_qpc = perf_count.QuadPart;
+@@ -368,9 +520,14 @@ static void d3d11_swap_buffers(struct ra_swapchain *sw)
++    int64_t blackout_present_end = p->blackout ? qpc_ns_now(sw) : 0;
+     p->present_calls++;
+     log_result(sw->ctx, RESULT_PRESENT, hr, hr == S_OK ? -1 :
+                (qpc_ns_now(sw) - qpc_to_ns(sw, p->last_submit_qpc)) / 1e6);
++    if (p->blackout) {
++        blackout_call(sw->ctx, BO_PRESENT_END, hr, p->opts->sync_interval,
++                      (blackout_present_end - qpc_to_ns(sw, p->last_submit_qpc)) / 1e6);
++    }
+ }
+ 
+-static void d3d11_get_vsync(struct ra_swapchain *sw, struct vo_vsync_info *info)
++static void d3d11_get_vsync_impl(struct ra_swapchain *sw, struct vo_vsync_info *info)
+ {
+     struct priv *p = sw->priv;
+     HRESULT hr;
+@@ -394,6 +551,10 @@ static void d3d11_get_vsync(struct ra_swapchain *sw, struct vo_vsync_info *info)
+     // the last call to IDXGISwapChain::Present()
+     UINT submit_count;
+     hr = IDXGISwapChain_GetLastPresentCount(p->swapchain, &submit_count);
++    if (p->blackout) {
++        p->blackout_feedback_snapshot.u.feedback.count_hr = hr;
++        p->blackout_feedback_snapshot.u.feedback.submitted = SUCCEEDED(hr) ? submit_count : 0;
++    }
+     if (FAILED(hr))
+         return;
+ 
+@@ -404,4 +565,14 @@ static void d3d11_get_vsync(struct ra_swapchain *sw, struct vo_vsync_info *info)
+     // to a timestamp on the same clock as QueryPerformanceCounter.
+     DXGI_FRAME_STATISTICS stats;
+     hr = IDXGISwapChain_GetFrameStatistics(p->swapchain, &stats);
++    if (p->blackout) {
++        struct bo_record *r = &p->blackout_feedback_snapshot;
++        r->u.feedback.stats_hr = hr;
++        if (SUCCEEDED(hr)) {
++            r->u.feedback.displayed = stats.PresentCount;
++            r->u.feedback.present_refresh = stats.PresentRefreshCount;
++            r->u.feedback.sync_refresh = stats.SyncRefreshCount;
++            r->u.feedback.sync_qpc = stats.SyncQPCTime.QuadPart;
++        }
++    }
+     if (hr == DXGI_ERROR_FRAME_STATISTICS_DISJOINT) {
+@@ -447,6 +618,23 @@ static void d3d11_get_vsync(struct ra_swapchain *sw, struct vo_vsync_info *info)
+     }
+ }
+ 
++static void d3d11_get_vsync(struct ra_swapchain *sw, struct vo_vsync_info *info)
++{
++    struct priv *p = sw->priv;
++    if (p->blackout) {
++        p->blackout_feedback_snapshot = blackout_base(sw->ctx, BO_FEEDBACK);
++        // E_PENDING here means the normal feedback path did not query this
++        // API (unsupported mode / gated feedback), NOT a failed or stalled GPU.
++        p->blackout_feedback_snapshot.u.feedback.count_hr = E_PENDING;
++        p->blackout_feedback_snapshot.u.feedback.stats_hr = E_PENDING;
++    }
++    // Reuse the exact existing calls: extra GetFrameStatistics calls could
++    // consume a DISJOINT result before the timing estimator sees it.
++    d3d11_get_vsync_impl(sw, info);
++    if (p->blackout)
++        blackout_feedback(sw->ctx, p->blackout_feedback_snapshot);
++}
++
+ static bool d3d11_set_fullscreen(struct ra_ctx *ctx)
+ {
+     struct priv *p = ctx->priv;
+@@ -471,6 +659,7 @@ static bool d3d11_set_fullscreen(struct ra_ctx *ctx)
+ 
+     hr = IDXGISwapChain_SetFullscreenState(p->swapchain,
+                                            enable_exclusive_fs, NULL);
++    blackout_call(ctx, BO_FULLSCREEN_RESULT, hr, enable_exclusive_fs, 0);
+     log_result(ctx, RESULT_FULLSCREEN, hr, -1);
+     if (FAILED(hr))
+         return false;
+@@ -507,6 +696,15 @@ static int d3d11_control(struct ra_ctx *ctx, int *events, int request, void *arg
+         break;
+     }
+ 
++    if (fullscreen_switch_needed && p->blackout) {
++        // This must precede SetFullscreenState, ResizeBuffers AND Win32's
++        // window-style/placement changes. A Lua property observer is too late.
++        bo_gpu_poll(p->blackout, &p->blackout_gpu);
++        blackout_call(ctx, BO_FULLSCREEN_REQUEST, S_OK, p->vo_opts->fullscreen, 0);
++        if (!p->vo_opts->fullscreen)
++            bo_trigger(p->blackout, mp_time_ns());
++    }
++
+     // if leaving full screen, handle d3d11 stuff first, then general
+     // windowing
+     if (fullscreen_switch_needed && !p->vo_opts->fullscreen) {
+@@ -537,6 +735,13 @@ static void d3d11_uninit(struct ra_ctx *ctx)
+ {
+     struct priv *p = ctx->priv;
+ 
++    if (p->blackout) {
++        ctx->diagnostic_frame = NULL;
++        bo_gpu_destroy(p->blackout, &p->blackout_gpu);
++        blackout_call(ctx, BO_STOP, S_OK, 0, 0);
++        bo_destroy(&p->blackout);
++    }
++
+     if (p->swapchain)
+         IDXGISwapChain_SetFullscreenState(p->swapchain, FALSE, NULL);
+ 
+@@ -638,6 +843,14 @@ static bool d3d11_init(struct ra_ctx *ctx)
+     if (ctx->opts.composition)
+         vo_w32_swapchain(ctx->vo, p->swapchain);
+ 
++    if (p->opts->blackout_diagnostics) {
++        p->blackout = bo_create(ctx, p->opts->blackout_dir);
++        if (p->blackout) {
++            ctx->diagnostic_frame = blackout_frame;
++            blackout_state(ctx);
++        }
++    }
++
+     return true;
+ 
+ error:
+@@ -673,6 +886,8 @@ bool ra_d3d11_ctx_recreate_swapchain(struct ra_ctx *ra)
+     if (!p->swapchain || p->backbuffer)
+         return false;
+ 
++    blackout_call(ra, BO_RECREATE_BEGIN, S_OK, 0, 0);
++
+     BOOL was_exclusive = FALSE;
+     IDXGISwapChain_GetFullscreenState(p->swapchain, &was_exclusive, NULL);
+     if (was_exclusive)
+@@ -702,6 +917,7 @@ bool ra_d3d11_ctx_recreate_swapchain(struct ra_ctx *ra)
+     if (!mp_d3d11_create_swapchain(p->device, ra->log, &scopts,
+                                     &p->swapchain))
+     {
++        blackout_call(ra, BO_RECREATE_END, E_FAIL, 0, 0);
+         return false;
+     }
+ 
+@@ -711,6 +927,11 @@ bool ra_d3d11_ctx_recreate_swapchain(struct ra_ctx *ra)
+     if (was_exclusive)
+         IDXGISwapChain_SetFullscreenState(p->swapchain, TRUE, NULL);
+ 
++    p->blackout_last_stats = (DXGI_FRAME_STATISTICS){0};
++    p->blackout_last_advance = 0;
++    blackout_call(ra, BO_RECREATE_END, S_OK, 0, 0);
++    blackout_state(ra);
++
+     return true;
+ }
+ 
+diff --git a/video/out/gpu/context.h b/video/out/gpu/context.h
+--- a/video/out/gpu/context.h
++++ b/video/out/gpu/context.h
+@@ -30,6 +30,13 @@ struct ra_ctx {
+     struct ra_swapchain *swapchain;
+     struct spirv_compiler *spirv;
+ 
++    // Opt-in backend diagnostics, NULL on the ordinary path. The backend must
++    // copy metadata immediately; none of these borrowed frame pointers survive.
++    // stage: 0=draw begin, 1=render completed, 2=render/start-frame failed.
++    void (*diagnostic_frame)(struct ra_ctx *ctx, const struct vo_frame *frame,
++                            const struct mp_image *selected, uint64_t selected_id,
++                            int mixed, int stage, const struct pl_color_space *target);
++
+     void *priv;
+ };
+ 
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -2675,6 +2675,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+     struct priv *p = vo->priv;
+     pl_options pars = p->pars;
+     pl_gpu gpu = p->gpu;
++    if (p->ra_ctx->diagnostic_frame)
++        p->ra_ctx->diagnostic_frame(p->ra_ctx, frame, NULL, 0, 0, 0, NULL);
+     update_options(vo);
+ 
+     struct pl_render_params params = pars->params;
+@@ -2909,6 +2911,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+     struct pl_swapchain_frame swframe;
+     bool should_draw = sw->fns->start_frame(sw, NULL); // for wayland logic
+     if (!should_draw || !pl_swapchain_start_frame(p->sw, &swframe)) {
++        if (p->ra_ctx->diagnostic_frame)
++            p->ra_ctx->diagnostic_frame(p->ra_ctx, frame, NULL, 0, 0, 2, NULL);
+         if (frame->current) {
+             // Advance the queue state to the current PTS to discard unused frames
+             struct pl_queue_params qparams = *pl_queue_params(
+@@ -3225,6 +3229,14 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+     stats_time_start(p->stats, "render");
+     bool render_ok = pl_render_image_mix(p->rr, &mix, &target, &params);
+     stats_time_end(p->stats, "render");
++    if (p->ra_ctx->diagnostic_frame) {
++        const struct pl_frame *selected = pl_frame_mix_current(&mix);
++        const struct mp_image *mpi = selected ? selected->user_data : NULL;
++        const struct frame_priv *fp = mpi ? mpi->priv : NULL;
++        p->ra_ctx->diagnostic_frame(p->ra_ctx, frame, mpi,
++            fp && fp->causal_scene_tag ? fp->causal_scene_tag - 1 : 0,
++            mix.num_frames, render_ok ? 1 : 2, &target.color);
++    }
+     struct vo_tone_curve curve = {
+         .enabled = p->next_opts->analyzer_tone_curve,
+         .pts = frame->current ? frame->current->pts : MP_NOPTS_VALUE,
+@@ -3427,6 +3439,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+     // fall through
+ 
+ done:
++    if (!valid && p->ra_ctx->diagnostic_frame)
++        p->ra_ctx->diagnostic_frame(p->ra_ctx, frame, NULL, 0, 0, 2, &target.color);
+     if (!valid) // clear with purple to indicate error
+         pl_tex_clear(gpu, swframe.fbo, (float[4]){ 0.5, 0.0, 1.0, 1.0 });
+ 
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -6465,6 +6465,29 @@ them.
+     Schedule each frame to be presented for this number of VBlank intervals.
+     (default: 1) Setting to 1 will enable VSync, setting to 0 will disable it.
+ 
++``--d3d11-blackout-diagnostics=<yes|no>``
++    Opt-in mpv-ht D3D11 blackout recorder (default: no). Requires restarting the
++    video output. Keeps up to 60 seconds of bounded RAM history, including
++    gpu-next frame identities, render/Present progress, DXGI feedback and state,
++    and 2 Hz asynchronous sparse samples of the live backbuffer. No synchronous
++    GPU wait, image rerender, timing correction, automatic reset or OSD is added.
++    Leaving fullscreen freezes the preceding history before the window/swapchain
++    transition and records another 10 seconds, including a return to fullscreen.
++    A background worker writes JSONL even while playback is paused. Additional
++    toggles during the capture do not overwrite or indefinitely extend it.
++    Files contain no media paths or full screenshots. Samples include overlays,
++    may miss small features, and are native channel values, not nits. Unavailable
++    samples/feedback are not evidence of black output. S_OK/counters do not prove
++    physical display output. Capture overhead must be evaluated on the test PC.
++
++``--d3d11-blackout-dir=<path>``
++    Recorder destination (default: ``~~/../user-data/logs/blackout``). Used only
++    with blackout diagnostics enabled. Retains the four newest owned JSONL files,
++    capped at 32 MiB each. At very high frame rates the fixed record capacity can
++    shorten history; truncation is recorded. Stop/reinitialization finishes an
++    active capture early. A forced kill can leave a partial file, without its
++    final capture-end record. No capture is written until fullscreen is exited.
++
+ ``--d3d11-adapter=<adapter name|help>``
+     Select a specific D3D11 adapter to utilize for D3D11 rendering.
+     Will pick the default adapter if unset. Alternatives are listed
+diff --git a/video/out/d3d11/blackout_data.h b/video/out/d3d11/blackout_data.h
+new file mode 100644
+--- /dev/null
++++ b/video/out/d3d11/blackout_data.h
+@@ -0,0 +1,135 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++// Fixed-size, allocation-free hot-path records. No pixel images or media paths.
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <string.h>
++#include <math.h>
++
++#define BO_HISTORY_NS INT64_C(60000000000)
++#define BO_AFTER_NS   INT64_C(10000000000)
++#define BO_SAMPLE_NS  INT64_C(500000000)
++#define BO_HISTORY_CAP 32768
++#define BO_CAPTURE_CAP 40000
++#define BO_FILE_LIMIT (32u << 20)
++#define BO_KEEP_FILES 4
++
++enum bo_kind {
++    BO_RENDER_BEGIN, BO_RENDER_END, BO_RENDER_ABORT,
++    BO_PRESENT_BEGIN, BO_PRESENT_END, BO_FRAME_SUBMIT,
++    BO_FULLSCREEN_REQUEST, BO_FULLSCREEN_RESULT,
++    BO_RESIZE_BEGIN, BO_RESIZE_END, BO_RECREATE_BEGIN, BO_RECREATE_END,
++    BO_STATE, BO_FEEDBACK, BO_SAMPLE_QUEUED, BO_SAMPLE_READY,
++    BO_SAMPLE_UNAVAILABLE, BO_SAMPLE_BUSY, BO_STOP,
++};
++
++enum bo_sample_status {
++    BO_SAMPLE_OK, BO_SAMPLE_GET_BUFFER, BO_SAMPLE_FORMAT,
++    BO_SAMPLE_CREATE, BO_SAMPLE_QUERY, BO_SAMPLE_MAP,
++    BO_SAMPLE_TEARDOWN,
++};
++
++struct bo_record {
++    int64_t time_ns;
++    uint64_t sequence, generation, present, frame_id;
++    enum bo_kind kind;
++    union {
++        struct {
++            uint64_t selected_id;
++            double pts, selected_pts;
++            int64_t scheduled_ns;
++            int repeats, mixed, flags, target_prim, target_trc;
++            float target_min, target_max;
++        } frame;
++        struct { int32_t hr; double duration_ms; int value; } call;
++        struct {
++            int32_t desc_hr, fs_hr, removed_hr, output_hr;
++            int width, height, format, buffers, effect, flags;
++            int fullscreen, exclusive, visible, minimized, composition;
++            int sync_interval, requested_csp, output_csp, bits;
++            uint64_t window, swapchain, monitor;
++        } state;
++        struct {
++            int32_t count_hr, stats_hr;
++            unsigned submitted, displayed, present_refresh, sync_refresh;
++            int64_t sync_qpc, age_ns;
++            bool populated, advanced;
++        } feedback;
++        struct {
++            uint64_t id, hash;
++            int64_t queued_ns;
++            int32_t hr;
++            int status, width, height, format, count, finite_count, zero_count;
++            float min[3], mean[3], max[3], tile_max[16];
++        } sample;
++    } u;
++};
++
++struct bo_history {
++    struct bo_record *rows;
++    unsigned start, count;
++    uint64_t sequence, capacity_evictions;
++};
++
++static inline void bo_history_push(struct bo_history *h, struct bo_record *r)
++{
++    r->sequence = ++h->sequence;
++    while (h->count && h->rows[h->start].time_ns < r->time_ns - BO_HISTORY_NS) {
++        h->start = (h->start + 1) % BO_HISTORY_CAP;
++        h->count--;
++    }
++    if (h->count == BO_HISTORY_CAP) {
++        h->start = (h->start + 1) % BO_HISTORY_CAP;
++        h->count--;
++        h->capacity_evictions++;
++    }
++    h->rows[(h->start + h->count++) % BO_HISTORY_CAP] = *r;
++}
++
++static inline unsigned bo_history_copy(const struct bo_history *h,
++                                      struct bo_record *out, int64_t now)
++{
++    unsigned count = 0;
++    for (unsigned i = 0; i < h->count; i++) {
++        const struct bo_record *r = &h->rows[(h->start + i) % BO_HISTORY_CAP];
++        if (r->time_ns >= now - BO_HISTORY_NS)
++            out[count++] = *r;
++    }
++    return count;
++}
++
++// Decode the native channel values, NOT nits or a display measurement. Preserve
++// negative scRGB and non-finite half-floats; don't silently turn these into black.
++static inline float bo_half(uint16_t v)
++{
++    unsigned e = (v >> 10) & 31, m = v & 1023;
++    float value = e == 31 ? (m ? NAN : INFINITY) :
++                  e ? ldexpf(1.0f + m / 1024.0f, (int)e - 15) :
++                      ldexpf((float)m, -24);
++    return v & 0x8000 ? -value : value;
++}
++
++static inline bool bo_decode(int format, const unsigned char *p, float rgb[3])
++{
++    // Stable DXGI_FORMAT values. Kept independent of Windows headers for tests.
++    if (format == 28 || format == 87) { // RGBA8 / BGRA8 UNORM
++        rgb[0] = p[format == 87 ? 2 : 0] / 255.0f;
++        rgb[1] = p[1] / 255.0f;
++        rgb[2] = p[format == 87 ? 0 : 2] / 255.0f;
++    } else if (format == 24) { // R10G10B10A2_UNORM
++        uint32_t v;
++        memcpy(&v, p, sizeof(v));
++        for (int c = 0; c < 3; c++)
++            rgb[c] = ((v >> (10 * c)) & 1023) / 1023.0f;
++    } else if (format == 10) { // R16G16B16A16_FLOAT
++        for (int c = 0; c < 3; c++) {
++            uint16_t v;
++            memcpy(&v, p + 2 * c, sizeof(v));
++            rgb[c] = bo_half(v);
++        }
++    } else {
++        return false;
++    }
++    return true;
++}
+diff --git a/video/out/d3d11/blackout_recorder.h b/video/out/d3d11/blackout_recorder.h
+new file mode 100644
+--- /dev/null
++++ b/video/out/d3d11/blackout_recorder.h
+@@ -0,0 +1,359 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++// The VO thread records to RAM. Only this worker creates/writes/prunes files.
++#pragma once
++
++#include <ctype.h>
++#include <float.h>
++#include <inttypes.h>
++#include "options/path.h"
++#include "osdep/io.h"
++#include "osdep/threads.h"
++#include "blackout_data.h"
++
++#define BO_MAGIC "{\"type\":\"mpv-ht-blackout\",\"schema\":1"
++
++struct bo_recorder {
++    struct mp_log *log;
++    char *directory;
++    struct bo_history history; // VO-thread-owned, including resize/recreate
++    struct bo_record *capture;
++    mp_mutex lock;             // never held for I/O or GPU operations
++    mp_cond wakeup;
++    mp_thread thread;
++    bool busy, collecting, stopping;
++    unsigned count, overflow, capture_number, session;
++    int64_t trigger_ns, deadline_ns;
++    uint64_t capacity_evictions;
++};
++
++static void bo_record(struct bo_recorder *b, struct bo_record r)
++{
++    if (!b)
++        return;
++    bo_history_push(&b->history, &r);
++    mp_mutex_lock(&b->lock);
++    if (b->collecting && r.time_ns <= b->deadline_ns) {
++        if (b->count < BO_CAPTURE_CAP)
++            b->capture[b->count++] = r;
++        else
++            b->overflow++;
++    }
++    mp_mutex_unlock(&b->lock);
++}
++
++static void bo_trigger(struct bo_recorder *b, int64_t now)
++{
++    if (!b)
++        return;
++    mp_mutex_lock(&b->lock);
++    // Further toggles belong to this recovery, never replace its pre-history
++    // and never prolong the window indefinitely.
++    if (!b->busy && !b->stopping) {
++        b->count = bo_history_copy(&b->history, b->capture, now);
++        b->overflow = 0;
++        b->capacity_evictions = b->history.capacity_evictions;
++        b->trigger_ns = now;
++        b->deadline_ns = now + BO_AFTER_NS;
++        b->capture_number++;
++        b->busy = b->collecting = true;
++        mp_cond_signal(&b->wakeup);
++    }
++    mp_mutex_unlock(&b->lock);
++}
++
++static const char *bo_number(char buf[40], double x)
++{
++    if (!isfinite(x) || x == MP_NOPTS_VALUE)
++        return "null";
++    snprintf(buf, 40, "%.9g", x);
++    return buf;
++}
++
++static void bo_write_record(FILE *f, const struct bo_record *r)
++{
++    static const char *const names[] = {
++        "render_begin", "render_end", "render_abort", "present_begin",
++        "present_end", "frame_submit", "fullscreen_request", "fullscreen_result",
++        "resize_begin", "resize_end", "recreate_begin", "recreate_end",
++        "state", "feedback", "sample_queued", "sample_ready",
++        "sample_unavailable", "sample_busy", "stop",
++    };
++    fprintf(f, "{\"event\":\"%s\",\"seq\":%"PRIu64",\"time_ns\":%"PRId64
++            ",\"generation\":%"PRIu64",\"present\":%"PRIu64",\"frame_id\":%"PRIu64,
++            names[r->kind], r->sequence, r->time_ns, r->generation,
++            r->present, r->frame_id);
++    switch (r->kind) {
++    case BO_RENDER_BEGIN: case BO_RENDER_END: case BO_RENDER_ABORT: {
++        char a[40], c[40];
++        fprintf(f, ",\"pts\":%s,\"selected_id\":%"PRIu64",\"selected_pts\":%s"
++                ",\"scheduled_ns\":%"PRId64",\"remaining_vsyncs\":%d,\"mixed\":%d"
++                ",\"frame_flags\":%d,\"target_primaries\":%d,\"target_transfer\":%d"
++                ",\"target_min\":%.9g,\"target_max\":%.9g",
++                bo_number(a, r->u.frame.pts), r->u.frame.selected_id,
++                bo_number(c, r->u.frame.selected_pts), r->u.frame.scheduled_ns,
++                r->u.frame.repeats, r->u.frame.mixed, r->u.frame.flags,
++                r->u.frame.target_prim, r->u.frame.target_trc,
++                r->u.frame.target_min, r->u.frame.target_max);
++        break;
++    }
++    case BO_STATE: {
++        fprintf(f, ",\"desc_hr\":\"0x%08"PRIx32"\",\"fs_hr\":\"0x%08"PRIx32
++                "\",\"device_reason\":\"0x%08"PRIx32"\",\"output_hr\":\"0x%08"PRIx32
++                "\",\"width\":%d,\"height\":%d,\"format\":%d,\"buffers\":%d"
++                ",\"swap_effect\":%d,\"swap_flags\":%d,\"requested_fullscreen\":%d"
++                ",\"exclusive\":%d,\"visible\":%d,\"minimized\":%d,\"composition\":%d"
++                ",\"sync_interval\":%d,\"requested_csp\":%d,\"output_csp\":%d,\"bits\":%d"
++                ",\"window\":\"%"PRIx64"\",\"swapchain\":\"%"PRIx64"\",\"monitor\":\"%"PRIx64"\"",
++                (uint32_t)r->u.state.desc_hr, (uint32_t)r->u.state.fs_hr,
++                (uint32_t)r->u.state.removed_hr, (uint32_t)r->u.state.output_hr,
++                r->u.state.width, r->u.state.height, r->u.state.format,
++                r->u.state.buffers, r->u.state.effect, r->u.state.flags,
++                r->u.state.fullscreen, r->u.state.exclusive, r->u.state.visible,
++                r->u.state.minimized, r->u.state.composition, r->u.state.sync_interval,
++                r->u.state.requested_csp, r->u.state.output_csp, r->u.state.bits,
++                r->u.state.window, r->u.state.swapchain, r->u.state.monitor);
++        break;
++    }
++    case BO_FEEDBACK:
++        fprintf(f, ",\"count_hr\":\"0x%08"PRIx32"\",\"stats_hr\":\"0x%08"PRIx32
++                "\",\"submitted\":%u,\"displayed\":%u,\"present_refresh\":%u"
++                ",\"sync_refresh\":%u,\"sync_qpc\":%"PRId64
++                ",\"populated\":%s,\"advanced\":%s,\"last_advance_age_ns\":%"PRId64,
++                (uint32_t)r->u.feedback.count_hr, (uint32_t)r->u.feedback.stats_hr,
++                r->u.feedback.submitted, r->u.feedback.displayed,
++                r->u.feedback.present_refresh, r->u.feedback.sync_refresh,
++                r->u.feedback.sync_qpc, r->u.feedback.populated ? "true" : "false",
++                r->u.feedback.advanced ? "true" : "false", r->u.feedback.age_ns);
++        break;
++    case BO_SAMPLE_QUEUED: case BO_SAMPLE_READY: case BO_SAMPLE_UNAVAILABLE:
++        fprintf(f, ",\"sample_id\":%"PRIu64",\"queued_ns\":%"PRId64
++                ",\"status\":%d,\"hr\":\"0x%08"PRIx32"\",\"width\":%d,\"height\":%d"
++                ",\"format\":%d", r->u.sample.id, r->u.sample.queued_ns,
++                r->u.sample.status, (uint32_t)r->u.sample.hr,
++                r->u.sample.width, r->u.sample.height, r->u.sample.format);
++        if (r->kind == BO_SAMPLE_READY) {
++            fprintf(f, ",\"pixels\":%d,\"finite_pixels\":%d,\"exact_zero_pixels\":%d"
++                    ",\"hash\":\"%016"PRIx64"\",\"min\":[%.9g,%.9g,%.9g]"
++                    ",\"mean\":[%.9g,%.9g,%.9g],\"max\":[%.9g,%.9g,%.9g],\"tile_max_abs\":[",
++                    r->u.sample.count, r->u.sample.finite_count, r->u.sample.zero_count,
++                    r->u.sample.hash, r->u.sample.min[0], r->u.sample.min[1],
++                    r->u.sample.min[2], r->u.sample.mean[0], r->u.sample.mean[1],
++                    r->u.sample.mean[2], r->u.sample.max[0], r->u.sample.max[1],
++                    r->u.sample.max[2]);
++            for (int i = 0; i < 16; i++)
++                fprintf(f, "%s%.9g", i ? "," : "", r->u.sample.tile_max[i]);
++            fputc(']', f);
++        }
++        break;
++    default:
++        fprintf(f, ",\"hr\":\"0x%08"PRIx32"\",\"duration_ms\":%.6f,\"value\":%d",
++                (uint32_t)r->u.call.hr, r->u.call.duration_ms, r->u.call.value);
++    }
++    fputs("}\n", f);
++}
++
++// Only prune this recorder's exact namespace AND verified header. Never recurse,
++// follow reparse points, remove arbitrary JSON/logs, or overwrite an existing file.
++static bool bo_owned_filename(const char *name)
++{
++    size_t n = strlen(name);
++    if (n < 30 || strncmp(name, "blackout-", 9) || strcmp(name + n - 6, ".jsonl"))
++        return false;
++    for (size_t i = 9; i < n - 6; i++)
++        if (!isdigit((unsigned char)name[i]) && name[i] != '-')
++            return false;
++    return true;
++}
++
++static void bo_prune(struct bo_recorder *b)
++{
++    for (int attempts = 0; attempts < 64; attempts++) {
++        DIR *dir = opendir(b->directory);
++        if (!dir)
++            return;
++        unsigned count = 0;
++        char *oldest = NULL;
++        int64_t oldest_time = INT64_MAX;
++        struct dirent *entry;
++        while ((entry = readdir(dir))) {
++            if (!bo_owned_filename(entry->d_name))
++                continue;
++            char *path = mp_path_join(NULL, b->directory, entry->d_name);
++            wchar_t *wide = mp_from_utf8(NULL, path);
++            DWORD attrs = GetFileAttributesW(wide);
++            talloc_free(wide);
++            struct stat st;
++            bool owned = false;
++            if (attrs != INVALID_FILE_ATTRIBUTES &&
++                !(attrs & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) &&
++                !stat(path, &st)) {
++                FILE *f = fopen(path, "rb");
++                if (f) {
++                    char magic[sizeof(BO_MAGIC)] = {0};
++                    owned = fread(magic, 1, sizeof(magic) - 1, f) == sizeof(magic) - 1 &&
++                            !strcmp(magic, BO_MAGIC);
++                    fclose(f);
++                }
++            }
++            if (owned) {
++                count++;
++                if (st.st_mtime < oldest_time ||
++                    (st.st_mtime == oldest_time && oldest && strcmp(path, oldest) < 0)) {
++                    talloc_free(oldest);
++                    oldest = talloc_strdup(NULL, path);
++                    oldest_time = st.st_mtime;
++                }
++            }
++            talloc_free(path);
++        }
++        closedir(dir);
++        bool again = count > BO_KEEP_FILES && oldest && !unlink(oldest);
++        talloc_free(oldest);
++        if (!again)
++            return;
++    }
++}
++
++static MP_THREAD_VOID bo_writer(void *arg)
++{
++    struct bo_recorder *b = arg;
++    mp_thread_set_name("d3d11-blackout");
++    struct bo_record batch[64];
++    mp_mutex_lock(&b->lock);
++    for (;;) {
++        while (!b->busy && !b->stopping)
++            mp_cond_wait(&b->wakeup, &b->lock);
++        if (!b->busy && b->stopping)
++            break;
++        int64_t trigger = b->trigger_ns, deadline = b->deadline_ns;
++        unsigned capture_number = b->capture_number;
++        uint64_t evictions = b->capacity_evictions;
++        int64_t history_span = b->count ? trigger - b->capture[0].time_ns : 0;
++        mp_mutex_unlock(&b->lock);
++
++        SYSTEMTIME utc;
++        GetSystemTime(&utc);
++        char name[128];
++        snprintf(name, sizeof(name), "blackout-%04u%02u%02u-%02u%02u%02u-%lu-%u-%u.jsonl",
++                 utc.wYear, utc.wMonth, utc.wDay, utc.wHour, utc.wMinute, utc.wSecond,
++                 (unsigned long)GetCurrentProcessId(), b->session, capture_number);
++        char *path = mp_path_join(NULL, b->directory, name);
++        mp_mkdirp(b->directory);
++        FILE *f = fopen(path, "wbx");
++        bool size_limited = false, failed = !f, stopped = false;
++        if (f) {
++            LARGE_INTEGER frequency, counter;
++            QueryPerformanceFrequency(&frequency);
++            QueryPerformanceCounter(&counter);
++            fprintf(f, BO_MAGIC ",\"trigger\":\"fullscreen-exit\",\"trigger_ns\":%"PRId64
++                    ",\"deadline_ns\":%"PRId64",\"history_seconds\":60,\"after_seconds\":10"
++                    ",\"history_span_ns\":%"PRId64",\"qpc_frequency\":%"PRId64
++                    ",\"qpc_at_header\":%"PRId64",\"time_ns_at_header\":%"PRId64
++                    ",\"history_capacity\":%d,\"capture_capacity\":%d,\"capacity_evictions\":%"PRIu64
++                    ",\"sample_hz\":2,\"sample_layout\":\"4x4 evenly-spaced 8x8 patches\""
++                    ",\"sample_units\":\"native RGB channel values, not nits\""
++                    ",\"frame_flags\":\"1=repeat 2=still 4=display-sync 8=redraw 16=source-present\""
++                    ",\"sample_status\":\"0=ok 1=get-buffer 2=format 3=create 4=query 5=map 6=teardown\""
++                    ",\"feedback\":\"Reuses normal timing queries. E_PENDING (0x8000000a) means not queried, not stalled.\""
++                    ",\"limits\":\"Sparse samples include overlays and can miss content. S_OK and counters do not prove physical display output. Missing samples/feedback are not black. requested_csp is not a measured HDMI flag.\"}\n",
++                    trigger, deadline, history_span, (int64_t)frequency.QuadPart,
++                    (int64_t)counter.QuadPart, mp_time_ns(),
++                    BO_HISTORY_CAP, BO_CAPTURE_CAP, evictions);
++        }
++        unsigned written = 0, overflow = 0;
++        for (;;) {
++            mp_mutex_lock(&b->lock);
++            if (b->stopping || mp_time_ns() >= b->deadline_ns)
++                b->collecting = false;
++            unsigned n = MPMIN((unsigned)MP_ARRAY_SIZE(batch), b->count - written);
++            memcpy(batch, b->capture + written, n * sizeof(batch[0]));
++            written += n;
++            bool finished = !b->collecting && written == b->count;
++            overflow = b->overflow;
++            stopped = b->stopping;
++            if (!n && !finished)
++                mp_cond_timedwait(&b->wakeup, &b->lock, INT64_C(50000000));
++            mp_mutex_unlock(&b->lock);
++            if (f && !failed) {
++                for (unsigned i = 0; i < n; i++) {
++                    int64_t pos = ftell(f);
++                    if (pos < 0) { failed = true; break; }
++                    if (pos >= BO_FILE_LIMIT - 4096) { size_limited = true; break; }
++                    bo_write_record(f, &batch[i]);
++                }
++                failed |= ferror(f) != 0;
++                // Preserve pre-history even if the player later has to be killed.
++                if (n && fflush(f))
++                    failed = true;
++            }
++            if (finished)
++                break;
++        }
++        if (f) {
++            fprintf(f, "{\"type\":\"capture_end\",\"time_ns\":%"PRId64
++                    ",\"records_collected\":%u,\"overflow\":%u,\"size_limited\":%s"
++                    ",\"stopped_early\":%s,\"io_failed\":%s}\n",
++                    mp_time_ns(), written, overflow, size_limited ? "true" : "false",
++                    stopped && mp_time_ns() < deadline ? "true" : "false",
++                    failed ? "true" : "false");
++            if (fclose(f))
++                failed = true;
++        }
++        if (failed)
++            MP_WARN(b, "Blackout capture could not be fully saved: %s\n", path);
++        else
++            MP_INFO(b, "Blackout diagnostic saved: %s (fullscreen exit; not an automatic fault diagnosis)\n", path);
++        talloc_free(path);
++        bo_prune(b);
++        mp_mutex_lock(&b->lock);
++        b->busy = false;
++    }
++    mp_mutex_unlock(&b->lock);
++    MP_THREAD_RETURN();
++}
++
++static struct bo_recorder *bo_create(struct ra_ctx *ctx, const char *directory)
++{
++    static LONG sessions;
++    struct bo_recorder *b = talloc_zero(NULL, struct bo_recorder);
++    b->log = mp_log_new(b, ctx->log, "blackout");
++    b->directory = mp_normalize_user_path(b, ctx->global, directory);
++    b->history.rows = calloc(BO_HISTORY_CAP, sizeof(struct bo_record));
++    b->capture = calloc(BO_CAPTURE_CAP, sizeof(struct bo_record));
++    if (!b->directory || !b->directory[0] || !b->history.rows || !b->capture)
++        goto fail;
++    b->session = InterlockedIncrement(&sessions);
++    mp_mutex_init(&b->lock);
++    mp_cond_init(&b->wakeup);
++    if (mp_thread_create(&b->thread, bo_writer, b)) {
++        mp_cond_destroy(&b->wakeup);
++        mp_mutex_destroy(&b->lock);
++        goto fail;
++    }
++    MP_INFO(b, "D3D11 blackout diagnostics enabled: 60s rolling history, 2Hz sparse pixels, 10s recovery, directory=%s\n", b->directory);
++    return b;
++fail:
++    MP_WARN(ctx, "Could not initialize blackout diagnostics; playback is unchanged\n");
++    free(b->history.rows);
++    free(b->capture);
++    talloc_free(b);
++    return NULL;
++}
++
++static void bo_destroy(struct bo_recorder **ptr)
++{
++    struct bo_recorder *b = *ptr;
++    if (!b)
++        return;
++    mp_mutex_lock(&b->lock);
++    b->stopping = true;
++    mp_cond_signal(&b->wakeup);
++    mp_mutex_unlock(&b->lock);
++    mp_thread_join(b->thread);
++    mp_cond_destroy(&b->wakeup);
++    mp_mutex_destroy(&b->lock);
++    free(b->history.rows);
++    free(b->capture);
++    talloc_free(b);
++    *ptr = NULL;
++}
+diff --git a/video/out/d3d11/blackout_probe.h b/video/out/d3d11/blackout_probe.h
+new file mode 100644
+--- /dev/null
++++ b/video/out/d3d11/blackout_probe.h
+@@ -0,0 +1,220 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++// Shaderless sparse copies from the actual swapchain buffer before Present.
++// No shader bindings changed, no Flush, no blocking Map/GetData, no backbuffer
++// reference retained across ResizeBuffers. Pending staging slots retain their
++// original frame/generation tags across resize; results are never relabeled.
++#pragma once
++
++#define BO_GPU_SLOTS 3
++#define BO_TILE 8
++#define BO_GRID 4
++#define BO_PROBE_SIZE (BO_TILE * BO_GRID)
++
++struct bo_gpu_slot {
++    ID3D11Texture2D *texture;
++    ID3D11Query *query;
++    DXGI_FORMAT format;
++    bool pending;
++    struct bo_record record;
++};
++
++struct bo_gpu {
++    ID3D11DeviceContext *context;
++    struct bo_gpu_slot slots[BO_GPU_SLOTS];
++    int64_t next_sample_ns;
++    uint64_t sample_id;
++};
++
++static void bo_gpu_result(struct bo_recorder *b, struct bo_gpu_slot *s,
++                          int status, HRESULT hr)
++{
++    s->record.kind = BO_SAMPLE_UNAVAILABLE;
++    s->record.time_ns = mp_time_ns();
++    s->record.u.sample.status = status;
++    s->record.u.sample.hr = hr;
++    bo_record(b, s->record);
++    s->pending = false;
++}
++
++static void bo_gpu_poll(struct bo_recorder *b, struct bo_gpu *g)
++{
++    if (!b || !g->context)
++        return;
++    for (int i = 0; i < BO_GPU_SLOTS; i++) {
++        struct bo_gpu_slot *s = &g->slots[i];
++        if (!s->pending)
++            continue;
++        BOOL complete = FALSE;
++        HRESULT hr = ID3D11DeviceContext_GetData(g->context,
++            (ID3D11Asynchronous *)s->query, &complete, sizeof(complete),
++            D3D11_ASYNC_GETDATA_DONOTFLUSH);
++        if (hr == S_FALSE || (hr == S_OK && !complete))
++            continue;
++        if (hr != S_OK) {
++            bo_gpu_result(b, s, BO_SAMPLE_QUERY, hr);
++            continue;
++        }
++        D3D11_MAPPED_SUBRESOURCE map = {0};
++        hr = ID3D11DeviceContext_Map(g->context, (ID3D11Resource *)s->texture,
++            0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &map);
++        if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
++            continue;
++        if (hr != S_OK) {
++            bo_gpu_result(b, s, BO_SAMPLE_MAP, hr);
++            continue;
++        }
++        struct bo_record *r = &s->record;
++        r->kind = BO_SAMPLE_READY;
++        r->time_ns = mp_time_ns();
++        r->u.sample.count = BO_PROBE_SIZE * BO_PROBE_SIZE;
++        r->u.sample.finite_count = r->u.sample.zero_count = 0;
++        r->u.sample.hash = UINT64_C(14695981039346656037);
++        double sum[3] = {0};
++        for (int c = 0; c < 3; c++) {
++            r->u.sample.min[c] = FLT_MAX;
++            r->u.sample.max[c] = -FLT_MAX;
++        }
++        int bytes = s->format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4;
++        if (map.RowPitch < BO_PROBE_SIZE * bytes) {
++            ID3D11DeviceContext_Unmap(g->context, (ID3D11Resource *)s->texture, 0);
++            bo_gpu_result(b, s, BO_SAMPLE_MAP, E_FAIL);
++            continue;
++        }
++        for (int y = 0; y < BO_PROBE_SIZE; y++) {
++            const unsigned char *row = (const unsigned char *)map.pData + y * map.RowPitch;
++            for (int x = 0; x < BO_PROBE_SIZE; x++) {
++                const unsigned char *px = row + x * bytes;
++                for (int k = 0; k < bytes; k++) {
++                    r->u.sample.hash ^= px[k];
++                    r->u.sample.hash *= UINT64_C(1099511628211);
++                }
++                float rgb[3];
++                bo_decode(s->format, px, rgb);
++                if (!isfinite(rgb[0]) || !isfinite(rgb[1]) || !isfinite(rgb[2]))
++                    continue;
++                r->u.sample.finite_count++;
++                r->u.sample.zero_count += rgb[0] == 0 && rgb[1] == 0 && rgb[2] == 0;
++                int tile = (y / BO_TILE) * BO_GRID + x / BO_TILE;
++                for (int c = 0; c < 3; c++) {
++                    sum[c] += rgb[c];
++                    r->u.sample.min[c] = fminf(r->u.sample.min[c], rgb[c]);
++                    r->u.sample.max[c] = fmaxf(r->u.sample.max[c], rgb[c]);
++                    r->u.sample.tile_max[tile] = fmaxf(r->u.sample.tile_max[tile], fabsf(rgb[c]));
++                }
++            }
++        }
++        for (int c = 0; c < 3; c++) {
++            r->u.sample.mean[c] = r->u.sample.finite_count ? sum[c] / r->u.sample.finite_count : 0;
++            if (!r->u.sample.finite_count)
++                r->u.sample.min[c] = r->u.sample.max[c] = 0;
++        }
++        ID3D11DeviceContext_Unmap(g->context, (ID3D11Resource *)s->texture, 0);
++        bo_record(b, *r);
++        s->pending = false;
++    }
++}
++
++static void bo_gpu_sample(struct bo_recorder *b, struct bo_gpu *g,
++                           ID3D11Device *device, IDXGISwapChain *swapchain,
++                           struct bo_record base)
++{
++    if (!b)
++        return;
++    bo_gpu_poll(b, g);
++    if (base.time_ns < g->next_sample_ns)
++        return;
++    g->next_sample_ns = base.time_ns + BO_SAMPLE_NS;
++    struct bo_gpu_slot *s = NULL;
++    int pending = 0;
++    int64_t oldest = base.time_ns;
++    for (int i = 0; i < BO_GPU_SLOTS; i++) {
++        if (!g->slots[i].pending) {
++            if (!s) s = &g->slots[i];
++        } else {
++            pending++;
++            oldest = MPMIN(oldest, g->slots[i].record.u.sample.queued_ns);
++        }
++    }
++    if (!s) {
++        base.kind = BO_SAMPLE_BUSY;
++        base.u.call.value = pending;
++        base.u.call.duration_ms = (base.time_ns - oldest) / 1e6;
++        bo_record(b, base);
++        return;
++    }
++    s->record = base;
++    s->record.kind = BO_SAMPLE_QUEUED;
++    memset(&s->record.u, 0, sizeof(s->record.u));
++    s->record.u.sample.id = ++g->sample_id;
++    s->record.u.sample.queued_ns = base.time_ns;
++    ID3D11Texture2D *source = NULL;
++    HRESULT hr = IDXGISwapChain_GetBuffer(swapchain, 0, &IID_ID3D11Texture2D,
++                                          (void **)&source);
++    if (FAILED(hr)) {
++        bo_gpu_result(b, s, BO_SAMPLE_GET_BUFFER, hr);
++        return;
++    }
++    D3D11_TEXTURE2D_DESC desc;
++    ID3D11Texture2D_GetDesc(source, &desc);
++    s->record.u.sample.width = desc.Width;
++    s->record.u.sample.height = desc.Height;
++    s->record.u.sample.format = desc.Format;
++    float test[3];
++    const unsigned char zero[8] = {0};
++    if (desc.Width < BO_TILE || desc.Height < BO_TILE || desc.SampleDesc.Count != 1 ||
++        desc.ArraySize != 1 || desc.MipLevels != 1 || !bo_decode(desc.Format, zero, test)) {
++        ID3D11Texture2D_Release(source);
++        bo_gpu_result(b, s, BO_SAMPLE_FORMAT, E_NOTIMPL);
++        return;
++    }
++    if (!g->context)
++        ID3D11Device_GetImmediateContext(device, &g->context);
++    if (s->format != desc.Format) {
++        SAFE_RELEASE(s->texture);
++        s->format = desc.Format;
++    }
++    if (!s->texture) {
++        D3D11_TEXTURE2D_DESC staging = {
++            .Width = BO_PROBE_SIZE, .Height = BO_PROBE_SIZE,
++            .MipLevels = 1, .ArraySize = 1, .Format = desc.Format,
++            .SampleDesc = { .Count = 1 }, .Usage = D3D11_USAGE_STAGING,
++            .CPUAccessFlags = D3D11_CPU_ACCESS_READ,
++        };
++        hr = ID3D11Device_CreateTexture2D(device, &staging, NULL, &s->texture);
++    }
++    if (SUCCEEDED(hr) && !s->query) {
++        D3D11_QUERY_DESC query = { .Query = D3D11_QUERY_EVENT };
++        hr = ID3D11Device_CreateQuery(device, &query, &s->query);
++    }
++    if (FAILED(hr)) {
++        ID3D11Texture2D_Release(source);
++        bo_gpu_result(b, s, BO_SAMPLE_CREATE, hr);
++        return;
++    }
++    for (unsigned y = 0; y < BO_GRID; y++) {
++        for (unsigned x = 0; x < BO_GRID; x++) {
++            unsigned sx = ((2 * x + 1) * (desc.Width - BO_TILE)) / (2 * BO_GRID);
++            unsigned sy = ((2 * y + 1) * (desc.Height - BO_TILE)) / (2 * BO_GRID);
++            D3D11_BOX box = { sx, sy, 0, sx + BO_TILE, sy + BO_TILE, 1 };
++            ID3D11DeviceContext_CopySubresourceRegion(g->context,
++                (ID3D11Resource *)s->texture, 0, x * BO_TILE, y * BO_TILE, 0,
++                (ID3D11Resource *)source, 0, &box);
++        }
++    }
++    ID3D11DeviceContext_End(g->context, (ID3D11Asynchronous *)s->query);
++    ID3D11Texture2D_Release(source);
++    s->pending = true;
++    bo_record(b, s->record);
++}
++
++static void bo_gpu_destroy(struct bo_recorder *b, struct bo_gpu *g)
++{
++    bo_gpu_poll(b, g);
++    for (int i = 0; i < BO_GPU_SLOTS; i++) {
++        if (g->slots[i].pending)
++            bo_gpu_result(b, &g->slots[i], BO_SAMPLE_TEARDOWN, S_FALSE);
++        SAFE_RELEASE(g->slots[i].texture);
++        SAFE_RELEASE(g->slots[i].query);
++    }
++    SAFE_RELEASE(g->context);
++}
