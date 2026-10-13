@@ -1,0 +1,480 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <noreply@openai.com>
+Date: Tue, 13 Oct 2026 12:00:00 -0400
+Subject: [PATCH] d3d11: default-on conservative redundant resize guard
+
+Standalone production replacement for tester-only 0072. Apply after 0069,
+without 0070/0071/0072. Preserve required transitions, device-health and
+state checks, notification processing and existing feedback resets.
+No recorder, GPU sampling, detailed tracing or per-frame diagnostic queries.
+Keep d3d11-skip-redundant-resize=no as a manual rollback option.
+
+---
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index 195b72d6a..851300846 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -6430,6 +6430,19 @@ them.
+     "D3D fullscreen" in other applications. Gives mpv full control of
+     rendering on the swap chain's screen. Off by default.
+ 
++``--d3d11-skip-redundant-resize=<yes|no>``
++    Avoid redundant D3D11 buffer resizes from ordinary Windows notifications
++    (default: yes). The requested size, swapchain, window, monitor and output
++    state must match a successful previous resize, with successful state queries
++    and a healthy device. Actual changes, unknown origins, explicit configuration,
++    fullscreen transitions and recovery paths still perform the resize.
++    Window notification handling and presentation timing resets are unchanged.
++    Does not apply to composition output or other GPU backends.
++
++    To disable in mpv-ht, put ``d3d11-skip-redundant-resize=no`` in
++    ``user-data/local.conf`` and restart the player. No recorder, pixel sampling
++    or detailed notification tracing is enabled by this option.
++
+ ``--d3d11-warp=<yes|no|auto>``
+     Use WARP (Windows Advanced Rasterization Platform) with the D3D11 GPU
+     backend (default: auto). This is a high performance software renderer. By
+diff --git a/video/out/d3d11/context.c b/video/out/d3d11/context.c
+index 74ac184be..de9e39784 100644
+--- a/video/out/d3d11/context.c
++++ b/video/out/d3d11/context.c
+@@ -43,6 +43,7 @@ struct d3d11_opts {
+     int color_space;
+     bool exclusive_fs;
+     int output_mode;
++    bool skip_redundant_resize;
+ };
+ 
+ #define OPT_BASE_STRUCT struct d3d11_opts
+@@ -68,6 +69,7 @@ const struct m_sub_options d3d11_conf = {
+         },
+         {"d3d11-flip", OPT_BOOL(flip), .flags = UPDATE_VO},
+         {"d3d11-sync-interval", OPT_INT(sync_interval), M_RANGE(0, 4)},
++        {"d3d11-skip-redundant-resize", OPT_BOOL(skip_redundant_resize), .flags = UPDATE_VO},
+         {"d3d11-adapter",
+             OPT_STRING_VALIDATE(adapter_name, mp_dxgi_validate_adapter),
+             .flags = UPDATE_VO,
+@@ -106,10 +108,22 @@ const struct m_sub_options d3d11_conf = {
+         .output_format = DXGI_FORMAT_UNKNOWN,
+         .color_space = -1,
+         .output_mode = -1,
++        .skip_redundant_resize = true,
+     },
+     .size = sizeof(struct d3d11_opts)
+ };
+ 
++struct resize_state {
++    DXGI_SWAP_CHAIN_DESC desc;
++    DXGI_OUTPUT_DESC1 output;
++    WINDOWINFO window;
++    MONITORINFO monitor;
++    BOOL exclusive;
++    bool fullscreen;
++    uint64_t generation;
++    struct pl_color_space color;
++};
++
+ struct priv {
+     struct d3d11_opts *opts;
+     struct m_config_cache *opts_cache;
+@@ -121,6 +135,9 @@ struct priv {
+     ID3D11Device *device;
+     IDXGISwapChain *swapchain;
+     struct pl_color_space swapchain_csp;
++    uint64_t swapchain_generation;
++    bool resize_valid;
++    struct resize_state resize_state;
+ 
+     int64_t perf_freq;
+     struct d3d11_vsync_estimator vsync;
+@@ -142,6 +159,7 @@ static struct ra_tex *get_backbuffer(struct ra_ctx *ctx)
+     hr = IDXGISwapChain_GetBuffer(p->swapchain, 0, &IID_ID3D11Texture2D,
+                                   (void**)&backbuffer);
+     if (FAILED(hr)) {
++        p->resize_valid = false;
+         MP_ERR(ctx, "Couldn't get swapchain image\n");
+         goto done;
+     }
+@@ -152,7 +170,41 @@ done:
+     return tex;
+ }
+ 
+-static bool resize(struct ra_ctx *ctx)
++static bool query_resize_state(struct ra_ctx *ctx, struct resize_state *s)
++{
++    struct priv *p = ctx->priv;
++    *s = (struct resize_state){0};
++    if (ctx->opts.composition || !p->swapchain)
++        return false;
++    HWND hwnd = vo_w32_hwnd(ctx->vo);
++    s->window.cbSize = sizeof(s->window);
++    s->monitor.cbSize = sizeof(s->monitor);
++    s->fullscreen = p->vo_opts->fullscreen;
++    s->generation = p->swapchain_generation;
++    s->color = p->swapchain_csp;
++    return SUCCEEDED(IDXGISwapChain_GetDesc(p->swapchain, &s->desc)) &&
++           SUCCEEDED(IDXGISwapChain_GetFullscreenState(p->swapchain, &s->exclusive, NULL)) &&
++           GetWindowInfo(hwnd, &s->window) && IsWindowVisible(hwnd) && !IsIconic(hwnd) &&
++           mp_dxgi_output_desc_from_swapchain(&p->dxgi_ctx, p->swapchain, &s->output) &&
++           s->output.Monitor == MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL) &&
++           GetMonitorInfoW(s->output.Monitor, &s->monitor);
++}
++
++static bool same_resize_state(struct ra_ctx *ctx, const struct resize_state *a,
++                              const struct resize_state *b)
++{
++    return ctx->vo->dwidth > 0 && ctx->vo->dheight > 0 &&
++           a->desc.BufferDesc.Width == ctx->vo->dwidth &&
++           a->desc.BufferDesc.Height == ctx->vo->dheight &&
++           !memcmp(&a->desc, &b->desc, sizeof(a->desc)) &&
++           !memcmp(&a->output, &b->output, sizeof(a->output)) &&
++           !memcmp(&a->window, &b->window, sizeof(a->window)) &&
++           !memcmp(&a->monitor, &b->monitor, sizeof(a->monitor)) &&
++           a->generation == b->generation && a->exclusive == b->exclusive &&
++           a->fullscreen == b->fullscreen && pl_color_space_equal(&a->color, &b->color);
++}
++
++static bool resize(struct ra_ctx *ctx, bool force, unsigned reasons)
+ {
+     struct priv *p = ctx->priv;
+     HRESULT hr;
+@@ -162,13 +214,34 @@ static bool resize(struct ra_ctx *ctx)
+         return false;
+     }
+ 
+-    hr = IDXGISwapChain_ResizeBuffers(p->swapchain, 0, ctx->vo->dwidth,
+-        ctx->vo->dheight, DXGI_FORMAT_UNKNOWN, 0);
+-    if (FAILED(hr)) {
+-        MP_FATAL(ctx, "Couldn't resize swapchain: %s\n", mp_HRESULT_to_str(hr));
+-        return false;
++    bool skip = false;
++    // Only query on eligible notifications, never during steady-state rendering.
++    if (resize_guard_can_skip(p->opts->skip_redundant_resize, force, reasons,
++                              true, true, true)) {
++        struct resize_state current;
++        bool queried = query_resize_state(ctx, &current);
++        bool same = queried && p->resize_valid &&
++                    same_resize_state(ctx, &current, &p->resize_state);
++        bool healthy = SUCCEEDED(p->last_present_result) &&
++                       ID3D11Device_GetDeviceRemovedReason(p->device) == S_OK;
++        skip = resize_guard_can_skip(true, false, reasons, queried, same, healthy);
++    }
++    if (skip) {
++        MP_DBG(ctx, "Skipping redundant D3D11 buffer resize\n");
++    } else {
++        p->resize_valid = false;
++        MP_DBG(ctx, "Resizing D3D11 buffers to %dx%d\n", ctx->vo->dwidth, ctx->vo->dheight);
++        hr = IDXGISwapChain_ResizeBuffers(p->swapchain, 0, ctx->vo->dwidth,
++            ctx->vo->dheight, DXGI_FORMAT_UNKNOWN, 0);
++        if (FAILED(hr)) {
++            MP_FATAL(ctx, "Couldn't resize swapchain: %s\n", mp_HRESULT_to_str(hr));
++            return false;
++        }
++        if (p->opts->skip_redundant_resize)
++            p->resize_valid = query_resize_state(ctx, &p->resize_state);
+     }
+ 
++    // Preserve the established timing/feedback reset; only omit the DXGI call.
+     d3d11_vsync_reset(&p->vsync);
+     p->feedback = (struct ht_dxgi_state){0};
+     p->feedback_epoch++;
+@@ -182,7 +255,7 @@ static bool d3d11_reconfig(struct ra_ctx *ctx)
+     } else {
+         vo_w32_config(ctx->vo);
+     }
+-    return resize(ctx);
++    return resize(ctx, true, 0);
+ }
+ 
+ static int d3d11_color_depth(struct ra_swapchain *sw)
+@@ -296,6 +369,8 @@ static void d3d11_swap_buffers(struct ra_swapchain *sw)
+     p->last_submit_qpc = perf_count.QuadPart;
+ 
+     p->last_present_result = IDXGISwapChain_Present(p->swapchain, p->opts->sync_interval, 0);
++    if (FAILED(p->last_present_result))
++        p->resize_valid = false;
+ }
+ 
+ static void d3d11_get_vsync(struct ra_swapchain *sw, struct vo_vsync_info *info)
+@@ -427,10 +502,12 @@ static bool d3d11_set_fullscreen(struct ra_ctx *ctx)
+ 
+     hr = IDXGISwapChain_SetFullscreenState(p->swapchain,
+                                            enable_exclusive_fs, NULL);
+-    if (FAILED(hr))
++    if (FAILED(hr)) {
++        p->resize_valid = false;
+         return false;
++    }
+ 
+-    if (!resize(ctx))
++    if (!resize(ctx, true, 0))
+         return false;
+ 
+     return true;
+@@ -462,6 +539,7 @@ static int d3d11_control(struct ra_ctx *ctx, int *events, int request, void *arg
+         break;
+     }
+ 
++    bool required_transition = fullscreen_switch_needed;
+     // if leaving full screen, handle d3d11 stuff first, then general
+     // windowing
+     if (fullscreen_switch_needed && !p->vo_opts->fullscreen) {
+@@ -471,7 +549,9 @@ static int d3d11_control(struct ra_ctx *ctx, int *events, int request, void *arg
+         fullscreen_switch_needed = false;
+     }
+ 
+-    ret = ctx->opts.composition ? VO_TRUE : vo_w32_control(ctx->vo, events, request, arg);
++    unsigned reasons = 0;
++    ret = ctx->opts.composition ? VO_TRUE :
++          vo_w32_control_resize(ctx->vo, events, request, arg, &reasons);
+ 
+     // if entering full screen, handle d3d11 after general windowing stuff
+     if (fullscreen_switch_needed && p->vo_opts->fullscreen) {
+@@ -482,7 +562,10 @@ static int d3d11_control(struct ra_ctx *ctx, int *events, int request, void *arg
+     }
+ 
+     if (*events & VO_EVENT_RESIZE) {
+-        if (!resize(ctx))
++        bool force = required_transition || ctx->opts.composition ||
++                     request != VOCTRL_CHECK_EVENTS ||
++                     (*events & (VO_EVENT_DPI | VO_EVENT_ICC_PROFILE_CHANGED));
++        if (!resize(ctx, force, reasons))
+             return VO_ERROR;
+     }
+     return ret;
+@@ -561,6 +644,9 @@ static bool d3d11_init(struct ra_ctx *ctx)
+     if (!ctx->opts.composition && !vo_w32_init(ctx->vo))
+         goto error;
+ 
++    if (!ctx->opts.composition)
++        vo_w32_track_resize_reasons(ctx->vo);
++
+     if (ctx->opts.composition && !vo_w32_composition_size(ctx->vo))
+         goto error;
+ 
+@@ -588,6 +674,7 @@ static bool d3d11_init(struct ra_ctx *ctx)
+     };
+     if (!mp_d3d11_create_swapchain(p->device, ctx->log, &scopts, &p->swapchain))
+         goto error;
++    p->swapchain_generation++;
+ 
+     if (ctx->opts.composition)
+         vo_w32_swapchain(ctx->vo, p->swapchain);
+@@ -627,6 +714,7 @@ bool ra_d3d11_ctx_recreate_swapchain(struct ra_ctx *ra)
+     if (!p->swapchain || p->backbuffer)
+         return false;
+ 
++    p->resize_valid = false;
+     BOOL was_exclusive = FALSE;
+     IDXGISwapChain_GetFullscreenState(p->swapchain, &was_exclusive, NULL);
+     if (was_exclusive)
+@@ -661,6 +749,7 @@ bool ra_d3d11_ctx_recreate_swapchain(struct ra_ctx *ra)
+ 
+     if (ra->opts.composition)
+         vo_w32_swapchain(ra->vo, p->swapchain);
++    p->swapchain_generation++;
+     if (was_exclusive)
+         IDXGISwapChain_SetFullscreenState(p->swapchain, TRUE, NULL);
+ 
+diff --git a/video/out/w32_common.c b/video/out/w32_common.c
+index bd1f09438..f23077c4c 100644
+--- a/video/out/w32_common.c
++++ b/video/out/w32_common.c
+@@ -137,6 +137,9 @@ struct vo_w32_state {
+     bool disable_screensaver;
+     bool cursor_visible;
+     atomic_uint event_flags;
++    // GUI-thread owned; transferred with the same lock as resize geometry.
++    bool track_resize_reasons;
++    unsigned resize_reasons;
+ 
+     BOOL tracking;
+     TRACKMOUSEEVENT track_event;
+@@ -1070,6 +1073,12 @@ static void window_resize(struct vo_w32_state *w32);
+ static void window_set_pos(struct vo_w32_state *w32, RECT client_rect);
+ static void update_corners_pref(const struct vo_w32_state *w32);
+ 
++static void resize_reason(struct vo_w32_state *w32, unsigned reason)
++{
++    if (w32->track_resize_reasons)
++        w32->resize_reasons |= reason;
++}
++
+ static void update_fullscreen_state(struct vo_w32_state *w32)
+ {
+     if (w32->parent)
+@@ -1088,6 +1097,7 @@ static void update_fullscreen_state(struct vo_w32_state *w32)
+     if (w32->current_fs == w32->opts->fullscreen)
+         return;
+ 
++    resize_reason(w32, W32_R_FULLSCREEN);
+     w32->current_fs = w32->opts->fullscreen;
+     update_window_style(w32);
+ 
+@@ -1344,6 +1354,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
+         signal_events(w32, VO_EVENT_EXPOSE);
+         break;
+     case WM_MOVE: {
++        resize_reason(w32, W32_R_MOVE);
+         w32->moving = false;
+         const int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
+         OffsetRect(&w32->current_rect, x - w32->current_rect.left,
+@@ -1394,6 +1405,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
+         w32->moving = false;
+         break;
+     case WM_SIZE: {
++        resize_reason(w32, W32_R_SIZE);
+         const int w = LOWORD(lParam), h = HIWORD(lParam);
+         int events = 0;
+         if (w > 0 && h > 0) {
+@@ -1471,6 +1483,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
+         handle_sizing(w32, wParam, (RECT *)lParam);
+         return TRUE;
+     case WM_DPICHANGED:
++        resize_reason(w32, W32_R_DPI);
+         update_display_info(w32);
+ 
+         RECT *rc = (RECT*)lParam;
+@@ -1659,9 +1672,11 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
+             HIWORD(wParam) == 1 ? MP_MBTN_BACK : MP_MBTN_FORWARD);
+         return TRUE;
+     case WM_DISPLAYCHANGE:
++        resize_reason(w32, W32_R_DISPLAY);
+         force_update_display_info(w32);
+         break;
+     case WM_SETTINGCHANGE:
++        resize_reason(w32, W32_R_SETTING);
+         update_dark_mode(w32);
+         update_window_style(w32);
+         window_resize(w32);
+@@ -1896,6 +1911,7 @@ static void window_set_pos(struct vo_w32_state *w32, RECT client_rect)
+ 
+ static void window_resize(struct vo_w32_state *w32)
+ {
++    resize_reason(w32, W32_R_LAYOUT);
+     struct vo *vo = w32->vo;
+ 
+     RECT r = get_working_area(w32);
+@@ -2006,6 +2022,7 @@ finish:
+ 
+ static void gui_thread_reconfig(void *ptr)
+ {
++    resize_reason(ptr, W32_R_CONFIG);
+     window_resize(ptr);
+ }
+ 
+@@ -2515,22 +2532,42 @@ static void do_control(void *ptr)
+     int request = *(int *)p[2];
+     void *arg = p[3];
+     int *ret = p[4];
++    unsigned *reasons = p[5];
++    if (request == VOCTRL_VO_OPTS_CHANGED || request == VOCTRL_SET_UNFS_WINDOW_SIZE)
++        resize_reason(w32, W32_R_OPTIONS);
+     *ret = gui_thread_control(w32, request, arg);
+     *events |= atomic_fetch_and(&w32->event_flags, 0);
+     // Safe access, since caller (owner of vo) is blocked.
+     if (*events & VO_EVENT_RESIZE) {
+         w32->vo->dwidth = rect_w(w32->current_rect);
+         w32->vo->dheight = rect_h(w32->current_rect);
++        if (reasons) {
++            *reasons = w32->resize_reasons;
++            w32->resize_reasons = 0;
++        }
+     }
+ }
+ 
+ int vo_w32_control(struct vo *vo, int *events, int request, void *arg)
++{
++    return vo_w32_control_resize(vo, events, request, arg, NULL);
++}
++
++int vo_w32_control_resize(struct vo *vo, int *events, int request, void *arg,
++                          unsigned *reasons)
+ {
+     struct vo_w32_state *w32 = vo->w32;
+     if (request == VOCTRL_CHECK_EVENTS) {
+         *events |= atomic_fetch_and(&w32->event_flags, 0);
+         if (*events & VO_EVENT_RESIZE) {
+             mp_dispatch_lock(w32->dispatch);
++            if (reasons) {
++                // Merge events received while acquiring the lock so geometry,
++                // reasons and flags all describe the same notification batch.
++                *events |= atomic_fetch_and(&w32->event_flags, 0);
++                *reasons = w32->resize_reasons;
++                w32->resize_reasons = 0;
++            }
+             vo->dwidth = rect_w(w32->current_rect);
+             vo->dheight = rect_h(w32->current_rect);
+             mp_dispatch_unlock(w32->dispatch);
+@@ -2540,12 +2577,24 @@ int vo_w32_control(struct vo *vo, int *events, int request, void *arg)
+         return VO_NOTIMPL;
+     } else {
+         int r;
+-        void *p[] = {w32, events, &request, arg, &r};
++        void *p[] = {w32, events, &request, arg, &r, reasons};
+         mp_dispatch_run(w32->dispatch, do_control, p);
+         return r;
+     }
+ }
+ 
++static void enable_resize_tracking(void *ptr)
++{
++    struct vo_w32_state *w32 = ptr;
++    w32->track_resize_reasons = true;
++    w32->resize_reasons = W32_R_OTHER;
++}
++
++void vo_w32_track_resize_reasons(struct vo *vo)
++{
++    mp_dispatch_run(vo->w32->dispatch, enable_resize_tracking, vo->w32);
++}
++
+ static void do_terminate(void *ptr)
+ {
+     struct vo_w32_state *w32 = ptr;
+diff --git a/video/out/w32_common.h b/video/out/w32_common.h
+index c2f30dabe..135759d54 100644
+--- a/video/out/w32_common.h
++++ b/video/out/w32_common.h
+@@ -23,12 +23,16 @@
+ #include <windows.h>
+ 
+ #include "common/common.h"
++#include "w32_resize.h"
+ 
+ struct vo;
+ 
+ bool vo_w32_init(struct vo *vo);
+ void vo_w32_uninit(struct vo *vo);
+ int vo_w32_control(struct vo *vo, int *events, int request, void *arg);
++int vo_w32_control_resize(struct vo *vo, int *events, int request, void *arg,
++                          unsigned *reasons);
++void vo_w32_track_resize_reasons(struct vo *vo);
+ void vo_w32_config(struct vo *vo);
+ HWND vo_w32_hwnd(struct vo *vo);
+ void vo_w32_swapchain(struct vo *vo, void *swapchain);
+diff --git a/video/out/w32_resize.h b/video/out/w32_resize.h
+new file mode 100644
+index 000000000..b0ca76cca
+--- /dev/null
++++ b/video/out/w32_resize.h
+@@ -0,0 +1,19 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++// Coalesced Win32 resize reasons and conservative, platform-free skip policy.
++#pragma once
++#include <stdbool.h>
++
++enum w32_resize_reason {
++    W32_R_SETTING = 1 << 0, W32_R_SIZE = 1 << 1, W32_R_LAYOUT = 1 << 2,
++    W32_R_DISPLAY = 1 << 3, W32_R_DPI = 1 << 4, W32_R_MOVE = 1 << 5,
++    W32_R_FULLSCREEN = 1 << 6, W32_R_CONFIG = 1 << 7,
++    W32_R_OPTIONS = 1 << 8, W32_R_OTHER = 1 << 9,
++};
++
++static inline bool resize_guard_can_skip(bool enabled, bool forced,
++    unsigned reasons, bool query_ok, bool state_equal, bool healthy)
++{
++    const unsigned benign = W32_R_SETTING | W32_R_SIZE | W32_R_LAYOUT;
++    return enabled && !forced && (reasons & (W32_R_SETTING | W32_R_SIZE)) &&
++           !(reasons & ~benign) && query_ok && state_equal && healthy;
++}
