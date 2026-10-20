@@ -1,0 +1,967 @@
+{
+  "baseline_release": "0.41.0.72",
+  "baseline_run": 38436222182,
+  "source_cache": "source-2026-09-09-34393354351-1",
+  "recovery_run": "39447782830",
+  "request_log_sha256": "3821ab3adf3c0bd3bc292a2d027678c930110d0f999af83c153237f550ed5e0c",
+  "packages": [
+    {
+      "name": "rubberband",
+      "repository": "https://github.com/breakfastquay/rubberband.git",
+      "expected": "e4296ac80b1170018a110bc326fd0d45a0eb27d6",
+      "method": "unchanged-tracking-ref-in-exact-release-072-input-cache",
+      "cached_head": "e4296ac80b1170018a110bc326fd0d45a0eb27d6",
+      "cached_tracking_ref": "refs/remotes/origin/default",
+      "cached_tracking_sha": "e4296ac80b1170018a110bc326fd0d45a0eb27d6",
+      "base": "e4296ac80b1170018a110bc326fd0d45a0eb27d6"
+    },
+    {
+      "name": "libsamplerate",
+      "repository": "https://github.com/libsndfile/libsamplerate.git",
+      "expected": "0844c208f683527c08ea8a80acc13b398aa9c8bf",
+      "method": "unchanged-tracking-ref-in-exact-release-072-input-cache",
+      "cached_head": "0844c208f683527c08ea8a80acc13b398aa9c8bf",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "0844c208f683527c08ea8a80acc13b398aa9c8bf",
+      "base": "0844c208f683527c08ea8a80acc13b398aa9c8bf"
+    },
+    {
+      "name": "xz",
+      "repository": "https://github.com/tukaani-project/xz.git",
+      "expected": "3d078b52adbff566ccfc51067dfbf742ecf3ef86",
+      "method": "explicit-recipe-pin",
+      "cached_head": "3d078b52adbff566ccfc51067dfbf742ecf3ef86",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "318fbc79be1209dcff88519f2e8b5a37b9cefc77",
+      "base": "3d078b52adbff566ccfc51067dfbf742ecf3ef86"
+    },
+    {
+      "name": "bzip2",
+      "repository": "https://gitlab.com/bzip2/bzip2.git",
+      "expected": "66c46b8c9436613fd81bc5d03f63a61933a4dcc3",
+      "method": "unchanged-tracking-ref-in-exact-release-072-input-cache",
+      "cached_head": "66c46b8c9436613fd81bc5d03f63a61933a4dcc3",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "66c46b8c9436613fd81bc5d03f63a61933a4dcc3",
+      "base": "66c46b8c9436613fd81bc5d03f63a61933a4dcc3"
+    },
+    {
+      "name": "uchardet",
+      "repository": "https://gitlab.freedesktop.org/uchardet/uchardet.git",
+      "expected": "06029ec3340cdf6bf9a6a537dafb3f39eda0560e",
+      "method": "unchanged-tracking-ref-in-exact-release-072-input-cache",
+      "cached_head": "06029ec3340cdf6bf9a6a537dafb3f39eda0560e",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "06029ec3340cdf6bf9a6a537dafb3f39eda0560e",
+      "base": "06029ec3340cdf6bf9a6a537dafb3f39eda0560e"
+    },
+    {
+      "name": "zlib",
+      "repository": "https://github.com/zlib-ng/zlib-ng.git",
+      "expected": "1ab945a",
+      "method": "release-072-fetch-destination",
+      "cached_head": "a77d08470816d86ad77926ccbe4f478d3aff8fa6",
+      "cached_tracking_ref": "refs/remotes/origin/develop",
+      "cached_tracking_sha": "a77d08470816d86ad77926ccbe4f478d3aff8fa6",
+      "base": "1ab945a841245634cc770b9c3d0e0150734ad013"
+    },
+    {
+      "name": "zstd",
+      "repository": "https://github.com/facebook/zstd.git",
+      "expected": "49cf517",
+      "method": "release-072-fetch-destination",
+      "cached_head": "d9c0c7e2cf8a8bf9fb98d3bee546dcf8dc9ac59a",
+      "cached_tracking_ref": "refs/remotes/origin/dev",
+      "cached_tracking_sha": "d9c0c7e2cf8a8bf9fb98d3bee546dcf8dc9ac59a",
+      "base": "49cf51799ea051457f57243527aa2058f999f005"
+    },
+    {
+      "name": "ogg",
+      "repository": "https://github.com/xiph/ogg.git",
+      "expected": "be05b13e98b048f0b5a0f5fa8ce514d56db5f822",
+      "method": "unchanged-tracking-ref-in-exact-release-072-input-cache",
+      "cached_head": "be05b13e98b048f0b5a0f5fa8ce514d56db5f822",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "be05b13e98b048f0b5a0f5fa8ce514d56db5f822",
+      "base": "be05b13e98b048f0b5a0f5fa8ce514d56db5f822"
+    },
+    {
+      "name": "lame",
+      "repository": "https://gitlab.com/shinchiro/lame.git",
+      "expected": "9a5b35c430a2e6d150d65a96c7d7acdd64962a8f",
+      "method": "unchanged-tracking-ref-in-exact-release-072-input-cache",
+      "cached_head": "9a5b35c430a2e6d150d65a96c7d7acdd64962a8f",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "9a5b35c430a2e6d150d65a96c7d7acdd64962a8f",
+      "base": "9a5b35c430a2e6d150d65a96c7d7acdd64962a8f"
+    },
+    {
+      "name": "libjpeg",
+      "repository": "https://github.com/libjpeg-turbo/libjpeg-turbo.git",
+      "expected": "43ea809",
+      "method": "release-072-fetch-destination",
+      "cached_head": "d9b5af99e53591c0b51ba82bea3a0874b78c4c20",
+      "cached_tracking_ref": "refs/remotes/origin/main",
+      "cached_tracking_sha": "d9b5af99e53591c0b51ba82bea3a0874b78c4c20",
+      "base": "43ea809765004508d8da72ebe562cf570c6a62b2"
+    },
+    {
+      "name": "vorbis",
+      "repository": "https://github.com/xiph/vorbis.git",
+      "expected": "c2aa86b05e981c96bf381fc6aa11cdd03eccc2fb",
+      "method": "unchanged-tracking-ref-in-exact-release-072-input-cache",
+      "cached_head": "c2aa86b05e981c96bf381fc6aa11cdd03eccc2fb",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "c2aa86b05e981c96bf381fc6aa11cdd03eccc2fb",
+      "base": "c2aa86b05e981c96bf381fc6aa11cdd03eccc2fb"
+    },
+    {
+      "name": "lcms2",
+      "repository": "https://github.com/mm2/Little-CMS.git",
+      "expected": "15c24e7",
+      "method": "release-072-fetch-destination",
+      "cached_head": "ad3c8a831074eec05c96f1b3c580ce0464b2fdc3",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "ad3c8a831074eec05c96f1b3c580ce0464b2fdc3",
+      "base": "15c24e7ded91184c38c46c096804fa7272765737"
+    },
+    {
+      "name": "libmodplug",
+      "repository": "https://github.com/Konstanty/libmodplug.git",
+      "expected": "d1b97ed0020bc620a059d3675d1854b40bd2608d",
+      "method": "unchanged-tracking-ref-in-exact-release-072-input-cache",
+      "cached_head": "d1b97ed0020bc620a059d3675d1854b40bd2608d",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "d1b97ed0020bc620a059d3675d1854b40bd2608d",
+      "base": "d1b97ed0020bc620a059d3675d1854b40bd2608d"
+    },
+    {
+      "name": "speex",
+      "repository": "https://github.com/xiph/speex.git",
+      "expected": "f461ff4",
+      "method": "release-072-fetch-destination",
+      "cached_head": "05895229896dc942d453446eba6f9f5ddcf95422",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "05895229896dc942d453446eba6f9f5ddcf95422",
+      "base": "f461ff44072493dde26d72862921ab5d30180cd4"
+    },
+    {
+      "name": "game-music-emu",
+      "repository": "https://bitbucket.org/mpyne/game-music-emu.git",
+      "expected": "a5216b1dafe476b6de36a316a151c64df575197a",
+      "method": "unchanged-tracking-ref-in-exact-release-072-input-cache",
+      "cached_head": "a5216b1dafe476b6de36a316a151c64df575197a",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "a5216b1dafe476b6de36a316a151c64df575197a",
+      "base": "a5216b1dafe476b6de36a316a151c64df575197a"
+    },
+    {
+      "name": "opus",
+      "repository": "https://github.com/xiph/opus.git",
+      "expected": "503d81b",
+      "method": "release-072-fetch-destination",
+      "cached_head": "328079cfdade069a2fce6db5501b8de75c97d060",
+      "cached_tracking_ref": "refs/remotes/origin/main",
+      "cached_tracking_sha": "328079cfdade069a2fce6db5501b8de75c97d060",
+      "base": "503d81b138d76621aae4b12786e90de48aa8db3a"
+    },
+    {
+      "name": "x264",
+      "repository": "https://code.videolan.org/videolan/x264.git",
+      "expected": "0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee",
+      "method": "unchanged-tracking-ref-in-exact-release-072-input-cache",
+      "cached_head": "0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee",
+      "base": "0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee"
+    },
+    {
+      "name": "libpng",
+      "repository": "https://github.com/glennrp/libpng.git",
+      "expected": "33d0150",
+      "method": "release-072-fetch-destination",
+      "cached_head": "d636385b22e9005b0fd2ae10180f7b1dcf5b6142",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "d636385b22e9005b0fd2ae10180f7b1dcf5b6142",
+      "base": "33d015040f5dbc3d678413360ff9df35d152eefc"
+    },
+    {
+      "name": "libdvdcss",
+      "repository": "https://code.videolan.org/videolan/libdvdcss.git",
+      "expected": "811ce97a1d4d1c9d936f4b2707f533a9ef768251",
+      "method": "unchanged-tracking-ref-in-exact-release-072-input-cache",
+      "cached_head": "811ce97a1d4d1c9d936f4b2707f533a9ef768251",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "811ce97a1d4d1c9d936f4b2707f533a9ef768251",
+      "base": "811ce97a1d4d1c9d936f4b2707f533a9ef768251"
+    },
+    {
+      "name": "libdvdread",
+      "repository": "https://code.videolan.org/videolan/libdvdread.git",
+      "expected": "0f30df53125b564ef45903714403ce0a1e6c5e9e",
+      "method": "unchanged-tracking-ref-in-exact-release-072-input-cache",
+      "cached_head": "0f30df53125b564ef45903714403ce0a1e6c5e9e",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "0f30df53125b564ef45903714403ce0a1e6c5e9e",
+      "base": "0f30df53125b564ef45903714403ce0a1e6c5e9e"
+    },
+    {
+      "name": "libdvdnav",
+      "repository": "https://code.videolan.org/videolan/libdvdnav.git",
+      "expected": "8147ccd35e5aae4afdd21171cf7b6b4d8f179d28",
+      "method": "unchanged-tracking-ref-in-exact-release-072-input-cache",
+      "cached_head": "8147ccd35e5aae4afdd21171cf7b6b4d8f179d28",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "8147ccd35e5aae4afdd21171cf7b6b4d8f179d28",
+      "base": "8147ccd35e5aae4afdd21171cf7b6b4d8f179d28"
+    },
+    {
+      "name": "x265",
+      "repository": "https://github.com/Multicorewareinc/x265.git",
+      "expected": "87f5f70",
+      "method": "release-072-fetch-destination",
+      "cached_head": "95852181b12a1b1fc0380f841fed6e6edb1586cf",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "95852181b12a1b1fc0380f841fed6e6edb1586cf",
+      "base": "87f5f709b0d2653d2feae302c1ee4527f672a6e0"
+    },
+    {
+      "name": "libvpx",
+      "repository": "https://chromium.googlesource.com/webm/libvpx.git",
+      "expected": "6a891739",
+      "method": "release-072-fetch-destination",
+      "cached_head": "d2413e2ca11039724ca33bb4d661ca2c94cb501e",
+      "cached_tracking_ref": "refs/remotes/origin/main",
+      "cached_tracking_sha": "d2413e2ca11039724ca33bb4d661ca2c94cb501e",
+      "base": "6a8917393da96b10f263f77e4dcd0dc7fbbd254b"
+    },
+    {
+      "name": "libudfread",
+      "repository": "https://code.videolan.org/videolan/libudfread.git",
+      "expected": "b0bc6957e7e07d5f35391f210596d9eb71cffdd9",
+      "method": "unchanged-tracking-ref-in-exact-release-072-input-cache",
+      "cached_head": "b0bc6957e7e07d5f35391f210596d9eb71cffdd9",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "b0bc6957e7e07d5f35391f210596d9eb71cffdd9",
+      "base": "b0bc6957e7e07d5f35391f210596d9eb71cffdd9"
+    },
+    {
+      "name": "fribidi",
+      "repository": "https://github.com/fribidi/fribidi.git",
+      "expected": "24f15ee",
+      "method": "release-072-fetch-destination",
+      "cached_head": "c928e4c77549de59e057f72bbbec1e38ce8b43bd",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "c928e4c77549de59e057f72bbbec1e38ce8b43bd",
+      "base": "24f15eee832eafa5d63319b666d50e488668ce31"
+    },
+    {
+      "name": "luajit",
+      "repository": "https://github.com/openresty/luajit2.git",
+      "expected": "f75bf45",
+      "method": "release-072-fetch-destination",
+      "cached_head": "56d12c006b06cf026c3928768f52377c0a6b6605",
+      "cached_tracking_ref": "refs/remotes/origin/v2.1-agentzh",
+      "cached_tracking_sha": "1b3e6c0bb78f1edfeaa895816ec6fec9d7a11a6b",
+      "base": "f75bf45e8b869a8ee4562ab0183322c3ebf2d9f3"
+    },
+    {
+      "name": "brotli",
+      "repository": "https://github.com/google/brotli.git",
+      "expected": "86ee1f6",
+      "method": "release-072-fetch-destination",
+      "cached_head": "4508218e7fef90fa4273286f7a415065946f2c43",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "4508218e7fef90fa4273286f7a415065946f2c43",
+      "base": "86ee1f65f62d6272345dee751d49e7d1f01c2b11"
+    },
+    {
+      "name": "libxml2",
+      "repository": "https://github.com/GNOME/libxml2.git",
+      "expected": "c43dc98",
+      "method": "release-072-fetch-destination",
+      "cached_head": "81c05bafd4d7df6da91ccf8eab8f539cc78421d8",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "81c05bafd4d7df6da91ccf8eab8f539cc78421d8",
+      "base": "c43dc98d27ac315a48d93dbd399c6c22cf7125b1"
+    },
+    {
+      "name": "graphengine",
+      "repository": "https://github.com/sekrit-twc/graphengine.git",
+      "expected": "91c6af4c795c5396d8b974f24b4d2e2ecca04e2d",
+      "method": "unchanged-tracking-ref-in-exact-release-072-input-cache",
+      "cached_head": "91c6af4c795c5396d8b974f24b4d2e2ecca04e2d",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "91c6af4c795c5396d8b974f24b4d2e2ecca04e2d",
+      "base": "91c6af4c795c5396d8b974f24b4d2e2ecca04e2d"
+    },
+    {
+      "name": "freetype2",
+      "repository": "https://github.com/freetype/freetype.git",
+      "expected": "88f8b33",
+      "method": "release-072-fetch-destination",
+      "cached_head": "5c79d6cd1ac73d70a55f3d963fb568aa32f6d794",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "5c79d6cd1ac73d70a55f3d963fb568aa32f6d794",
+      "base": "88f8b33c4d5e695565bd9ef90d6e9e5ef1d51bde"
+    },
+    {
+      "name": "libsoxr",
+      "repository": "https://gitlab.com/shinchiro/soxr.git",
+      "expected": "945b592b70470e29f917f4de89b4281fbbd540c0",
+      "method": "unchanged-tracking-ref-in-exact-release-072-input-cache",
+      "cached_head": "945b592b70470e29f917f4de89b4281fbbd540c0",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "945b592b70470e29f917f4de89b4281fbbd540c0",
+      "base": "945b592b70470e29f917f4de89b4281fbbd540c0"
+    },
+    {
+      "name": "libzimg",
+      "repository": "https://github.com/sekrit-twc/zimg.git",
+      "expected": "67e0603271c080e22c8429856dd4a8a56587e61e",
+      "method": "unchanged-tracking-ref-in-exact-release-072-input-cache",
+      "cached_head": "67e0603271c080e22c8429856dd4a8a56587e61e",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "67e0603271c080e22c8429856dd4a8a56587e61e",
+      "base": "67e0603271c080e22c8429856dd4a8a56587e61e"
+    },
+    {
+      "name": "libunibreak",
+      "repository": "https://github.com/adah1972/libunibreak.git",
+      "expected": "f8172fe",
+      "method": "release-072-fetch-destination",
+      "cached_head": "a6dd9020cc9338d867a6a6c75fe0401f1d587bc8",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "a6dd9020cc9338d867a6a6c75fe0401f1d587bc8",
+      "base": "f8172fe771ef620112247cadfb876aecaa4f769e"
+    },
+    {
+      "name": "harfbuzz",
+      "repository": "https://github.com/harfbuzz/harfbuzz.git",
+      "expected": "fed245b6",
+      "method": "release-072-fetch-destination",
+      "cached_head": "f5efbbef3841bdcdc6427bde7c2971f62ac8c8f1",
+      "cached_tracking_ref": "refs/remotes/origin/main",
+      "cached_tracking_sha": "f5efbbef3841bdcdc6427bde7c2971f62ac8c8f1",
+      "base": "fed245b6ab669ac553aceee369436c8a534d3e29"
+    },
+    {
+      "name": "subrandr",
+      "repository": "https://github.com/afishhh/subrandr.git",
+      "expected": "efb9546",
+      "method": "release-072-fetch-destination",
+      "cached_head": "a7bcdfc102198404c63835f1799b0d331d4f4818",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "a7bcdfc102198404c63835f1799b0d331d4f4818",
+      "base": "efb954689387fb242f1cbc8b083427dbe3de496b"
+    },
+    {
+      "name": "libass",
+      "repository": "https://github.com/libass/libass.git",
+      "expected": "f61db56",
+      "method": "release-072-fetch-destination",
+      "cached_head": "b2fe9d8770678a7b5271387d38c20657ebf3429a",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "b2fe9d8770678a7b5271387d38c20657ebf3429a",
+      "base": "f61db567e6593df3470e91594bcd4ad2d0473aff"
+    },
+    {
+      "name": "libvpl",
+      "repository": "https://github.com/intel/libvpl.git",
+      "expected": "674d015bcb294bc39fa276e99a652ea045423e82",
+      "method": "unchanged-tracking-ref-in-exact-release-072-input-cache",
+      "cached_head": "674d015bcb294bc39fa276e99a652ea045423e82",
+      "cached_tracking_ref": "refs/remotes/origin/main",
+      "cached_tracking_sha": "674d015bcb294bc39fa276e99a652ea045423e82",
+      "base": "674d015bcb294bc39fa276e99a652ea045423e82"
+    },
+    {
+      "name": "avisynth-headers",
+      "repository": "https://github.com/AviSynth/AviSynthPlus.git",
+      "expected": "21fdc997f9724b994896ba5520ddf64d677976b3",
+      "method": "explicit-recipe-pin",
+      "cached_head": "21fdc997f9724b994896ba5520ddf64d677976b3",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "5c82777b374bdef16e13007a11e77d735ac1e4eb",
+      "base": "21fdc997f9724b994896ba5520ddf64d677976b3"
+    },
+    {
+      "name": "libmysofa",
+      "repository": "https://github.com/hoene/libmysofa.git",
+      "expected": "648eed03472e6720a1ea45d1a1f86c4efb569ff9",
+      "method": "unchanged-tracking-ref-in-exact-release-072-input-cache",
+      "cached_head": "648eed03472e6720a1ea45d1a1f86c4efb569ff9",
+      "cached_tracking_ref": "refs/remotes/origin/main",
+      "cached_tracking_sha": "648eed03472e6720a1ea45d1a1f86c4efb569ff9",
+      "base": "648eed03472e6720a1ea45d1a1f86c4efb569ff9"
+    },
+    {
+      "name": "libbluray",
+      "repository": "https://code.videolan.org/videolan/libbluray.git",
+      "expected": "448f896",
+      "method": "release-072-fetch-destination",
+      "cached_head": "a24f4fad4d62893de647abc8671397747b2359dd",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "a24f4fad4d62893de647abc8671397747b2359dd",
+      "base": "448f896091634ab84776a3d062f0e1826e13ac6c"
+    },
+    {
+      "name": "amf-headers",
+      "repository": "https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git",
+      "expected": "8c64800",
+      "method": "release-072-fetch-destination",
+      "cached_head": "c35f613aea2e5057a688c979e75b1cf24253297e",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "c35f613aea2e5057a688c979e75b1cf24253297e",
+      "base": "8c648005e07d4309033282bfd9947df2c7e76104",
+      "resolution": {
+        "url": "https://api.github.com/repos/GPUOpen-LibrariesAndSDKs/AMF/commits/8c64800",
+        "verified_prefix": "8c64800"
+      }
+    },
+    {
+      "name": "nvcodec-headers",
+      "repository": "https://github.com/FFmpeg/nv-codec-headers.git",
+      "expected": "eddcea9e27f6b772057c9b3f87de2cc1737faffc",
+      "method": "unchanged-tracking-ref-in-exact-release-072-input-cache",
+      "cached_head": "eddcea9e27f6b772057c9b3f87de2cc1737faffc",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "eddcea9e27f6b772057c9b3f87de2cc1737faffc",
+      "base": "eddcea9e27f6b772057c9b3f87de2cc1737faffc",
+      "resolution": "Full ID already present in the recipe or recovered immutable input cache"
+    },
+    {
+      "name": "xxhash",
+      "repository": "https://github.com/Cyan4973/xxHash.git",
+      "expected": "680bf46",
+      "method": "release-072-fetch-destination",
+      "cached_head": "c0b5ea995d66691734b1a79ad89e73a0d2fd5a53",
+      "cached_tracking_ref": "refs/remotes/origin/dev",
+      "cached_tracking_sha": "c0b5ea995d66691734b1a79ad89e73a0d2fd5a53",
+      "base": "680bf463fa1ca0461b9a7c2dab7556e1f54cf4cf",
+      "resolution": {
+        "url": "https://api.github.com/repos/Cyan4973/xxHash/commits/680bf46",
+        "verified_prefix": "680bf46"
+      }
+    },
+    {
+      "name": "vapoursynth",
+      "repository": "https://github.com/vapoursynth/vapoursynth.git",
+      "expected": "e46204429041e95a881b61eedddd46c08f9a307c",
+      "method": "explicit-recipe-pin",
+      "cached_head": "e46204429041e95a881b61eedddd46c08f9a307c",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "3871f1c228797c990850c3ad4201888be0bc542b",
+      "base": "e46204429041e95a881b61eedddd46c08f9a307c",
+      "resolution": "Full ID already present in the recipe or recovered immutable input cache"
+    },
+    {
+      "name": "libbs2b",
+      "repository": "https://github.com/alexmarsev/libbs2b.git",
+      "expected": "5ca2d59888df047f1e4b028e3a2fd5be8b5a7277",
+      "method": "unchanged-tracking-ref-in-exact-release-072-input-cache",
+      "cached_head": "284cbc278d4fc21e9f2fc8558f0db14cb6b6c221",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "5ca2d59888df047f1e4b028e3a2fd5be8b5a7277",
+      "base": "5ca2d59888df047f1e4b028e3a2fd5be8b5a7277",
+      "resolution": "Full ID already present in the recipe or recovered immutable input cache"
+    },
+    {
+      "name": "fontconfig",
+      "repository": "https://gitlab.freedesktop.org/fontconfig/fontconfig.git",
+      "expected": "129ddf3",
+      "method": "release-072-fetch-destination",
+      "cached_head": "257a003c85a2b05ab5afd9933bb0dbb63ad25c46",
+      "cached_tracking_ref": "refs/remotes/origin/main",
+      "cached_tracking_sha": "a4115f2094a30ccf6c5e8647a8e26fdeedc9a510",
+      "base": "129ddf32994886b52b1ca91fdde305b426b5d526",
+      "resolution": {
+        "url": "https://gitlab.freedesktop.org/api/v4/projects/fontconfig%2Ffontconfig/repository/commits/129ddf3",
+        "verified_prefix": "129ddf3"
+      }
+    },
+    {
+      "name": "libwebp",
+      "repository": "https://chromium.googlesource.com/webm/libwebp.git",
+      "expected": "abd0127",
+      "method": "release-072-fetch-destination",
+      "cached_head": "9c4a699e5aacc1995a27ca3bf1643c8b2378616c",
+      "cached_tracking_ref": "refs/remotes/origin/main",
+      "cached_tracking_sha": "9c4a699e5aacc1995a27ca3bf1643c8b2378616c",
+      "base": "abd0127ea848432e2a199aefcdd244eb886631a7",
+      "resolution": {
+        "url": "https://chromium.googlesource.com/webm/libwebp.git/+/abd0127?format=JSON",
+        "verified_prefix": "abd0127"
+      }
+    },
+    {
+      "name": "aom",
+      "repository": "https://aomedia.googlesource.com/aom",
+      "expected": "f931b30a",
+      "method": "release-072-fetch-destination",
+      "cached_head": "8e7b6a567df174d795479b92b4ac766d271add73",
+      "cached_tracking_ref": "refs/remotes/origin/main",
+      "cached_tracking_sha": "8e7b6a567df174d795479b92b4ac766d271add73",
+      "base": "f931b30a90071d03b710be9ed61d7413f8c369a4",
+      "resolution": {
+        "url": "https://aomedia.googlesource.com/aom/+/f931b30a?format=JSON",
+        "verified_prefix": "f931b30a"
+      }
+    },
+    {
+      "name": "libssh",
+      "repository": "https://gitlab.com/libssh/libssh-mirror.git",
+      "expected": "301d0e16dfa8a5cac1cff956b6880ca90eb82864",
+      "method": "explicit-recipe-pin",
+      "cached_head": "6ea329d58c5f60b94d0c0d5e7ba2e4f2d6d9acfc",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "10ad060693beb4ff458db14b493b4fc834a1240b",
+      "base": "301d0e16dfa8a5cac1cff956b6880ca90eb82864",
+      "resolution": "Full ID already present in the recipe or recovered immutable input cache"
+    },
+    {
+      "name": "uavs3d",
+      "repository": "https://github.com/uavs3/uavs3d.git",
+      "expected": "0e20d2c291853f196c68922a264bcd8471d75b68",
+      "method": "unchanged-tracking-ref-in-exact-release-072-input-cache",
+      "cached_head": "0e20d2c291853f196c68922a264bcd8471d75b68",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "0e20d2c291853f196c68922a264bcd8471d75b68",
+      "base": "0e20d2c291853f196c68922a264bcd8471d75b68",
+      "resolution": "Full ID already present in the recipe or recovered immutable input cache"
+    },
+    {
+      "name": "dav1d",
+      "repository": "https://code.videolan.org/videolan/dav1d.git",
+      "expected": "99f3354",
+      "method": "release-072-fetch-destination",
+      "cached_head": "060854a5980c94526965124b9761b5c8bfae85df",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "060854a5980c94526965124b9761b5c8bfae85df",
+      "base": "99f3354ed0b9b4bf3c7c9347318dbcc522c94af5",
+      "resolution": {
+        "url": "https://api.github.com/repos/videolan/dav1d/commits/99f3354",
+        "verified_prefix": "99f3354"
+      }
+    },
+    {
+      "name": "davs2",
+      "repository": "https://github.com/saindriches/davs2.git",
+      "expected": "f50435051b72c168c2b566c544e27fcff71ba61a",
+      "method": "unchanged-tracking-ref-in-exact-release-072-input-cache",
+      "cached_head": "f50435051b72c168c2b566c544e27fcff71ba61a",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "f50435051b72c168c2b566c544e27fcff71ba61a",
+      "base": "f50435051b72c168c2b566c544e27fcff71ba61a",
+      "resolution": "Full ID already present in the recipe or recovered immutable input cache"
+    },
+    {
+      "name": "openssl",
+      "repository": "https://github.com/openssl/openssl.git",
+      "expected": "d8bf6cdd4849925c30e4f1911c7acb49cb34b702",
+      "method": "explicit-recipe-pin",
+      "cached_head": "d8bf6cdd4849925c30e4f1911c7acb49cb34b702",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "47b46baebd47a7954ed894a74cc0d229e160d36a",
+      "base": "d8bf6cdd4849925c30e4f1911c7acb49cb34b702",
+      "resolution": "Full ID already present in the recipe or recovered immutable input cache"
+    },
+    {
+      "name": "libjxl",
+      "repository": "https://github.com/libjxl/libjxl.git",
+      "expected": "ef67fde",
+      "method": "release-072-fetch-destination",
+      "cached_head": "b5def9fb509d0f2421c8a5bcd7aa6f5a627363c4",
+      "cached_tracking_ref": "refs/remotes/origin/main",
+      "cached_tracking_sha": "b5def9fb509d0f2421c8a5bcd7aa6f5a627363c4",
+      "base": "ef67fde2ec16d52e644c5a0969230b9a85e3eb31",
+      "resolution": {
+        "url": "https://api.github.com/repos/libjxl/libjxl/commits/ef67fde",
+        "verified_prefix": "ef67fde"
+      }
+    },
+    {
+      "name": "angle-headers",
+      "repository": "https://github.com/google/angle.git",
+      "expected": "0cb8023c01f92b29f3738ea7472d06f8f059ed84",
+      "method": "explicit-recipe-pin",
+      "cached_head": "0cb8023c01f92b29f3738ea7472d06f8f059ed84",
+      "cached_tracking_ref": "refs/remotes/origin/main",
+      "cached_tracking_sha": "9ebe6aecc5d8f9119c78fcb5804f6ba31f4d02e2",
+      "base": "0cb8023c01f92b29f3738ea7472d06f8f059ed84",
+      "resolution": "Full ID already present in the recipe or recovered immutable input cache"
+    },
+    {
+      "name": "libarchive",
+      "repository": "https://github.com/libarchive/libarchive.git",
+      "expected": "faedff0",
+      "method": "release-072-fetch-destination",
+      "cached_head": "693bc2c8e894b283a415eb265f78ba84f536d683",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "693bc2c8e894b283a415eb265f78ba84f536d683",
+      "base": "faedff09e7e2a4a4ccba068364bb67e51626a01c",
+      "resolution": {
+        "url": "https://api.github.com/repos/libarchive/libarchive/commits/faedff0",
+        "verified_prefix": "faedff0"
+      }
+    },
+    {
+      "name": "highway",
+      "repository": "https://github.com/google/highway.git",
+      "expected": "8d07f07",
+      "method": "release-072-fetch-destination",
+      "cached_head": "fcda80dc5927e9a17204fb49b97426680eaa096d",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "fcda80dc5927e9a17204fb49b97426680eaa096d",
+      "base": "8d07f07df11f97de4e8874c69d90750ece4b7bb7",
+      "resolution": {
+        "url": "https://api.github.com/repos/google/highway/commits/8d07f07",
+        "verified_prefix": "8d07f07"
+      }
+    },
+    {
+      "name": "spirv-headers",
+      "repository": "https://github.com/KhronosGroup/SPIRV-Headers.git",
+      "expected": "86f980c",
+      "method": "release-072-fetch-destination",
+      "cached_head": "04fd3caa1e8267e4d95c806cad901181728e1006",
+      "cached_tracking_ref": "refs/remotes/origin/main",
+      "cached_tracking_sha": "04fd3caa1e8267e4d95c806cad901181728e1006",
+      "base": "86f980c731e62ae4eaf383d320449d71687936bf",
+      "resolution": {
+        "url": "https://api.github.com/repos/KhronosGroup/SPIRV-Headers/commits/86f980c",
+        "verified_prefix": "86f980c"
+      }
+    },
+    {
+      "name": "glslang",
+      "repository": "https://github.com/KhronosGroup/glslang.git",
+      "expected": "2fbed5e",
+      "method": "release-072-fetch-destination",
+      "cached_head": "ebe60e331c21d5c7f09734fbdcebbc46ee5d8507",
+      "cached_tracking_ref": "refs/remotes/origin/main",
+      "cached_tracking_sha": "ebe60e331c21d5c7f09734fbdcebbc46ee5d8507",
+      "base": "2fbed5e1fb43a1c480fe020e3bb686a31010989a",
+      "resolution": {
+        "url": "https://api.github.com/repos/KhronosGroup/glslang/commits/2fbed5e",
+        "verified_prefix": "2fbed5e"
+      }
+    },
+    {
+      "name": "vulkan",
+      "repository": "https://github.com/KhronosGroup/Vulkan-Loader.git",
+      "expected": "6b45d76",
+      "method": "release-072-fetch-destination",
+      "cached_head": "6460bd694f5e45fe9507eeb421d2d65fba4a4957",
+      "cached_tracking_ref": "refs/remotes/origin/main",
+      "cached_tracking_sha": "6460bd694f5e45fe9507eeb421d2d65fba4a4957",
+      "base": "6b45d76280a9525740c38c1796060eadb9267488",
+      "resolution": {
+        "url": "https://api.github.com/repos/KhronosGroup/Vulkan-Loader/commits/6b45d76",
+        "verified_prefix": "6b45d76"
+      }
+    },
+    {
+      "name": "mujs",
+      "repository": "https://codeberg.org/ccxvii/mujs.git",
+      "expected": "aab59f2",
+      "method": "release-072-fetch-destination",
+      "cached_head": "181b75306ba93f7ae3a4123208967d8e6fa8b6ce",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "8a32c397b28fe45747ac4e9e4f3dca049825eda7",
+      "base": "aab59f2c8136b55e8eef7a016d5a15fe8cf69f3f",
+      "resolution": {
+        "url": "https://codeberg.org/api/v1/repos/ccxvii/mujs/git/commits/aab59f2",
+        "verified_prefix": "aab59f2"
+      }
+    },
+    {
+      "name": "vulkan-header",
+      "repository": "https://github.com/KhronosGroup/Vulkan-Headers.git",
+      "expected": "c468508",
+      "method": "release-072-fetch-destination",
+      "cached_head": "ee2ec5fd83dafce291024683b50dc89219333076",
+      "cached_tracking_ref": "refs/remotes/origin/main",
+      "cached_tracking_sha": "ee2ec5fd83dafce291024683b50dc89219333076",
+      "base": "c46850864f4661461b0f6cb9922c058ffea4915e",
+      "resolution": {
+        "url": "https://api.github.com/repos/KhronosGroup/Vulkan-Headers/commits/c468508",
+        "verified_prefix": "c468508"
+      }
+    },
+    {
+      "name": "spirv-tools",
+      "repository": "https://github.com/KhronosGroup/SPIRV-Tools.git",
+      "expected": "911d1ea",
+      "method": "release-072-fetch-destination",
+      "cached_head": "5262baed1ceceb131175be564547d2b11a76be84",
+      "cached_tracking_ref": "refs/remotes/origin/main",
+      "cached_tracking_sha": "5262baed1ceceb131175be564547d2b11a76be84",
+      "base": "911d1eaf87fd7763b2365d7e339816fa31ec3f4b",
+      "resolution": {
+        "url": "https://api.github.com/repos/KhronosGroup/SPIRV-Tools/commits/911d1ea",
+        "verified_prefix": "911d1ea"
+      }
+    },
+    {
+      "name": "glad",
+      "repository": "https://github.com/Dav1dde/glad.git",
+      "expected": "0a7cf1a",
+      "method": "release-072-fetch-destination",
+      "cached_head": "e3c14f906127dea49ead20ff4d5878294d08b7ab",
+      "cached_tracking_ref": "refs/remotes/origin/glad2",
+      "cached_tracking_sha": "e3c14f906127dea49ead20ff4d5878294d08b7ab",
+      "base": "0a7cf1af9e25e02821587bd4095807fc90b6426a",
+      "resolution": {
+        "url": "https://api.github.com/repos/Dav1dde/glad/commits/0a7cf1a",
+        "verified_prefix": "0a7cf1a"
+      }
+    },
+    {
+      "name": "fast_float",
+      "repository": "https://github.com/fastfloat/fast_float.git",
+      "expected": "166d2b3",
+      "method": "release-072-fetch-destination",
+      "cached_head": "a8a02f77480d10c5dc90d39f7b890bc1dff9c1b9",
+      "cached_tracking_ref": "refs/remotes/origin/main",
+      "cached_tracking_sha": "a8a02f77480d10c5dc90d39f7b890bc1dff9c1b9",
+      "base": "166d2b3df29cf8101bb715bde2125610881df791",
+      "resolution": {
+        "url": "https://api.github.com/repos/fastfloat/fast_float/commits/166d2b3",
+        "verified_prefix": "166d2b3"
+      }
+    },
+    {
+      "name": "openal-soft",
+      "repository": "https://github.com/kcat/openal-soft.git",
+      "expected": "96c394c",
+      "method": "release-072-fetch-destination",
+      "cached_head": "c86ec9ea5d2c685ba03b037da3309ef2e55f6c62",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "c86ec9ea5d2c685ba03b037da3309ef2e55f6c62",
+      "base": "96c394c825beb5984264530106f1298083713b32",
+      "resolution": {
+        "url": "https://api.github.com/repos/kcat/openal-soft/commits/96c394c",
+        "verified_prefix": "96c394c"
+      }
+    },
+    {
+      "name": "shaderc",
+      "repository": "https://github.com/google/shaderc.git",
+      "expected": "ba3e587",
+      "method": "release-072-fetch-destination",
+      "cached_head": "27d8e0b55b53b97c1f25a90014b403993a114392",
+      "cached_tracking_ref": "refs/remotes/origin/main",
+      "cached_tracking_sha": "27d8e0b55b53b97c1f25a90014b403993a114392",
+      "base": "ba3e587dbc13d423c713e964ac08e094731a034d",
+      "resolution": {
+        "url": "https://api.github.com/repos/google/shaderc/commits/ba3e587",
+        "verified_prefix": "ba3e587"
+      }
+    },
+    {
+      "name": "libsdl2",
+      "repository": "https://github.com/libsdl-org/SDL.git",
+      "expected": "8acf7cfc",
+      "method": "release-072-fetch-destination",
+      "cached_head": "b90ac95029d801c5abc59472ba8e2200dff31e1e",
+      "cached_tracking_ref": "refs/remotes/origin/SDL2",
+      "cached_tracking_sha": "b90ac95029d801c5abc59472ba8e2200dff31e1e",
+      "base": "8acf7cfc0f88717e5c036f60f0314bfcafe39189",
+      "resolution": {
+        "url": "https://api.github.com/repos/libsdl-org/SDL/commits/8acf7cfc",
+        "verified_prefix": "8acf7cfc"
+      }
+    },
+    {
+      "name": "libzvbi",
+      "repository": "https://github.com/zapping-vbi/zvbi.git",
+      "expected": "d3a5ee9f2b047bf16cd1ee5ccf6ec05ee75409d0",
+      "method": "unchanged-tracking-ref-in-exact-release-072-input-cache",
+      "cached_head": "d3a5ee9f2b047bf16cd1ee5ccf6ec05ee75409d0",
+      "cached_tracking_ref": "refs/remotes/origin/main",
+      "cached_tracking_sha": "d3a5ee9f2b047bf16cd1ee5ccf6ec05ee75409d0",
+      "base": "d3a5ee9f2b047bf16cd1ee5ccf6ec05ee75409d0",
+      "resolution": "Full ID already present in the recipe or recovered immutable input cache"
+    },
+    {
+      "name": "libplacebo",
+      "repository": "https://github.com/haasn/libplacebo.git",
+      "expected": "22ee762e8e0890fc54068beb670310f0edce7263",
+      "method": "explicit-recipe-pin",
+      "cached_head": "65ade81ea89897f4fb53379bd6d6ae8e526461d6",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "3330a515d62139259c26239014f286e233bd3a5c",
+      "base": "22ee762e8e0890fc54068beb670310f0edce7263",
+      "resolution": "Full ID already present in the recipe or recovered immutable input cache"
+    },
+    {
+      "name": "libva",
+      "repository": "https://github.com/intel/libva.git",
+      "expected": "f3fefce",
+      "method": "release-072-fetch-destination",
+      "cached_head": "6b07f7100512817f736967e899b8c26313c20623",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "6b07f7100512817f736967e899b8c26313c20623",
+      "base": "f3fefceb192ca28abf588aadf2392350aebf46ce",
+      "resolution": {
+        "url": "https://api.github.com/repos/intel/libva/commits/f3fefce",
+        "verified_prefix": "f3fefce"
+      }
+    },
+    {
+      "name": "libaribcaption",
+      "repository": "https://github.com/xqq/libaribcaption.git",
+      "expected": "37dde0f",
+      "method": "release-072-fetch-destination",
+      "cached_head": "c64c23b8905ba514b87c9789269e9f66f949ffe0",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "c64c23b8905ba514b87c9789269e9f66f949ffe0",
+      "base": "37dde0f32652c32aa98bf92278944d1cfb2e7354",
+      "resolution": {
+        "url": "https://api.github.com/repos/xqq/libaribcaption/commits/37dde0f",
+        "verified_prefix": "37dde0f"
+      }
+    },
+    {
+      "name": "spirv-cross",
+      "repository": "https://github.com/KhronosGroup/SPIRV-Cross.git",
+      "expected": "aa217ae",
+      "method": "release-072-fetch-destination",
+      "cached_head": "b4d741f0d97f7d2ed5d4b1b6ddd354d066ca6b77",
+      "cached_tracking_ref": "refs/remotes/origin/main",
+      "cached_tracking_sha": "be71ee8c12cd7dc5ca8fa9581f708c2e8561fe2a",
+      "base": "aa217aeb6c9f0ace7a0ab233b28807edf45eb165",
+      "resolution": {
+        "url": "https://api.github.com/repos/KhronosGroup/SPIRV-Cross/commits/aa217ae",
+        "verified_prefix": "aa217ae"
+      }
+    },
+    {
+      "name": "nghttp3",
+      "repository": "https://github.com/ngtcp2/nghttp3.git",
+      "expected": "d29ceea",
+      "method": "release-072-fetch-destination",
+      "cached_head": "5dec87c9dc7b86a420423313adafc499f73680dd",
+      "cached_tracking_ref": "refs/remotes/origin/main",
+      "cached_tracking_sha": "5dec87c9dc7b86a420423313adafc499f73680dd",
+      "base": "d29ceea176cebc1f41c9d818c3b1825143d3f813",
+      "resolution": {
+        "url": "https://api.github.com/repos/ngtcp2/nghttp3/commits/d29ceea",
+        "verified_prefix": "d29ceea"
+      }
+    },
+    {
+      "name": "ngtcp2",
+      "repository": "https://github.com/ngtcp2/ngtcp2.git",
+      "expected": "4822893",
+      "method": "release-072-fetch-destination",
+      "cached_head": "55f5237d6b807a8a40042ea9e42a6b672a7b685d",
+      "cached_tracking_ref": "refs/remotes/origin/main",
+      "cached_tracking_sha": "55f5237d6b807a8a40042ea9e42a6b672a7b685d",
+      "base": "48228939787d4b5bea94c7795b8c7fe0781d918e",
+      "resolution": {
+        "url": "https://api.github.com/repos/ngtcp2/ngtcp2/commits/4822893",
+        "verified_prefix": "4822893"
+      }
+    },
+    {
+      "name": "libpsl",
+      "repository": "https://github.com/rockdaboot/libpsl.git",
+      "expected": "aa3a80e18f25caf3916636c8668dcc0fff7c016d",
+      "method": "explicit-recipe-pin",
+      "cached_head": "aa3a80e18f25caf3916636c8668dcc0fff7c016d",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "0ae0dfc942cc338f229c22009bcf9a52b4e6f018",
+      "base": "aa3a80e18f25caf3916636c8668dcc0fff7c016d",
+      "resolution": "Full ID already present in the recipe or recovered immutable input cache"
+    },
+    {
+      "name": "c-ares",
+      "repository": "https://github.com/c-ares/c-ares.git",
+      "expected": "f4156c1",
+      "method": "release-072-fetch-destination",
+      "cached_head": "5b181482e5b6d1dc04d1e899dd2c3a9f5695ce62",
+      "cached_tracking_ref": "refs/remotes/origin/main",
+      "cached_tracking_sha": "5b181482e5b6d1dc04d1e899dd2c3a9f5695ce62",
+      "base": "f4156c12c8b36f5cb8f8a53658d44b24263c6ad1",
+      "resolution": {
+        "url": "https://api.github.com/repos/c-ares/c-ares/commits/f4156c1",
+        "verified_prefix": "f4156c1"
+      }
+    },
+    {
+      "name": "nghttp2",
+      "repository": "https://github.com/nghttp2/nghttp2.git",
+      "expected": "7e10fcf",
+      "method": "release-072-fetch-destination",
+      "cached_head": "e4a2c989b39a9285791a8c0bbb9eb90fcb328659",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "e4a2c989b39a9285791a8c0bbb9eb90fcb328659",
+      "base": "7e10fcf3c58e692902939bab8f898bdd9ec9cff7",
+      "resolution": {
+        "url": "https://api.github.com/repos/nghttp2/nghttp2/commits/7e10fcf",
+        "verified_prefix": "7e10fcf"
+      }
+    },
+    {
+      "name": "mpv",
+      "repository": "https://github.com/mpv-player/mpv.git",
+      "expected": "654e9382c0bbccb09ccac348f792e9d378e9c7a9",
+      "method": "explicit-recipe-pin",
+      "cached_head": "3aa95251263a85a610e02022299434e341c0c86e",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "7e4cb538a3f30d25920ad8e87ba6571540fb729f",
+      "base": "654e9382c0bbccb09ccac348f792e9d378e9c7a9",
+      "resolution": "Full ID already present in the recipe or recovered immutable input cache"
+    },
+    {
+      "name": "mpv-packaging",
+      "repository": "https://github.com/shinchiro/mpv-packaging.git",
+      "expected": "1c534ce8c21fab0be2a394ad73decc15e015693e",
+      "method": "unchanged-tracking-ref-in-exact-release-072-input-cache",
+      "cached_head": "1c534ce8c21fab0be2a394ad73decc15e015693e",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "1c534ce8c21fab0be2a394ad73decc15e015693e",
+      "base": "1c534ce8c21fab0be2a394ad73decc15e015693e",
+      "resolution": "Full ID already present in the recipe or recovered immutable input cache"
+    },
+    {
+      "name": "curl",
+      "repository": "https://github.com/curl/curl.git",
+      "expected": "d4dc7d16c40a0d9e70f7858e645c7ab3997a38b0",
+      "method": "explicit-recipe-pin",
+      "cached_head": "c0c4971fceb41f312065b96be623d24dcc399892",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "c0c4971fceb41f312065b96be623d24dcc399892",
+      "base": "d4dc7d16c40a0d9e70f7858e645c7ab3997a38b0",
+      "resolution": "Full ID already present in the recipe or recovered immutable input cache"
+    },
+    {
+      "name": "ffmpeg",
+      "repository": "https://github.com/FFmpeg/FFmpeg.git",
+      "expected": "a234fc1130e6b17d550371dede849918202a303a",
+      "method": "explicit-recipe-pin",
+      "cached_head": "a234fc1130e6b17d550371dede849918202a303a",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "cc7a69a36a67acb661ceb2339a41488fb7409b57",
+      "base": "a234fc1130e6b17d550371dede849918202a303a",
+      "resolution": "Full ID already present in the recipe or recovered immutable input cache"
+    },
+    {
+      "name": "svtav1",
+      "repository": "https://gitlab.com/AOMediaCodec/SVT-AV1.git",
+      "expected": "3515359",
+      "method": "release-072-fetch-destination",
+      "cached_head": "c6cb4d0c2659062367b2c9592794e82d041d8e37",
+      "cached_tracking_ref": "refs/remotes/origin/master",
+      "cached_tracking_sha": "c6cb4d0c2659062367b2c9592794e82d041d8e37",
+      "base": "35153590e2e7a8be991f23c5f2d6e40abc26b75b",
+      "resolution": {
+        "url": "https://gitlab.com/api/v4/projects/AOMediaCodec%2FSVT-AV1/repository/commits/3515359",
+        "verified_prefix": "3515359"
+      }
+    }
+  ],
+  "complete": true
+}

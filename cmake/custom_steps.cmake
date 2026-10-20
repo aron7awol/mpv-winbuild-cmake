@@ -1,3 +1,13 @@
+include(${CMAKE_CURRENT_LIST_DIR}/dependency-baseline.cmake)
+
+function(require_dependency_baseline)
+    foreach(_name IN LISTS ARGN)
+        if(NOT DEFINED MPV_HT_DEPENDENCY_BASE_${_name})
+            message(FATAL_ERROR "Missing reviewed dependency baseline for ${_name}")
+        endif()
+    endforeach()
+endfunction()
+
 function(cleanup _name _last_step)
     get_property(_build_in_source TARGET ${_name} PROPERTY _EP_BUILD_IN_SOURCE)
     get_property(_git_repository TARGET ${_name} PROPERTY _EP_GIT_REPOSITORY)
@@ -83,7 +93,17 @@ function(force_rebuild_git _name)
     get_property(stamp_dir TARGET ${_name} PROPERTY _EP_STAMP_DIR)
     get_property(source_dir TARGET ${_name} PROPERTY _EP_SOURCE_DIR)
 
-    if("${git_remote_name}" STREQUAL "" AND NOT "${git_tag}" STREQUAL "")
+    set(baseline "${MPV_HT_DEPENDENCY_BASE_${_name}}")
+    if(NOT "${baseline}" STREQUAL "")
+        # A full source ID is authoritative even when the cached tracking
+        # branch moved. Do not refresh a floating branch for locked inputs.
+        string(LENGTH "${baseline}" baseline_length)
+        if(NOT baseline_length EQUAL 40 OR NOT baseline MATCHES "^[0-9a-f]+$")
+            message(FATAL_ERROR "Invalid dependency baseline for ${_name}")
+        endif()
+        set(reset "${baseline}")
+        set(fetch_command "git cat-file -e '${baseline}^{commit}' || git fetch --filter=tree:0 --no-recurse-submodules origin '${baseline}'")
+    elseif("${git_remote_name}" STREQUAL "" AND NOT "${git_tag}" STREQUAL "")
         # GIT_REMOTE_NAME is not set when commit hash is specified
         set(reset "")
     elseif(NOT "${git_reset}" STREQUAL "")
@@ -92,6 +112,11 @@ function(force_rebuild_git _name)
         set(reset "@{u}") # eg: origin/master
     endif()
 
+    if(NOT "${baseline}" STREQUAL "")
+        configure_file(${CMAKE_CURRENT_FUNCTION_LIST_DIR}/reset_locked_head.sh.in
+                       ${stamp_dir}/reset_head.sh @ONLY)
+    else()
+        set(fetch_command "git fetch --filter=tree:0 --no-recurse-submodules || true")
 file(WRITE ${stamp_dir}/reset_head.sh
 "#!/bin/bash
 set -e
@@ -105,6 +130,7 @@ if [[ ! -f \"${stamp_dir}/${_name}-patch\"  || \"${stamp_dir}/${_name}-download\
 else
     git -C ${source_dir} reset --hard -q
 fi")
+    endif()
 file(CHMOD ${stamp_dir}/reset_head.sh 
 PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
 
@@ -114,7 +140,7 @@ PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_
         INDEPENDENT TRUE
         WORKING_DIRECTORY <SOURCE_DIR>
         COMMAND bash -c "git am --abort 2> /dev/null || true"
-        COMMAND bash -c "git fetch --filter=tree:0 --no-recurse-submodules || true"
+        COMMAND bash -c "${fetch_command}"
         COMMAND ${stamp_dir}/reset_head.sh
     )
     ExternalProject_Add_StepTargets(${_name} force-update)
@@ -123,7 +149,7 @@ PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_
         DEPENDERS patch
         INDEPENDENT TRUE
         WORKING_DIRECTORY <SOURCE_DIR>
-        COMMAND bash -c "git rev-parse HEAD > ${stamp_dir}/HEAD"
+        COMMAND bash -c "git rev-parse HEAD > '${stamp_dir}/HEAD' && echo 'Dependency source ${_name}:' $(cat '${stamp_dir}/HEAD')"
         LOG 1
     )
 

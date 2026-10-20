@@ -1,0 +1,28 @@
+#!/bin/bash
+# Generated for one CMake-owned source and stamp directory.
+set -euo pipefail
+source_dir='@source_dir@'
+stamp_dir='@stamp_dir@'
+package='@_name@'
+expected='@baseline@'
+actual=$(git -C "$source_dir" rev-parse --verify "${expected}^{commit}")
+[[ "$actual" == "$expected" ]] || exit 1
+
+recorded=''
+[[ ! -f "$stamp_dir/HEAD" ]] || recorded=$(cat "$stamp_dir/HEAD")
+if [[ ! -f "$stamp_dir/$package-patch" ||
+      "$stamp_dir/$package-download" -nt "$stamp_dir/$package-patch" ||
+      "$recorded" != "$expected" ]] ||
+   ! git -C "$source_dir" merge-base --is-ancestor "$expected" HEAD; then
+    git -C "$source_dir" reset --hard "$expected" -q
+    # Invalidate only this package's generated zero-byte stamps. Keep the
+    # complete Windows toolchain/sysroot and all other packages intact.
+    find "$stamp_dir" -type f ! -iname '*.cmake' -size 0c -delete
+    printf '%s\n' "$expected" > "$stamp_dir/HEAD"
+    echo "Reset $package to locked base $expected; invalidated package stamps."
+else
+    # An installed package may include our applied patches above the base.
+    # Preserve those commits when neither its base nor patch stamps changed.
+    git -C "$source_dir" reset --hard -q
+    echo "Retained $package at locked base $expected."
+fi
