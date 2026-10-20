@@ -1,23 +1,23 @@
-From 361ef2f6efd5085cb44591cba686791dee8ae688 Mon Sep 17 00:00:00 2001
+From 4ed17843540da3577264eff98c49bb31062d347a Mon Sep 17 00:00:00 2001
 From: Aaron <aaronmedeiros@gmail.com>
 Date: Tue, 4 Aug 2026 17:20:26 -0400
 Subject: [PATCH] vo_gpu_next: reset peak smoothing at authored scene cuts
 
 ---
- DOCS/man/options.rst         |  8 +++++
- filters/f_enhancement_pair.c |  2 ++
+ DOCS/man/options.rst         |  8 ++++
+ filters/f_enhancement_pair.c |  2 +
  player/command.c             | 11 ++++++
- video/filter/vf_format.c     |  2 ++
- video/mp_image.c             | 18 ++++++++++
- video/mp_image.h             | 14 ++++++++
- video/out/vo_gpu_next.c      | 75 ++++++++++++++++++++++++++++++++++++++++
+ video/filter/vf_format.c     |  2 +
+ video/mp_image.c             | 18 +++++++++
+ video/mp_image.h             | 14 +++++++
+ video/out/vo_gpu_next.c      | 75 ++++++++++++++++++++++++++++++++++++
  7 files changed, 130 insertions(+)
 
 diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
-index 54bff121d..87fba24f2 100644
+index eb2dab737..ee5c922c1 100644
 --- a/DOCS/man/options.rst
 +++ b/DOCS/man/options.rst
-@@ -7840,6 +7840,14 @@ them.
+@@ -7848,6 +7848,14 @@ them.
      advanced scaling is enabled. Defaults to no. (Only affects
      ``--vo=gpu-next``, note that ``--vo=gpu`` always delays the peak.)
  
@@ -33,10 +33,10 @@ index 54bff121d..87fba24f2 100644
      Which percentile of the input image brightness histogram to consider as the
      true peak of the scene. If this is set to 100 (default), the
 diff --git a/filters/f_enhancement_pair.c b/filters/f_enhancement_pair.c
-index 16a4966e6..0aa338022 100644
+index 8ee9b165e..bc247e2d0 100644
 --- a/filters/f_enhancement_pair.c
 +++ b/filters/f_enhancement_pair.c
-@@ -103,6 +103,8 @@ static void inherit_dovi_from_el(struct mp_image *bl, struct mp_image *el)
+@@ -104,6 +104,8 @@ static void inherit_dovi_from_el(struct mp_image *bl, struct mp_image *el)
          return;
      if (el->params.dovi_el_type != MP_DOVI_EL_NONE)
          bl->params.dovi_el_type = el->params.dovi_el_type;
@@ -46,10 +46,10 @@ index 16a4966e6..0aa338022 100644
          return;
      if (bl->dovi)
 diff --git a/player/command.c b/player/command.c
-index ded9f6730..56bd0bf88 100644
+index 4c19d67a2..c7e0f863b 100644
 --- a/player/command.c
 +++ b/player/command.c
-@@ -2579,6 +2579,17 @@ static int property_imgparams(const struct mp_image_params *p, int action, void
+@@ -2583,6 +2583,17 @@ static int property_imgparams(const struct mp_image_params *p, int action, void
                              .unavailable = !peak->valid},
          {"raw-avg-rgb-nits", SUB_PROP_FLOAT(peak->raw_avg_rgb),
                              .unavailable = !peak->valid},
@@ -81,7 +81,7 @@ index e5a049c42..664fae41e 100644
  
          if (priv->opts->min_luma)
 diff --git a/video/mp_image.c b/video/mp_image.c
-index b2c03f4e8..4519d6c3c 100644
+index 3146660c1..fd188f8b0 100644
 --- a/video/mp_image.c
 +++ b/video/mp_image.c
 @@ -561,6 +561,8 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
@@ -120,10 +120,10 @@ index b2c03f4e8..4519d6c3c 100644
      pl_map_hdr_metadata(&dst->params.color.hdr, &(struct pl_av_hdr_metadata) {
          .mdm = (void *)(mdm ? mdm->data : NULL),
          .clm = (void *)(clm ? clm->data : NULL),
-@@ -1204,6 +1219,9 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
+@@ -1215,6 +1230,9 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
+             }
              dst->params.dovi_el_type =
-                 mapping->nlq_method_idc == AV_DOVI_NLQ_NONE ? MP_DOVI_EL_MEL
-                                                             : MP_DOVI_EL_FEL;
+                 mel ? MP_DOVI_EL_MEL : MP_DOVI_EL_FEL;
 +            const AVDOVIColorMetadata *color = av_dovi_get_color(metadata);
 +            if (color->scene_refresh_flag)
 +                dst->params.authored_scene_cut |= MP_SCENE_CUT_DOVI;
@@ -131,7 +131,7 @@ index b2c03f4e8..4519d6c3c 100644
  #if PL_API_VER < 364
          const AVDOVIRpuDataHeader *header = av_dovi_get_header(metadata);
 diff --git a/video/mp_image.h b/video/mp_image.h
-index e499bee66..defe0e61a 100644
+index 7f261113c..82d1c154d 100644
 --- a/video/mp_image.h
 +++ b/video/mp_image.h
 @@ -50,12 +50,21 @@ enum mp_dovi_el_type {
@@ -169,10 +169,10 @@ index e499bee66..defe0e61a 100644
      // Flags for f_enhancement_pair.c to not inherit flags from EL.
      bool no_dovi;
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index 700280ac2..bdcb454bd 100644
+index bbd921dde..603940eb9 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
-@@ -146,6 +146,11 @@ struct priv {
+@@ -147,6 +147,11 @@ struct priv {
      bool frame_pending;
      bool paused;
  
@@ -184,7 +184,7 @@ index 700280ac2..bdcb454bd 100644
      pl_options pars;
      struct m_config_cache *opts_cache;
      struct m_config_cache *next_opts_cache;
-@@ -180,6 +184,7 @@ static void update_lut(struct priv *p, struct user_lut *lut);
+@@ -181,6 +186,7 @@ static void update_lut(struct priv *p, struct user_lut *lut);
  
  struct gl_next_opts {
      bool delayed_peak;
@@ -192,7 +192,7 @@ index 700280ac2..bdcb454bd 100644
      int sub_hdr_peak;
      int image_subs_hdr_peak;
      int border_background;
-@@ -212,6 +217,7 @@ const struct m_sub_options gl_next_conf = {
+@@ -213,6 +219,7 @@ const struct m_sub_options gl_next_conf = {
          {"image-subs-hdr-peak", OPT_CHOICE(image_subs_hdr_peak, {"sdr", PL_COLOR_SDR_WHITE},
              {"video", -1}, {"video-static", -2}, {"video-dynamic", -3}),  M_RANGE(10, 10000)},
          {"allow-delayed-peak-detect", OPT_BOOL(delayed_peak)},
@@ -200,7 +200,7 @@ index 700280ac2..bdcb454bd 100644
          {"border-background", OPT_CHOICE(border_background,
              {"none",  BACKGROUND_NONE},
              {"color", BACKGROUND_COLOR},
-@@ -241,6 +247,7 @@ const struct m_sub_options gl_next_conf = {
+@@ -242,6 +249,7 @@ const struct m_sub_options gl_next_conf = {
          .image_subs_hdr_peak = 1000,
          .target_hint = -1,
          .target_hint_strict = true,
@@ -208,7 +208,7 @@ index 700280ac2..bdcb454bd 100644
      },
      .size = sizeof(struct gl_next_opts),
      .change_flags = UPDATE_VIDEO,
-@@ -484,8 +491,60 @@ struct frame_priv {
+@@ -564,8 +572,60 @@ struct frame_priv {
      struct ra_hwdec *el_hwdec;
      pl_tex el_tex[4];
      struct pl_frame el_frame;
@@ -269,7 +269,7 @@ index 700280ac2..bdcb454bd 100644
  static int plane_data_from_imgfmt(struct pl_plane_data out_data[4],
                                    struct pl_bit_encoding *out_bits,
                                    enum mp_imgfmt imgfmt, bool use_uint)
-@@ -895,6 +955,17 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
+@@ -975,6 +1035,17 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
          .rotation = par.rotate / 90,
          .user_data = mpi,
      };
@@ -287,7 +287,7 @@ index 700280ac2..bdcb454bd 100644
  
      const struct gl_video_opts *opts = p->opts_cache->opts;
      float ref_luma;
-@@ -1287,6 +1358,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1367,6 +1438,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
              pl_queue_reset(p->queue);
              p->last_pts = 0.0;
              p->last_id = 0;
@@ -295,7 +295,7 @@ index 700280ac2..bdcb454bd 100644
              p->want_reset = false;
              p->flush_cache = true;
          }
-@@ -1701,6 +1773,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1781,6 +1853,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
              vo->params->peak_detect = (struct mp_peak_detect_metrics) {
                  .valid               = true,
                  .tone_metric_valid   = metrics.metric != PL_TONE_MAP_METRIC_STANDARD,
