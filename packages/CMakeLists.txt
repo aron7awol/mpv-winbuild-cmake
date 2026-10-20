@@ -121,14 +121,6 @@ message(STATUS "Parsing ${ep_length} packages")
 list(APPEND removed "flac" "opusfile" "libopusenc" "opus-tools" "termcap" "readline" "cryptopp" "sqlite" "libuv" "libsodium" "megasdk" "libsixel" "curl" "libressl" "mbedtls" "nettle" "gmp")
 list(REMOVE_ITEM repo ${removed})
 list(REMOVE_ITEM ep ${removed})
-require_dependency_baseline(${repo})
-file(WRITE ${CMAKE_BINARY_DIR}/dependency-inputs.tsv "")
-foreach(package IN LISTS repo)
-    get_property(source_dir TARGET ${package} PROPERTY _EP_SOURCE_DIR)
-    get_property(stamp_dir TARGET ${package} PROPERTY _EP_STAMP_DIR)
-    file(APPEND ${CMAKE_BINARY_DIR}/dependency-inputs.tsv
-        "${package}\t${MPV_HT_DEPENDENCY_BASE_${package}}\t${source_dir}\t${stamp_dir}\n")
-endforeach()
 list(TRANSFORM repo APPEND "-force-update" OUTPUT_VARIABLE update)
 list(TRANSFORM ep APPEND "-download" OUTPUT_VARIABLE download)
 list(TRANSFORM ep APPEND "-fullclean" OUTPUT_VARIABLE fullclean)
@@ -153,3 +145,14 @@ add_custom_target(cargo-clean
     COMMAND du -sh ${RUSTUP_LOCATION}
     USES_TERMINAL
 )
+
+# Keep the wrapper's package-selection patch context intact. The filtered
+# source list is unchanged by the OUTPUT_VARIABLE transforms above.
+require_dependency_baseline(${repo})
+file(WRITE ${CMAKE_BINARY_DIR}/dependency-inputs.tsv "")
+foreach(package IN LISTS repo)
+    get_property(source_dir TARGET ${package} PROPERTY _EP_SOURCE_DIR)
+    get_property(stamp_dir TARGET ${package} PROPERTY _EP_STAMP_DIR)
+    file(APPEND ${CMAKE_BINARY_DIR}/dependency-inputs.tsv
+        "${package}\t${MPV_HT_DEPENDENCY_BASE_${package}}\t${source_dir}\t${stamp_dir}\n")
+endforeach()
