@@ -1,0 +1,419 @@
+From 2f5d49e5a976e2a551008d49fa242451ac925913 Mon Sep 17 00:00:00 2001
+From: Codex <noreply@openai.com>
+Date: Wed, 21 Oct 2026 11:18:32 -0400
+Subject: [PATCH] video: preserve independent source HDR diagnostic records
+
+Expose original HDR10 BL, DV L6/L1 and HDR10+ records, plus the actual peak detector, without changing renderer metadata or equality. Preserve through copies, AVFrame round trips and dual-track pairing. Let the mpv-ht adapter supply compact shared source rows to native Stats. Add a native copy/round-trip/equality test.
+---
+ DOCS/man/input.rst           | 43 ++++++++++++++++++
+ filters/f_enhancement_pair.c |  6 +++
+ player/command.c             | 27 ++++++++++++
+ player/lua/stats.lua         | 14 ++++++
+ test/meson.build             |  5 +++
+ test/source_hdr.c            | 85 ++++++++++++++++++++++++++++++++++++
+ video/mp_image.c             | 54 +++++++++++++++++++++++
+ video/mp_image.h             | 16 +++++++
+ video/out/vo_gpu_next.c      |  1 +
+ 9 files changed, 251 insertions(+)
+ create mode 100644 test/source_hdr.c
+
+diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
+index bf8377c1e..272168c4d 100644
+--- a/DOCS/man/input.rst
++++ b/DOCS/man/input.rst
+@@ -2980,6 +2980,49 @@ Property list
+         This uses the configured ``--hdr-peak-percentile`` and peak-detection
+         black cutoff, but is reported before temporal smoothing.
+ 
++    ``video-params/source-hdr-metadata-version``
++        Version of the independent original source records below (currently 1).
++        Diagnostic only; these values do not affect rendering. The existing
++        ``min-luma``, ``max-luma`` and dynamic fields remain renderer metadata
++        and may combine multiple authorities. Prefer ``video-out-params`` for
++        the paired BL/EL frame in dual-track Dolby Vision.
++
++    ``video-params/source-hdr10-mdl-present``, ``video-params/source-hdr10-cll-present``
++        Whether the original base-layer mastering display and content light
++        records were present. Values are in ``source-hdr10-min``,
++        ``source-hdr10-max``, ``source-hdr10-max-cll`` and
++        ``source-hdr10-max-fall``, in cd/m². Missing records make their numeric
++        fields unavailable. Zero CLL/FALL means unspecified, not a zero peak.
++
++    ``video-params/source-dovi-present``
++        Dolby Vision metadata was supplied by the decoder. Parsed Level 6 and
++        Level 1 records have separate ``source-dovi-l6-present`` and
++        ``source-dovi-l1-present`` flags; raw RPU presence alone does not
++        imply these parsed values are available.
++
++    ``video-params/source-dovi-l6-min``, ``video-params/source-dovi-l6-max``
++        Original Level 6 mastering display minimum/maximum in cd/m². The
++        minimum is converted from units of 0.0001 cd/m². These are NOT the
++        RPU source_min_pq/source_max_pq fields. Level 6 light levels are
++        ``source-dovi-l6-max-cll`` and ``source-dovi-l6-max-fall`` in cd/m².
++
++    ``video-params/source-dovi-l1-min-pq``, ``video-params/source-dovi-l1-max-pq``, ``video-params/source-dovi-l1-avg-pq``
++        Original authored Level 1 codes divided by 4095 (normalized PQ, 0–1),
++        before peak detection can replace renderer values. Zero is valid.
++
++    ``video-params/source-hdr10plus-present``
++        Whether an original HDR10+ record was supplied. Its MaxSCL components
++        are ``source-hdr10plus-max-r``, ``source-hdr10plus-max-g`` and
++        ``source-hdr10plus-max-b``; average maxRGB is
++        ``source-hdr10plus-avg``. All are in cd/m², not CIE Y Level 1 values.
++        These and the DV records remain separate if both formats are present.
++
++    ``video-params/measured-metric``
++        Detector accompanying the returned peak measurements: ``standard``
++        (CIE Y), ``bt2020-rgb`` (P), or ``maxrgb-rgb`` (maxRGB). Available only
++        with a valid detector result. This is not a requested option or an
++        output-pixel measurement. The detector does not report a minimum.
++
+     ``video-params/raw-avg-pq-y``
+         Unsmoothed average CIE Y of the current measured frame (in PQ, 0-1).
+ 
+diff --git a/filters/f_enhancement_pair.c b/filters/f_enhancement_pair.c
+index bc247e2d0..785e72918 100644
+--- a/filters/f_enhancement_pair.c
++++ b/filters/f_enhancement_pair.c
+@@ -100,6 +100,12 @@ static struct mp_image *take_head(struct mp_image ***queue, int *num)
+ // mirror them onto the BL here. This keeps DV bookkeeping local.
+ static void inherit_dovi_from_el(struct mp_image *bl, struct mp_image *el)
+ {
++    // Diagnostic originals survive stripping; they never re-enable DV.
++    // Retain HDR10/HDR10+ from the BL; only the RPU belongs to the EL.
++    if (el->params.source_hdr.dovi) {
++        bl->params.source_hdr.dovi = true;
++        bl->params.source_hdr.dv = el->params.source_hdr.dv;
++    }
+     if (bl->params.no_dovi)
+         return;
+     if (el->params.dovi_el_type != MP_DOVI_EL_NONE)
+diff --git a/player/command.c b/player/command.c
+index 759d763da..55325cd41 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -2564,7 +2564,30 @@ static int property_imgparams(const struct mp_image_params *p, int action, void
+         PL_TONE_MAP_METRIC_MAXRGB_RGB ? "maxrgb" : "unknown";
+     const char *pixelformat_name = p->imgfmt_name ? p->imgfmt_name :
+                                                    mp_imgfmt_to_name(p->imgfmt);
++    const struct mp_source_hdr_metadata *sh = &p->source_hdr;
+     struct m_sub_property props[] = {
++        {"source-hdr-metadata-version", SUB_PROP_INT(1), .unavailable = !sh->valid},
++        {"source-hdr10-mdl-present", SUB_PROP_BOOL(sh->bl_mdl)},
++        {"source-hdr10-cll-present", SUB_PROP_BOOL(sh->bl_cll)},
++        {"source-hdr10-min", SUB_PROP_DOUBLE(sh->bl_min), .unavailable = !sh->bl_mdl},
++        {"source-hdr10-max", SUB_PROP_DOUBLE(sh->bl_max), .unavailable = !sh->bl_mdl},
++        {"source-hdr10-max-cll", SUB_PROP_INT(sh->bl_max_cll), .unavailable = !sh->bl_cll},
++        {"source-hdr10-max-fall", SUB_PROP_INT(sh->bl_max_fall), .unavailable = !sh->bl_cll},
++        {"source-dovi-present", SUB_PROP_BOOL(sh->dovi)},
++        {"source-dovi-l6-present", SUB_PROP_BOOL(sh->dv.l6)},
++        {"source-dovi-l6-min", SUB_PROP_DOUBLE(sh->dv.min_mdl / 10000.0), .unavailable = !sh->dv.l6},
++        {"source-dovi-l6-max", SUB_PROP_INT(sh->dv.max_mdl), .unavailable = !sh->dv.l6},
++        {"source-dovi-l6-max-cll", SUB_PROP_INT(sh->dv.max_cll), .unavailable = !sh->dv.l6},
++        {"source-dovi-l6-max-fall", SUB_PROP_INT(sh->dv.max_fall), .unavailable = !sh->dv.l6},
++        {"source-dovi-l1-present", SUB_PROP_BOOL(sh->dv.l1)},
++        {"source-dovi-l1-min-pq", SUB_PROP_DOUBLE(sh->dv.min_pq / 4095.0), .unavailable = !sh->dv.l1},
++        {"source-dovi-l1-max-pq", SUB_PROP_DOUBLE(sh->dv.max_pq / 4095.0), .unavailable = !sh->dv.l1},
++        {"source-dovi-l1-avg-pq", SUB_PROP_DOUBLE(sh->dv.avg_pq / 4095.0), .unavailable = !sh->dv.l1},
++        {"source-hdr10plus-present", SUB_PROP_BOOL(sh->hdr10plus)},
++        {"source-hdr10plus-max-r", SUB_PROP_FLOAT(sh->max_scl[0]), .unavailable = !sh->hdr10plus},
++        {"source-hdr10plus-max-g", SUB_PROP_FLOAT(sh->max_scl[1]), .unavailable = !sh->hdr10plus},
++        {"source-hdr10plus-max-b", SUB_PROP_FLOAT(sh->max_scl[2]), .unavailable = !sh->hdr10plus},
++        {"source-hdr10plus-avg", SUB_PROP_FLOAT(sh->avg_maxrgb), .unavailable = !sh->hdr10plus},
+         {"pixelformat",     SUB_PROP_STR(pixelformat_name)},
+         {"hw-pixelformat",  SUB_PROP_STR(mp_imgfmt_to_name(p->hw_subfmt)),
+                             .unavailable = !p->hw_subfmt},
+@@ -2615,6 +2638,10 @@ static int property_imgparams(const struct mp_image_params *p, int action, void
+         {"avg-pq-y",    SUB_PROP_FLOAT(hdr->avg_pq_y),     .unavailable = !has_cie_y},
+         {"raw-max-pq-y", SUB_PROP_FLOAT(peak->raw_max_pq_y),
+                             .unavailable = !peak->valid},
++        {"measured-metric", SUB_PROP_STR(
++            peak->measured_metric == PL_TONE_MAP_METRIC_BT2020_RGB ? "bt2020-rgb" :
++            peak->measured_metric == PL_TONE_MAP_METRIC_MAXRGB_RGB ? "maxrgb-rgb" :
++            "standard"), .unavailable = !peak->valid},
+         {"raw-avg-pq-y", SUB_PROP_FLOAT(peak->raw_avg_pq_y),
+                             .unavailable = !peak->valid},
+         {"smoothed-max-pq-y", SUB_PROP_FLOAT(peak->smoothed_max_pq_y),
+diff --git a/player/lua/stats.lua b/player/lua/stats.lua
+index 6796515f7..e250b4fec 100644
+--- a/player/lua/stats.lua
++++ b/player/lua/stats.lua
+@@ -812,6 +812,20 @@ local function append_hdr(s, hdr, video_out)
+         return
+     end
+ 
++    -- The mpv-ht adapter supplies the same compact, source-separated formatter
++    -- as Tab and the Web remote. Plain mpv / --no-config retains upstream Stats.
++    if not video_out and type(mp._ht_hdr_info) == "function" then
++        local mono = o.font_mono == "monospace" and "Consolas" or o.font_mono
++        for _, row in ipairs(mp._ht_hdr_info().rows) do
++            append(s, row.line, {
++                prefix=o.use_ass and format("{\\fn%s}", mono) or "",
++                no_prefix_markup=true, prefix_sep="",
++                suffix=o.use_ass and format("{\\fn%s}", o.font) or "",
++            })
++        end
++        return
++    end
++
+     local function has(val, target)
+         return val and math.abs(val - target) > 1e-4
+     end
+diff --git a/test/meson.build b/test/meson.build
+index 06da4adc8..633ea1eef 100644
+--- a/test/meson.build
++++ b/test/meson.build
+@@ -73,6 +73,11 @@ img_utils = static_library('img-utils', 'img_utils.c', include_directories: incd
+                            dependencies: [libavcodec, libplacebo], objects: img_utils_objects)
+ 
+ # The actual tests.
++source_hdr = executable('source-hdr', 'source_hdr.c', include_directories: incdir,
++                        dependencies: [libavutil, libplacebo],
++                        link_with: [img_utils, test_utils])
++test('source-hdr', source_hdr)
++
+ chmap_files = [
+     'audio/chmap_avchannel.c',
+     'audio/chmap_sel.c',
+diff --git a/test/source_hdr.c b/test/source_hdr.c
+new file mode 100644
+index 000000000..529852afd
+--- /dev/null
++++ b/test/source_hdr.c
+@@ -0,0 +1,85 @@
++#include <libavutil/frame.h>
++#include <libavutil/mastering_display_metadata.h>
++
++#include "test_utils.h"
++#include "video/mp_image.h"
++
++// Original metadata is diagnostic only and must survive mpv-owned AVFrame
++// conversions without entering renderer equality or overwriting peak results.
++int main(void)
++{
++    AVFrame *frame = av_frame_alloc();
++    frame->format = AV_PIX_FMT_YUV420P;
++    frame->width = frame->height = 16;
++    frame->color_trc = AVCOL_TRC_SMPTE2084;
++    frame->color_primaries = AVCOL_PRI_BT2020;
++    frame->colorspace = AVCOL_SPC_BT2020_NCL;
++    assert_true(av_frame_get_buffer(frame, 32) >= 0);
++    AVMasteringDisplayMetadata *mdl = av_mastering_display_metadata_create_side_data(frame);
++    mdl->has_luminance = 1;
++    mdl->min_luminance = (AVRational){5, 1000};
++    mdl->max_luminance = (AVRational){1000, 1};
++    AVContentLightMetadata *cll = av_content_light_metadata_create_side_data(frame);
++    cll->MaxCLL = 1000;
++    cll->MaxFALL = 497;
++    struct mp_image *image = mp_image_from_av_frame(frame);
++    assert_true(image);
++    struct mp_source_hdr_metadata *sh = &image->params.source_hdr;
++    assert_true(sh->valid && sh->bl_mdl && sh->bl_cll);
++    assert_false(sh->dovi || sh->dv.l1 || sh->dv.l6 || sh->hdr10plus);
++    assert_float_equal(sh->bl_min, 0.005, 1e-10);
++    assert_int_equal(sh->bl_max, 1000);
++    assert_int_equal(sh->bl_max_cll, 1000);
++    assert_int_equal(sh->bl_max_fall, 497);
++
++    // Simulate the already-merged renderer record. Never read this back as BL.
++    image->params.color.hdr.max_luma = 4000;
++    sh->dovi = sh->dv.l6 = sh->dv.l1 = true;
++    sh->dv.max_mdl = 4000;
++    sh->dv.min_mdl = 50;
++    sh->dv.max_cll = 1600;
++    sh->dv.max_fall = 600;
++    sh->dv.min_pq = 0;
++    sh->dv.max_pq = 2000;
++    sh->dv.avg_pq = 600;
++    AVFrame *roundtrip = mp_image_to_av_frame(image);
++    assert_true(roundtrip);
++    struct mp_image *restored = mp_image_from_av_frame(roundtrip);
++    assert_true(restored);
++    assert_memcmp(&restored->params.source_hdr, sh, sizeof(*sh));
++    struct mp_image *copy = mp_image_alloc(image->imgfmt, image->w, image->h);
++    mp_image_copy_attributes(copy, image);
++    assert_memcmp(&copy->params.source_hdr, sh, sizeof(*sh));
++
++    struct mp_image_params before = image->params;
++    struct mp_image_params after = before;
++    after.source_hdr = (struct mp_source_hdr_metadata){.valid = true};
++    assert_true(mp_image_params_equal(&before, &after));
++    assert_true(mp_image_params_static_equal(&before, &after));
++    after.color.hdr.max_pq_y = 0.4;
++    after.color.hdr.avg_pq_y = 0.2;
++    mp_image_params_update_dynamic(&after, &before, true);
++    assert_memcmp(&after.source_hdr, sh, sizeof(*sh));
++    assert_float_equal(after.color.hdr.max_pq_y, 0.4, 1e-6);
++    assert_float_equal(after.color.hdr.avg_pq_y, 0.2, 1e-6);
++
++    // Zero-valued authored CLL is present but unspecified, not a missing record.
++    cll->MaxCLL = 0;
++    struct mp_image *zero = mp_image_from_av_frame(frame);
++    assert_true(zero->params.source_hdr.bl_cll);
++    assert_int_equal(zero->params.source_hdr.bl_max_cll, 0);
++    av_frame_remove_side_data(frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
++    av_frame_remove_side_data(frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
++    struct mp_image *missing = mp_image_from_av_frame(frame);
++    assert_true(missing->params.source_hdr.valid);
++    assert_false(missing->params.source_hdr.bl_mdl || missing->params.source_hdr.bl_cll);
++
++    talloc_free(missing);
++    talloc_free(zero);
++    talloc_free(copy);
++    talloc_free(restored);
++    talloc_free(image);
++    av_frame_free(&roundtrip);
++    av_frame_free(&frame);
++    return 0;
++}
+diff --git a/video/mp_image.c b/video/mp_image.c
+index fd188f8b0..072f53fe8 100644
+--- a/video/mp_image.c
++++ b/video/mp_image.c
+@@ -563,6 +563,7 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
+     dst->params.sys_orig = src->params.sys_orig;
+     dst->params.authored_scene_cut = src->params.authored_scene_cut;
+     dst->params.hdr10plus_signature = src->params.hdr10plus_signature;
++    dst->params.source_hdr = src->params.source_hdr;
+     dst->params.no_dovi = src->params.no_dovi;
+     dst->params.no_enhancement_layer = src->params.no_enhancement_layer;
+ 
+@@ -908,6 +909,7 @@ void mp_image_params_update_dynamic(struct mp_image_params *dst,
+     dst->dovi_el_type = src->dovi_el_type;
+     dst->authored_scene_cut = src->authored_scene_cut;
+     dst->hdr10plus_signature = src->hdr10plus_signature;
++    dst->source_hdr = src->source_hdr;
+     // Don't overwrite peak-detected HDR metadata if available.
+     float max_pq_y = dst->color.hdr.max_pq_y;
+     float avg_pq_y = dst->color.hdr.avg_pq_y;
+@@ -1192,6 +1194,31 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
+         .dhp = (void *)(dhp ? dhp->data : NULL),
+     });
+ 
++    // Keep the original side-data records, not the merged rendering metadata.
++    // In particular, DV source_min/max_pq are NOT Level 6 mastering metadata.
++    struct mp_source_hdr_metadata *sh = &dst->params.source_hdr;
++    sh->valid = true;
++    if (mdm) {
++        const AVMasteringDisplayMetadata *m = (const void *)mdm->data;
++        if (m->has_luminance) {
++            sh->bl_mdl = true;
++            sh->bl_min = av_q2d(m->min_luminance);
++            sh->bl_max = av_q2d(m->max_luminance);
++        }
++    }
++    if (clm) {
++        const AVContentLightMetadata *m = (const void *)clm->data;
++        sh->bl_cll = true;
++        sh->bl_max_cll = m->MaxCLL;
++        sh->bl_max_fall = m->MaxFALL;
++    }
++    if (dhp) {
++        sh->hdr10plus = true;
++        for (int i = 0; i < 3; i++)
++            sh->max_scl[i] = dst->params.color.hdr.scene_max[i];
++        sh->avg_maxrgb = dst->params.color.hdr.scene_avg;
++    }
++
+     sd = av_frame_get_side_data(src, AV_FRAME_DATA_A53_CC);
+     if (sd)
+         dst->a53_cc = sd->buf;
+@@ -1204,6 +1231,22 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
+     if (sd) {
+ #ifdef PL_HAVE_LAV_DOLBY_VISION
+         const AVDOVIMetadata *metadata = (const AVDOVIMetadata *)sd->buf->data;
++        sh->dovi = true;
++        for (int i = 0; i < metadata->num_ext_blocks; i++) {
++            const AVDOVIDmData *ext = av_dovi_get_ext(metadata, i);
++            if (ext->level == 1) {
++                sh->dv.l1 = true;
++                sh->dv.min_pq = ext->l1.min_pq;
++                sh->dv.max_pq = ext->l1.max_pq;
++                sh->dv.avg_pq = ext->l1.avg_pq;
++            } else if (ext->level == 6) {
++                sh->dv.l6 = true;
++                sh->dv.min_mdl = ext->l6.min_luminance;
++                sh->dv.max_mdl = ext->l6.max_luminance;
++                sh->dv.max_cll = ext->l6.max_cll;
++                sh->dv.max_fall = ext->l6.max_fall;
++            }
++        }
+         // MEL can carry LINEAR_DZ NLQ with trivial coefficients: zero
+         // offsets, slopes and thresholds, and normalized vdr_in_max = 1
+         // in all three components. NLQ presence alone does not imply FEL.
+@@ -1251,6 +1294,9 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
+ 
+     sd = av_frame_get_side_data(src, AV_FRAME_DATA_DOVI_RPU_BUFFER);
+     if (sd) {
++        // A raw-only decoder cannot expose parsed L6/L1 here. Report presence
++        // without inventing values or borrowing the merged HDR record.
++        sh->dovi = true;
+         pl_hdr_metadata_from_dovi_rpu(&dst->params.color.hdr, sd->buf->data,
+                                       sd->buf->size);
+     }
+@@ -1259,6 +1305,14 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
+     if (sd)
+         dst->film_grain = sd->buf;
+ 
++    // mp_image_to_av_frame may have serialized already mapped/overridden
++    // metadata. Across an mpv-owned AVFrame round trip retain the originals.
++    if (src->opaque_ref) {
++        const struct mp_image_params *p = (const void *)src->opaque_ref->data;
++        if (p->source_hdr.valid)
++            *sh = p->source_hdr;
++    }
++
+     for (int n = 0; n < src->nb_side_data; n++) {
+         sd = src->side_data[n];
+         struct mp_ff_side_data mpsd = {
+diff --git a/video/mp_image.h b/video/mp_image.h
+index 583e32a49..6a81593b9 100644
+--- a/video/mp_image.h
++++ b/video/mp_image.h
+@@ -56,11 +56,26 @@ enum mp_authored_scene_cut {
+     MP_SCENE_CUT_HDR10PLUS = 1 << 1,
+ };
+ 
++// Original authored metadata, captured before libplacebo combines authorities.
++// Diagnostics only: never used for rendering or parameter equality/reconfigure.
++struct mp_source_hdr_metadata {
++    bool valid, bl_mdl, bl_cll, hdr10plus, dovi;
++    double bl_min, bl_max;
++    unsigned bl_max_cll, bl_max_fall;
++    float max_scl[3], avg_maxrgb;
++    struct {
++        bool l1, l6;
++        unsigned min_pq, max_pq, avg_pq;
++        unsigned min_mdl, max_mdl, max_cll, max_fall;
++    } dv;
++};
++
+ // Per-frame peak-detection measurements produced by the video output. These
+ // are dynamic renderer results rather than source metadata, and therefore must
+ // not participate in image-parameter equality or trigger a VO reconfigure.
+ struct mp_peak_detect_metrics {
+     bool valid;
++    int measured_metric;       // actual detector, not the configured request
+     bool tone_metric_valid;
+     bool scene_reset;
+     unsigned scene_reset_source;
+@@ -134,6 +149,7 @@ struct mp_image_params {
+     unsigned authored_scene_cut;
+     // Exact fingerprint of parsed AV_FRAME_DATA_DYNAMIC_HDR_PLUS side data.
+     uint64_t hdr10plus_signature;
++    struct mp_source_hdr_metadata source_hdr;
+     struct mp_peak_detect_metrics peak_detect;
+     // Flags for f_enhancement_pair.c to not inherit flags from EL.
+     bool no_dovi;
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index dba7bb8c3..4d37061b9 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -3442,6 +3442,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+         if (pl_renderer_get_peak_detect_metrics(p->rr, &metrics)) {
+             vo->params->peak_detect = (struct mp_peak_detect_metrics) {
+                 .valid               = true,
++                .measured_metric     = metrics.metric,
+                 .tone_metric_valid   = metrics.metric != PL_TONE_MAP_METRIC_STANDARD,
+                 .scene_reset         = metrics.scene_reset,
+                 .scene_reset_source  = metrics.scene_reset_tag,
