@@ -1,5 +1,6 @@
 ExternalProject_Add(mingw-w64
     GIT_REPOSITORY https://github.com/mingw-w64/mingw-w64.git
+    GIT_TAG ${MPV_HT_DEPENDENCY_BASE_mingw-w64}
     SOURCE_DIR ${SOURCE_LOCATION}
     GIT_CLONE_FLAGS "--filter=tree:0"
     UPDATE_COMMAND ""

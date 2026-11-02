@@ -1,4 +1,5 @@
 include(${CMAKE_CURRENT_LIST_DIR}/dependency-baseline.cmake)
+include(${PROJECT_SOURCE_DIR}/toolchain/baseline.cmake)
 
 function(require_dependency_baseline)
     foreach(_name IN LISTS ARGN)

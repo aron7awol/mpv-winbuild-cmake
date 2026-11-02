@@ -4,6 +4,9 @@ FLAGS="$FLAGS -target @TARGET_CPU@-pc-windows-gnu"
 FLAGS="$FLAGS @driver_mode@ --sysroot @MINGW_INSTALL_PREFIX@"
 FLAGS="$FLAGS -fuse-ld=lld --ld-path=@TARGET_ARCH@-ld"
 FLAGS="$FLAGS -Wno-unused-command-line-argument"
+# Make the previous custom LLVM build's runtime defaults explicit, including
+# when the same LLVM source revision is supplied by the official binary.
+FLAGS="$FLAGS -rtlib=compiler-rt -unwindlib=libunwind -stdlib=libc++"
 
 if [ "@TARGET_CPU@" == "aarch64" ]; then
     ARCH_FLAGS="-mcpu=@GCC_ARCH@ -mtune=@M_TUNE@"
