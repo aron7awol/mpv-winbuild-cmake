@@ -1,6 +1,6 @@
-From 051b1189c1fb1a8dd43f40cd55419017aad96cdf Mon Sep 17 00:00:00 2001
-From: mpv-ht development <development@mpv-ht.local>
-Date: Thu, 27 Aug 2026 17:05:00 -0400
+From 790c7c65e11f37304b653879d1348fc296071b80 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:49:55 -0500
 Subject: [PATCH] gpu-next: invalidate cached frames after option changes
 
 VOCTRL_UPDATE_RENDER_OPTS already requests a redraw, but gpu-next can reuse
@@ -11,15 +11,12 @@ Invalidate the renderer cache whenever render options actually change. The
 existing draw-frame flush path then rebuilds cached frames with the new
 options, covering current and future live controls without option-specific
 invalidation.
----
- video/out/vo_gpu_next.c | 6 +++---
- 1 file changed, 3 insertions(+), 3 deletions(-)
 
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index a57b43185..bf5cb1231 100644
+index db470237b2cbf4dfe67b1bf6271d897ddce15e8a..9915da25ba914893b6e7044a84aa77978be03ad8 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
-@@ -1223,13 +1223,13 @@ static void update_options(struct vo *vo)
+@@ -1227,13 +1227,13 @@ static void update_options(struct vo *vo)
  {
      struct priv *p = vo->priv;
      pl_options pars = p->pars;
@@ -36,6 +33,3 @@ index a57b43185..bf5cb1231 100644
  
      update_lut(p, &p->next_opts->lut);
      pars->params.lut = p->next_opts->lut.lut;
--- 
-2.54.0.windows.1
-

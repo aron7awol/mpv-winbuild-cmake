@@ -1,16 +1,12 @@
-From e08f80328be0afe4d5475ed5a669238d4e87113c Mon Sep 17 00:00:00 2001
-From: Codex <codex@local>
-Date: Mon, 7 Sep 2026 12:48:35 -0400
+From fe6e5d8ca1983152979806358db5ffe1bfea3046 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:53:04 -0500
 Subject: [PATCH] custom shaders: expose saved textures and revisions for
  Analyzer
 
----
- src/include/libplacebo/shaders/custom.h |  3 +++
- src/shaders/custom_mpv.c                | 22 ++++++++++++++++++++++
- 2 files changed, 25 insertions(+)
 
 diff --git a/src/include/libplacebo/shaders/custom.h b/src/include/libplacebo/shaders/custom.h
-index 19e870de..f72ada33 100644
+index 19e870dec23a6891cceccbf5ea782189fdc0eec4..f72ada338cf29aa4682c70bfe6869b0fc3ae7cb9 100644
 --- a/src/include/libplacebo/shaders/custom.h
 +++ b/src/include/libplacebo/shaders/custom.h
 @@ -343,6 +343,9 @@ PL_API const struct pl_hook *
@@ -24,7 +20,7 @@ index 19e870de..f72ada33 100644
  PL_API_END
  
 diff --git a/src/shaders/custom_mpv.c b/src/shaders/custom_mpv.c
-index bdac4fc3..98f5feee 100644
+index bdac4fc326355c70d31770fdc282e34ae27e38dc..98f5feee467d5f7a8a270e34e4e7a04065ea8fed 100644
 --- a/src/shaders/custom_mpv.c
 +++ b/src/shaders/custom_mpv.c
 @@ -923,6 +923,7 @@ struct hook_pass {
@@ -77,6 +73,3 @@ index bdac4fc3..98f5feee 100644
              .name  = hook->save_tex.len ? hook->save_tex : stage,
              .tex   = fbo,
              .persistent = hook->persist,
--- 
-2.54.0.windows.1
-

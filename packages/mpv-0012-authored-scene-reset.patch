@@ -1,20 +1,11 @@
-From 4ed17843540da3577264eff98c49bb31062d347a Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Tue, 4 Aug 2026 17:20:26 -0400
+From 60e9913531996a6c51145c50f80b5aa1331633a0 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:49:46 -0500
 Subject: [PATCH] vo_gpu_next: reset peak smoothing at authored scene cuts
 
----
- DOCS/man/options.rst         |  8 ++++
- filters/f_enhancement_pair.c |  2 +
- player/command.c             | 11 ++++++
- video/filter/vf_format.c     |  2 +
- video/mp_image.c             | 18 +++++++++
- video/mp_image.h             | 14 +++++++
- video/out/vo_gpu_next.c      | 75 ++++++++++++++++++++++++++++++++++++
- 7 files changed, 130 insertions(+)
 
 diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
-index eb2dab737..ee5c922c1 100644
+index eb2dab7374ce66b1d92ca2ff463c4f17e150a1f9..ee5c922c10e03d920ffd4b36ea0715487350ebc5 100644
 --- a/DOCS/man/options.rst
 +++ b/DOCS/man/options.rst
 @@ -7848,6 +7848,14 @@ them.
@@ -33,7 +24,7 @@ index eb2dab737..ee5c922c1 100644
      Which percentile of the input image brightness histogram to consider as the
      true peak of the scene. If this is set to 100 (default), the
 diff --git a/filters/f_enhancement_pair.c b/filters/f_enhancement_pair.c
-index 8ee9b165e..bc247e2d0 100644
+index 8ee9b165e1fdd605262ab8a6e6f8ab7812312177..bc247e2d0f280e4d2fb3c09792a4526b21ea8ca3 100644
 --- a/filters/f_enhancement_pair.c
 +++ b/filters/f_enhancement_pair.c
 @@ -104,6 +104,8 @@ static void inherit_dovi_from_el(struct mp_image *bl, struct mp_image *el)
@@ -46,7 +37,7 @@ index 8ee9b165e..bc247e2d0 100644
          return;
      if (bl->dovi)
 diff --git a/player/command.c b/player/command.c
-index 4c19d67a2..c7e0f863b 100644
+index 4c19d67a2bebb15e217fe76f91df0fdbdabf460e..c7e0f863b15590444d5de599cbf6e7b230ce0b4c 100644
 --- a/player/command.c
 +++ b/player/command.c
 @@ -2583,6 +2583,17 @@ static int property_imgparams(const struct mp_image_params *p, int action, void
@@ -68,7 +59,7 @@ index 4c19d67a2..c7e0f863b 100644
                              .unavailable = !peak->tone_metric_valid},
          {"raw-avg-tone-metric-nits", SUB_PROP_FLOAT(peak->raw_avg_tone_metric),
 diff --git a/video/filter/vf_format.c b/video/filter/vf_format.c
-index e5a049c42..664fae41e 100644
+index e5a049c42b473970b647ae7488ef6b488d6ae07f..664fae41ea7632dfec95fdff35c2f525eaaa9eca 100644
 --- a/video/filter/vf_format.c
 +++ b/video/filter/vf_format.c
 @@ -203,6 +203,8 @@ static void vf_format_process(struct mp_filter *f)
@@ -81,19 +72,19 @@ index e5a049c42..664fae41e 100644
  
          if (priv->opts->min_luma)
 diff --git a/video/mp_image.c b/video/mp_image.c
-index 3146660c1..fd188f8b0 100644
+index 82b5f032ee95e34fc191afc0bf0d982336485369..5997dce036ddb12dfce39068a986b4bc3fffea73 100644
 --- a/video/mp_image.c
 +++ b/video/mp_image.c
-@@ -561,6 +561,8 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
-     dst->params.primaries_orig = src->params.primaries_orig;
+@@ -562,6 +562,8 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
      dst->params.transfer_orig = src->params.transfer_orig;
      dst->params.sys_orig = src->params.sys_orig;
+     dst->params.dovi_el_type = src->params.dovi_el_type;
 +    dst->params.authored_scene_cut = src->params.authored_scene_cut;
 +    dst->params.hdr10plus_signature = src->params.hdr10plus_signature;
      dst->params.no_dovi = src->params.no_dovi;
      dst->params.no_enhancement_layer = src->params.no_enhancement_layer;
  
-@@ -904,6 +906,8 @@ void mp_image_params_update_dynamic(struct mp_image_params *dst,
+@@ -905,6 +907,8 @@ void mp_image_params_update_dynamic(struct mp_image_params *dst,
      // update rather than the static params; without this the property would
      // keep reporting the value from the first frame of the stream.
      dst->dovi_el_type = src->dovi_el_type;
@@ -102,7 +93,7 @@ index 3146660c1..fd188f8b0 100644
      // Don't overwrite peak-detected HDR metadata if available.
      float max_pq_y = dst->color.hdr.max_pq_y;
      float avg_pq_y = dst->color.hdr.avg_pq_y;
-@@ -1171,6 +1175,17 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
+@@ -1172,6 +1176,17 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
      AVFrameSideData *mdm = av_frame_get_side_data(src, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
      AVFrameSideData *clm = av_frame_get_side_data(src, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
      AVFrameSideData *dhp = av_frame_get_side_data(src, AV_FRAME_DATA_DYNAMIC_HDR_PLUS);
@@ -120,7 +111,7 @@ index 3146660c1..fd188f8b0 100644
      pl_map_hdr_metadata(&dst->params.color.hdr, &(struct pl_av_hdr_metadata) {
          .mdm = (void *)(mdm ? mdm->data : NULL),
          .clm = (void *)(clm ? clm->data : NULL),
-@@ -1215,6 +1230,9 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
+@@ -1216,6 +1231,9 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
              }
              dst->params.dovi_el_type =
                  mel ? MP_DOVI_EL_MEL : MP_DOVI_EL_FEL;
@@ -131,7 +122,7 @@ index 3146660c1..fd188f8b0 100644
  #if PL_API_VER < 364
          const AVDOVIRpuDataHeader *header = av_dovi_get_header(metadata);
 diff --git a/video/mp_image.h b/video/mp_image.h
-index 7f261113c..82d1c154d 100644
+index 7f261113c940d4a3d6ba54109dad336d3e10d563..82d1c154df9d178e1a61c7d82216cfea131467b1 100644
 --- a/video/mp_image.h
 +++ b/video/mp_image.h
 @@ -50,12 +50,21 @@ enum mp_dovi_el_type {
@@ -169,7 +160,7 @@ index 7f261113c..82d1c154d 100644
      // Flags for f_enhancement_pair.c to not inherit flags from EL.
      bool no_dovi;
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index bbd921dde..603940eb9 100644
+index bbd921ddea0302b3a98e98482528c77662bc9181..603940eb98ba84574f6664e1254128787404b5ee 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
 @@ -147,6 +147,11 @@ struct priv {
@@ -305,5 +296,3 @@ index bbd921dde..603940eb9 100644
                  .raw_max_pq_y        = metrics.raw_max_pq_y,
                  .raw_avg_pq_y        = metrics.raw_avg_pq_y,
                  .raw_max_rgb         = metrics.raw_max_rgb,
--- 
-2.54.0.windows.1

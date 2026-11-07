@@ -1,20 +1,12 @@
-From 638162bb1e94fe4d8a84b8dd2c31ab87a3422397 Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Wed, 29 Jul 2026 16:20:53 -0400
+From 32de2e85a900378217b3e961e5d8865f8c8c46a8 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:49:28 -0500
 Subject: [PATCH] screenshot: optionally preserve native colorspace in raw
  output
 
----
- DOCS/interface-changes.rst |  1 +
- DOCS/man/input.rst         | 13 ++++++++++++-
- player/command.c           |  2 ++
- player/screenshot.c        | 38 +++++++++++++++++++++++++++++---------
- player/screenshot.h        |  3 ++-
- video/image_loader.c       |  2 +-
- 6 files changed, 47 insertions(+), 12 deletions(-)
 
 diff --git a/DOCS/interface-changes.rst b/DOCS/interface-changes.rst
-index 230a5b5..ffaffd5 100644
+index 230a5b52b1960d35edfdc9069c53a7ac98fe147e..ffaffd5423821f6a545a124ef343fd92b867064b 100644
 --- a/DOCS/interface-changes.rst
 +++ b/DOCS/interface-changes.rst
 @@ -184,6 +184,7 @@ Interface changes
@@ -26,10 +18,10 @@ index 230a5b5..ffaffd5 100644
        page number
      - add `demuxer-mkv-crop-compat` option
 diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
-index 5d3b9e4..397be36 100644
+index 55402dd641c6442ea4c1611252de61ee46678b35..c30381486e8a74a2529b505a458bcd84142d4928 100644
 --- a/DOCS/man/input.rst
 +++ b/DOCS/man/input.rst
-@@ -1520,7 +1520,7 @@ Screenshot Commands
+@@ -1538,7 +1538,7 @@ Screenshot Commands
      Like all input command parameters, the filename is subject to property
      expansion as described in `Property Expansion`_.
  
@@ -38,7 +30,7 @@ index 5d3b9e4..397be36 100644
      Return a screenshot in memory. This can be used only through the client API
      or from a script using ``mp.command_native``. The MPV_FORMAT_NODE_MAP
      returned by this command has the ``w``, ``h``, ``stride`` fields set to
-@@ -1543,10 +1543,21 @@ Screenshot Commands
+@@ -1561,10 +1561,21 @@ Screenshot Commands
          When this format is used, the image data will be high bit depth, and
          ``--screenshot-high-bit-depth`` is ignored.
  
@@ -61,10 +53,10 @@ index 5d3b9e4..397be36 100644
      pixel at ``(x0, y0 + 1)``. This can be larger than ``w * bpp`` if the image
      was cropped, or if there is padding. This number can be negative as well.
 diff --git a/player/command.c b/player/command.c
-index 5df0837..98173f4 100644
+index e467d44411c6596a3dd7374fddfd3ca0af4183ae..18d8d16f37c13150a134ca61e2c76147ae3de392 100644
 --- a/player/command.c
 +++ b/player/command.c
-@@ -7732,6 +7732,8 @@ const struct mp_cmd_def mp_cmds[] = {
+@@ -7753,6 +7753,8 @@ const struct mp_cmd_def mp_cmds[] = {
                  {"rgba", 2},
                  {"rgba64", 3}),
                  OPTDEF_INT(0)},
@@ -74,7 +66,7 @@ index 5df0837..98173f4 100644
      },
      { "loadfile", cmd_loadfile,
 diff --git a/player/screenshot.c b/player/screenshot.c
-index d21a53a..c51c6cb 100644
+index d21a53abdc8f61a336e93114724c4dcedfefea57..c51c6cb09517346dbbfd45c2ed5a6322e74ef035 100644
 --- a/player/screenshot.c
 +++ b/player/screenshot.c
 @@ -339,7 +339,7 @@ static void add_osd(struct MPContext *mpctx, struct mp_image *image, int mode)
@@ -183,7 +175,7 @@ index d21a53a..c51c6cb 100644
          node_map_add(res, "data", MPV_FORMAT_BYTE_ARRAY)->u.ba;
      *ba = (struct mpv_byte_array){
 diff --git a/player/screenshot.h b/player/screenshot.h
-index 97abc79..2638c4b 100644
+index 97abc79bde5508b72e4542cfc3d6cb7608b6838c..2638c4be9e68d1d5d3ebc60f86ab602fec86eb8f 100644
 --- a/player/screenshot.h
 +++ b/player/screenshot.h
 @@ -36,7 +36,8 @@ void handle_each_frame_screenshot(struct MPContext *mpctx);
@@ -197,7 +189,7 @@ index 97abc79..2638c4b 100644
  // Handlers for the user-facing commands.
  void cmd_screenshot(void *p);
 diff --git a/video/image_loader.c b/video/image_loader.c
-index ba4d62a..26e4362 100644
+index ba4d62acabcdc10bd80057132fb63edd83a1d30a..26e4362ff2ff84c967ead5c2abb4a890597466d7 100644
 --- a/video/image_loader.c
 +++ b/video/image_loader.c
 @@ -38,7 +38,7 @@ struct mp_image *load_image_png_buf(void *buffer, size_t buffer_size, int imgfmt
@@ -209,5 +201,3 @@ index ba4d62a..26e4362 100644
          talloc_free(r);
      }
      av_frame_free(&frame);
--- 
-2.55.0

@@ -1,14 +1,13 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: mpv-ht <mpv-ht@local>
-Date: Sat, 12 Sep 2026 20:00:00 -0400
+From cf8a4839ea8b5c3074370811ffdaae4057c73949 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:53:05 -0500
 Subject: [PATCH] gamut: replace hard-boundary P3D with a smooth mapping
 
 Opt-in P3D only. Existing automatic and Softclip behavior is unchanged.
 See analysis/ipt-path-gamut/SMOOTH-P3D.md in the packaging repository.
 
----
 diff --git a/src/gamut_mapping.c b/src/gamut_mapping.c
-index 9efbcc6a..33a471e6 100644
+index 9efbcc6a2e2193bc87a337121c384cee48c20de9..33a471e667d6be429537eb57c3105abc7c219496 100644
 --- a/src/gamut_mapping.c
 +++ b/src/gamut_mapping.c
 @@ -744,33 +744,64 @@ static void perceptual(float *lut, const struct pl_gamut_map_params *params)
@@ -91,7 +90,7 @@ index 9efbcc6a..33a471e6 100644
  };
  
 diff --git a/src/gamut_mapping_pipt.h b/src/gamut_mapping_pipt.h
-index 764b3ee1..564c5364 100644
+index 764b3ee1f3dbef6557d4a2f812a9d438336c7fff..564c5364e813a86723fbf657395c9eecad22c7b4 100644
 --- a/src/gamut_mapping_pipt.h
 +++ b/src/gamut_mapping_pipt.h
 @@ -1,67 +1,11 @@
@@ -227,7 +226,7 @@ index 764b3ee1..564c5364 100644
 -}
  #endif
 diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
-index 68e0e6be..b9575ee4 100644
+index 68e0e6bed8fbc0544d57323ce8dfa0e113c0e02f..b9575ee4c7d4de4b9152fec4a133abe653d2a843 100644
 --- a/src/shaders/colorspace.c
 +++ b/src/shaders/colorspace.c
 @@ -3011,13 +3011,12 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
@@ -279,7 +278,7 @@ index 68e0e6be..b9575ee4 100644
          // Apply ambient compensation after the ordinary tone/chroma and gamut
          // reconstruction. Preserve the resulting P/T exactly when the lifted
 diff --git a/src/shaders/ipt_path.h b/src/shaders/ipt_path.h
-index c1f9745a..b0beb6b8 100644
+index c1f9745a894c3c4f8b1ce9dbec9ca32bab76f1eb..b0beb6b80819444c81d46c7f92c5fce127633234 100644
 --- a/src/shaders/ipt_path.h
 +++ b/src/shaders/ipt_path.h
 @@ -1,74 +1,64 @@

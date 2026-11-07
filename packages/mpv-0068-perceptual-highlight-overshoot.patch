@@ -1,14 +1,15 @@
-From: mpv-ht <mpv-ht@localhost>
-Date: Thu, 1 Oct 2026 12:00:00 -0400
-Subject: [PATCH] gpu-next: expose Perceptual highlight overshoot and display ceiling
+From c83a4976b9cb2907559116fc82b071df5938996b Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:52:53 -0500
+Subject: [PATCH] gpu-next: expose Perceptual highlight overshoot and display
+ ceiling
 
 Map measured forward Perceptual HDR to an optional higher endpoint, then clip
 RGB channels at the real display peak. Keep output metadata unchanged and
 report both the creative curve target and physical ceiling to the Analyzer.
 
----
 diff --git a/player/command.c b/player/command.c
-index 8e97b33d5..405c69885 100644
+index 8e97b33d577ad05170876d26b5e0d76e35f56f69..405c6988541c6081182e88627ce30042947c7abd 100644
 --- a/player/command.c
 +++ b/player/command.c
 @@ -2820,6 +2820,7 @@ static int mp_property_tone_curve(void *ctx, struct m_property *prop, int action
@@ -20,7 +21,7 @@ index 8e97b33d5..405c69885 100644
          {"near-black-protection", SUB_PROP_BOOL(v.near_black_protection)},
          {"input", SUB_PROP_STR(input)}, {"base", SUB_PROP_STR(base)}, {"output", SUB_PROP_STR(output)},
 diff --git a/video/out/gpu/video.c b/video/out/gpu/video.c
-index af224173c..f60c8cb33 100644
+index af224173c0d9373d7dd540794f77fddd3ac71975..f60c8cb33281d8d82eebff71c365f7ebb3e6be3a 100644
 --- a/video/out/gpu/video.c
 +++ b/video/out/gpu/video.c
 @@ -484,6 +484,7 @@ const struct m_sub_options gl_video_conf = {
@@ -32,7 +33,7 @@ index af224173c..f60c8cb33 100644
              OPT_FLOAT(tone_map.ambient_gamma), M_RANGE(0.5, 1.5)},
          {"inverse-tone-mapping", OPT_BOOL(tone_map.inverse)},
 diff --git a/video/out/gpu/video.h b/video/out/gpu/video.h
-index 73f423e6f..651e93d04 100644
+index 73f423e6f33c9ea88cb688aac2e0a4c042c9f74f..651e93d04087b10622f6253cd9a7854a9ca649f9 100644
 --- a/video/out/gpu/video.h
 +++ b/video/out/gpu/video.h
 @@ -129,6 +129,7 @@ struct gl_tone_map_opts {
@@ -44,7 +45,7 @@ index 73f423e6f..651e93d04 100644
      float curve_param;
      float max_boost;
 diff --git a/video/out/vo.h b/video/out/vo.h
-index e3243365b..b19614622 100644
+index e3243365b152a69bdb70b9ec8062c6871deb9782..b196146224bd3c4eeb438596ee5dae208a80fb91 100644
 --- a/video/out/vo.h
 +++ b/video/out/vo.h
 @@ -544,6 +544,7 @@ struct vo_tone_curve {
@@ -56,7 +57,7 @@ index e3243365b..b19614622 100644
  };
  
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index d3662bea1..dba7bb8c3 100644
+index d3662bea10fdb147979e8f158291284dd6971d15..dba7bb8c31832097bfeda7eee04684857ba0ad6e 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
 @@ -3403,6 +3403,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)

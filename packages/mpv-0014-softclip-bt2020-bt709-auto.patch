@@ -1,17 +1,11 @@
-From f781f812536677fbf9102281d81b9b2f3270c823 Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Mon, 10 Aug 2026 14:18:09 -0400
+From 1b4b5848d2a1b28b2da44da0371a528b5b50cd77 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:49:48 -0500
 Subject: [PATCH] gpu-next: use Softclip for automatic BT.2020 to BT.709
 
----
- DOCS/man/options.rst    |  7 ++++++-
- video/out/gpu/video.c   |  1 +
- video/out/gpu/video.h   |  1 +
- video/out/vo_gpu_next.c | 35 +++++++++++++++++++++++++++++++++++
- 4 files changed, 43 insertions(+), 1 deletion(-)
 
 diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
-index c83c979f7..204a9bcaa 100644
+index ee5c922c10e03d920ffd4b36ea0715487350ebc5..a17e45a9c5c32d6280792b8c3c8f9854a8b4f55d 100644
 --- a/DOCS/man/options.rst
 +++ b/DOCS/man/options.rst
 @@ -7795,13 +7795,18 @@ them.
@@ -35,7 +29,7 @@ index c83c979f7..204a9bcaa 100644
          Performs relative colorimetric clipping, while maintaining an
          exponential relationship between brightness and chromaticity.
 diff --git a/video/out/gpu/video.c b/video/out/gpu/video.c
-index 642639cfb..8ed9a6bda 100644
+index 642639cfb84f39af95b45292dd206334861e1146..8ed9a6bdad0b0211c7f6242562d7a8785245a6eb 100644
 --- a/video/out/gpu/video.c
 +++ b/video/out/gpu/video.c
 @@ -487,6 +487,7 @@ const struct m_sub_options gl_video_conf = {
@@ -47,7 +41,7 @@ index 642639cfb..8ed9a6bda 100644
              {"saturation",  GAMUT_SATURATION},
              {"absolute",    GAMUT_ABSOLUTE},
 diff --git a/video/out/gpu/video.h b/video/out/gpu/video.h
-index 8ba031b35..2f2fc805c 100644
+index 8ba031b352c2aae28e25d1f0c89b4aebc52b2b48..2f2fc805c0eabe363b6487238383a8b048c799f2 100644
 --- a/video/out/gpu/video.h
 +++ b/video/out/gpu/video.h
 @@ -115,6 +115,7 @@ enum gamut_mode {
@@ -59,10 +53,10 @@ index 8ba031b35..2f2fc805c 100644
      GAMUT_SATURATION,
      GAMUT_ABSOLUTE,
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index c2f4540fc..47aac911f 100644
+index 603940eb98ba84574f6664e1254128787404b5ee..5e817aaf22c163ffd7ae809f82bed7018ab48a26 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
-@@ -1293,6 +1293,23 @@ static void update_tm_viz(struct pl_color_map_params *params,
+@@ -1380,6 +1380,23 @@ static void update_tm_viz(struct pl_color_map_params *params,
  static void update_hook_opts_dynamic(struct priv *p, const struct pl_hook *hook,
                                       const struct mp_image *mpi);
  
@@ -86,7 +80,7 @@ index c2f4540fc..47aac911f 100644
  static bool draw_frame(struct vo *vo, struct vo_frame *frame)
  {
      struct priv *p = vo->priv;
-@@ -1638,6 +1655,16 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1725,6 +1742,16 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
      apply_crop(&target, p->dst, swframe.fbo->params.w, swframe.fbo->params.h);
      update_tm_viz(&pars->color_map_params, &target);
  
@@ -103,7 +97,7 @@ index c2f4540fc..47aac911f 100644
      struct pl_frame_mix mix = {0};
      if (frame->current) {
          // Update queue state
-@@ -2085,6 +2112,13 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
+@@ -2172,6 +2199,13 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
      apply_crop(&target, dst, fbo->params.w, fbo->params.h);
      update_tm_viz(&pars->color_map_params, &target);
  
@@ -117,7 +111,7 @@ index c2f4540fc..47aac911f 100644
      int osd_flags = 0;
      if (!args->subs)
          osd_flags |= OSD_DRAW_OSD_ONLY;
-@@ -3004,6 +3038,7 @@ static void update_render_options(struct vo *vo)
+@@ -3091,6 +3125,7 @@ static void update_render_options(struct vo *vo)
          [GAMUT_AUTO]            = pl_color_map_default_params.gamut_mapping,
          [GAMUT_CLIP]            = &pl_gamut_map_clip,
          [GAMUT_PERCEPTUAL]      = &pl_gamut_map_perceptual,
@@ -125,6 +119,3 @@ index c2f4540fc..47aac911f 100644
          [GAMUT_RELATIVE]        = &pl_gamut_map_relative,
          [GAMUT_SATURATION]      = &pl_gamut_map_saturation,
          [GAMUT_ABSOLUTE]        = &pl_gamut_map_absolute,
--- 
-2.54.0.windows.1
-

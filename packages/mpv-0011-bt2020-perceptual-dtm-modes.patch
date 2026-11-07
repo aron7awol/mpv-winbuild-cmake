@@ -1,23 +1,14 @@
-From 271f9ddd3af6dd8de1b890259644974034c8d11c Mon Sep 17 00:00:00 2001
-From: mpv-ht <local@mpv-ht>
-Date: Mon, 3 Aug 2026 20:45:00 -0400
+From 3a74d446ca958099deb6bd384757dd260f85fbfb Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:49:33 -0500
 Subject: [PATCH] vo_gpu_next: add private DTM metric modes
 
----
- DOCS/man/input.rst      | 14 ++++++++++++++
- DOCS/man/options.rst    | 35 +++++++++++++++++++++++++++++++++++
- player/command.c        |  8 ++++++++
- video/mp_image.h        |  5 +++++
- video/out/gpu/video.c   | 11 +++++++++++
- video/out/gpu/video.h   | 12 ++++++++++++
- video/out/vo_gpu_next.c | 40 +++++++++++++++++++++++++++++++++++-----
- 7 files changed, 120 insertions(+), 5 deletions(-)
 
 diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
-index ed5ada576..8ab44ebaf 100644
+index fa12675d7984ada6045ab3f0c8fdbca01a502c65..4665cd2f833858187a1f9590d1ef9ddaf959e90d 100644
 --- a/DOCS/man/input.rst
 +++ b/DOCS/man/input.rst
-@@ -2932,6 +2932,16 @@ Property list
+@@ -2950,6 +2950,16 @@ Property list
          black pixels. It is independent of ``--hdr-peak-percentile`` and is
          not static MaxFALL metadata.
  
@@ -34,7 +25,7 @@ index ed5ada576..8ab44ebaf 100644
      ``video-params/dolby-vision-el-type``
          Dolby Vision enhancement layer type of the current frame, as signalled
          by the RPU. Either ``fel`` (full enhancement layer: carries residual
-@@ -2994,6 +3004,10 @@ Property list
+@@ -3012,6 +3022,10 @@ Property list
              "raw-avg-pq-y"      MPV_FORMAT_DOUBLE
              "raw-max-rgb-nits"  MPV_FORMAT_DOUBLE
              "raw-avg-rgb-nits"  MPV_FORMAT_DOUBLE
@@ -46,7 +37,7 @@ index ed5ada576..8ab44ebaf 100644
              "prim-red-x"        MPV_FORMAT_DOUBLE
              "prim-red-y"        MPV_FORMAT_DOUBLE
 diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
-index 3fed8f062..edd9e734d 100644
+index 3fed8f06238051f1a8293d541878241325be7855..eb2dab7374ce66b1d92ca2ff463c4f17e150a1f9 100644
 --- a/DOCS/man/options.rst
 +++ b/DOCS/man/options.rst
 @@ -7730,6 +7730,41 @@ them.
@@ -92,10 +83,10 @@ index 3fed8f062..edd9e734d 100644
      If set, allows inverse tone mapping (expanding dynamic range). Can be used
      for upscaling SDR content to HDR, or for making HDR content brighter.
 diff --git a/player/command.c b/player/command.c
-index 4184189d6..ded9f6730 100644
+index 455f7a9973250afbbaa53721350d518db5902866..4c19d67a2bebb15e217fe76f91df0fdbdabf460e 100644
 --- a/player/command.c
 +++ b/player/command.c
-@@ -2579,6 +2579,14 @@ static int property_imgparams(const struct mp_image_params *p, int action, void
+@@ -2583,6 +2583,14 @@ static int property_imgparams(const struct mp_image_params *p, int action, void
                              .unavailable = !peak->valid},
          {"raw-avg-rgb-nits", SUB_PROP_FLOAT(peak->raw_avg_rgb),
                              .unavailable = !peak->valid},
@@ -111,7 +102,7 @@ index 4184189d6..ded9f6730 100644
              SUB_PROP_STR(p->dovi_el_type == MP_DOVI_EL_FEL ? "fel" : "mel"),
              .unavailable = p->dovi_el_type == MP_DOVI_EL_NONE},
 diff --git a/video/mp_image.h b/video/mp_image.h
-index 550cc19b7..e499bee66 100644
+index 0099b31f94e8779f7df4a4d6ed05965ec6f57f98..7f261113c940d4a3d6ba54109dad336d3e10d563 100644
 --- a/video/mp_image.h
 +++ b/video/mp_image.h
 @@ -55,10 +55,15 @@ enum mp_dovi_el_type {
@@ -131,7 +122,7 @@ index 550cc19b7..e499bee66 100644
  
  // Describes image parameters that usually stay constant.
 diff --git a/video/out/gpu/video.c b/video/out/gpu/video.c
-index 656c11c29..642639cfb 100644
+index 656c11c29f27538068f1be0e60d60d5b821b8ea2..642639cfb84f39af95b45292dd206334861e1146 100644
 --- a/video/out/gpu/video.c
 +++ b/video/out/gpu/video.c
 @@ -399,6 +399,7 @@ static const struct gl_video_opts gl_video_opts_def = {
@@ -160,7 +151,7 @@ index 656c11c29..642639cfb 100644
          {"tone-mapping-max-boost", OPT_FLOAT(tone_map.max_boost),
              M_RANGE(1.0, 10.0)},
 diff --git a/video/out/gpu/video.h b/video/out/gpu/video.h
-index a5b03adfb..8ba031b35 100644
+index a5b03adfbf7bc2163058d69113a46ef240a680b6..8ba031b352c2aae28e25d1f0c89b4aebc52b2b48 100644
 --- a/video/out/gpu/video.h
 +++ b/video/out/gpu/video.h
 @@ -101,6 +101,16 @@ enum tone_mapping {
@@ -190,10 +181,10 @@ index a5b03adfb..8ba031b35 100644
      float max_boost;
      bool inverse;
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index 5b4813829..a6d349c12 100644
+index 86ff957936173aa448794842477ccf22a8c2e361..bbd921ddea0302b3a98e98482528c77662bc9181 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
-@@ -1699,11 +1699,16 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1779,11 +1779,16 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
          struct pl_peak_detect_metrics metrics;
          if (pl_renderer_get_peak_detect_metrics(p->rr, &metrics)) {
              vo->params->peak_detect = (struct mp_peak_detect_metrics) {
@@ -215,7 +206,7 @@ index 5b4813829..a6d349c12 100644
              };
          } else {
              vo->params->peak_detect = (struct mp_peak_detect_metrics) {0};
-@@ -2946,6 +2951,31 @@ AV_NOWARN_DEPRECATED(
+@@ -3026,6 +3031,31 @@ AV_NOWARN_DEPRECATED(
      if (isnan(pars->color_map_params.tone_mapping_param)) // vo_gpu compatibility
          pars->color_map_params.tone_mapping_param = 0.0;
  )
@@ -247,5 +238,3 @@ index 5b4813829..a6d349c12 100644
      pars->color_map_params.inverse_tone_mapping = opts->tone_map.inverse;
      pars->color_map_params.contrast_recovery = opts->tone_map.contrast_recovery;
      pars->color_map_params.visualize_lut = opts->tone_map.visualize;
--- 
-2.54.0.windows.1

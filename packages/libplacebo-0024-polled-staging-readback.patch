@@ -1,10 +1,11 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: mpv-ht <mpv-ht@local>
-Date: Sat, 12 Sep 2026 15:00:00 -0400
+From ccad230d555431e265d3f7fa07a09a9aa3d923d4 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:53:05 -0500
 Subject: [PATCH] d3d11: opt in to nonblocking staged buffer polling
 
+
 diff --git a/src/d3d11/gpu.c b/src/d3d11/gpu.c
-index a4a003dc..ac424cdd 100644
+index a4a003dc16b85dfa252284e090cafd2822fad09f..ac424cdd16a9f7f40184260a14fbb676d5315b85 100644
 --- a/src/d3d11/gpu.c
 +++ b/src/d3d11/gpu.c
 @@ -431,6 +431,7 @@ static struct pl_gpu_fns pl_fns_d3d11 = {
@@ -16,7 +17,7 @@ index a4a003dc..ac424cdd 100644
      .desc_namespace         = d3d11_desc_namespace,
      .pass_create            = pl_d3d11_pass_create,
 diff --git a/src/d3d11/gpu.h b/src/d3d11/gpu.h
-index c6d842e6..ee4e0dd5 100644
+index c6d842e6d6f37ac97c8de26ed4696cb02a102f73..ee4e0dd5293433265eb7c5c8dbb7a3486b05c823 100644
 --- a/src/d3d11/gpu.h
 +++ b/src/d3d11/gpu.h
 @@ -101,6 +101,7 @@ void pl_d3d11_timer_end(pl_gpu gpu, pl_timer timer);
@@ -36,7 +37,7 @@ index c6d842e6..ee4e0dd5 100644
  pl_buf pl_d3d11_buf_create(pl_gpu gpu, const struct pl_buf_params *params);
  void pl_d3d11_buf_write(pl_gpu gpu, pl_buf buf, size_t offset, const void *data,
 diff --git a/src/d3d11/gpu_buf.c b/src/d3d11/gpu_buf.c
-index 955e6e19..1488a47a 100644
+index 955e6e198834097b52b6ebb2911f109a3b18daea..1488a47ab22c7949a459ef73cf0e451b30c42aa8 100644
 --- a/src/d3d11/gpu_buf.c
 +++ b/src/d3d11/gpu_buf.c
 @@ -47,6 +47,7 @@ pl_buf pl_d3d11_buf_create(pl_gpu gpu, const struct pl_buf_params *params)
@@ -126,7 +127,7 @@ index 955e6e19..1488a47a 100644
      // Handle system memory copies in case one or both of the buffers has a
      // system memory mirror
 diff --git a/src/d3d11/gpu_pass.c b/src/d3d11/gpu_pass.c
-index e47d5fac..55abf752 100644
+index e47d5facaa749b38d61c65e08226060e22a426a2..55abf75275a50c9cfc00cba712c599d7610a9e3e 100644
 --- a/src/d3d11/gpu_pass.c
 +++ b/src/d3d11/gpu_pass.c
 @@ -1005,6 +1005,7 @@ static void fill_uavs(pl_pass pass, const struct pl_pass_run_params *params,
@@ -146,7 +147,7 @@ index e47d5fac..55abf752 100644
              break;
          default:
 diff --git a/src/gpu.c b/src/gpu.c
-index 130979f2..fb57cc89 100644
+index 130979f297a3e60e201827ffdcea4887a3a4b8d5..fb57cc89ba42564c4207bee1c4c3cfb5f6c10235 100644
 --- a/src/gpu.c
 +++ b/src/gpu.c
 @@ -588,6 +588,7 @@ pl_buf pl_buf_create(pl_gpu gpu, const struct pl_buf_params *params)
@@ -166,7 +167,7 @@ index 130979f2..fb57cc89 100644
             (a.uniform        || !b.uniform) &&
             (a.storable       || !b.storable) &&
 diff --git a/src/include/libplacebo/gpu.h b/src/include/libplacebo/gpu.h
-index fcaca197..57a39b50 100644
+index fcaca1976e51d91547addd656d2b84f40e248e0f..57a39b50e18f1dc524a94f69e3229a279b828622 100644
 --- a/src/include/libplacebo/gpu.h
 +++ b/src/include/libplacebo/gpu.h
 @@ -503,6 +503,12 @@ struct pl_buf_params {
@@ -182,6 +183,3 @@ index fcaca197..57a39b50 100644
  };
  
  #define pl_buf_params(...) (&(struct pl_buf_params) {   \
-
--- 
-2.50.1

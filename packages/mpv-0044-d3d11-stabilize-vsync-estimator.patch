@@ -1,17 +1,12 @@
-From df6c63d31b14a5db545a1e71b90e92006686a298 Mon Sep 17 00:00:00 2001
-From: mpv-ht build preparation <diagnostic@mpv-ht.invalid>
-Date: Thu, 10 Sep 2026 12:25:21 -0400
+From 26f76558d4a5cc61714958ba917f36cd900f65eb Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:52:02 -0500
 Subject: [PATCH] d3d11: stabilize queued presentation timing with refresh
  history
 
----
- video/out/d3d11/context.c         | 38 +++++++---------------
- video/out/d3d11/vsync_estimator.h | 53 +++++++++++++++++++++++++++++++
- 2 files changed, 65 insertions(+), 26 deletions(-)
- create mode 100644 video/out/d3d11/vsync_estimator.h
 
 diff --git a/video/out/d3d11/context.c b/video/out/d3d11/context.c
-index 9fb65e283..8bac900b2 100644
+index 9fb65e2838f540a8fdfcbec44b29f08b5f594699..8bac900b2f996b5e642993a872681e7f3425346c 100644
 --- a/video/out/d3d11/context.c
 +++ b/video/out/d3d11/context.c
 @@ -26,6 +26,7 @@
@@ -99,7 +94,7 @@ index 9fb65e283..8bac900b2 100644
          // time. It could be before if mpv skips a lot of frames.
 diff --git a/video/out/d3d11/vsync_estimator.h b/video/out/d3d11/vsync_estimator.h
 new file mode 100644
-index 000000000..2e2e66062
+index 0000000000000000000000000000000000000000..2e2e6606219fec348a21a778236df0cf5a8493a0
 --- /dev/null
 +++ b/video/out/d3d11/vsync_estimator.h
 @@ -0,0 +1,53 @@
@@ -156,6 +151,3 @@ index 000000000..2e2e66062
 +}
 +
 +#endif
--- 
-2.54.0.windows.1
-

@@ -1,16 +1,11 @@
-From 258f857d816e6fee7a8d6c81c7b4a3b39c97e8e4 Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Sat, 22 Aug 2026 17:48:13 -0400
+From 6ded825b8ede53c015bb1d8be69523f3fbe47d87 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:53:01 -0500
 Subject: [PATCH] colorspace: add target-PQ ambient exponent
 
----
- src/include/libplacebo/shaders/colorspace.h |  9 +++
- src/shaders/colorspace.c                    | 89 +++++++++++++++++++--
- src/tests/gpu_tests.c                       | 78 ++++++++++++++++++
- 3 files changed, 170 insertions(+), 6 deletions(-)
 
 diff --git a/src/include/libplacebo/shaders/colorspace.h b/src/include/libplacebo/shaders/colorspace.h
-index d948a4ac..160570ba 100644
+index d948a4ac033a0d5bca9d3e742b73d1834f04c99b..160570ba2d983c6be0850b5b04e75f4fc871e259 100644
 --- a/src/include/libplacebo/shaders/colorspace.h
 +++ b/src/include/libplacebo/shaders/colorspace.h
 @@ -383,6 +383,14 @@ struct pl_color_map_params {
@@ -37,10 +32,10 @@ index d948a4ac..160570ba 100644
      .lut_size               = 256,                              \
      .visualize_rect         = {0, 0, 1, 1},                     \
 diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
-index 9cfb63f7..bfc92844 100644
+index 862a78946c9deefe57cab7f55019d8e8a242b7ba..40841eef8bfd103c0b1888b0441d474560f2668c 100644
 --- a/src/shaders/colorspace.c
 +++ b/src/shaders/colorspace.c
-@@ -2827,7 +2827,10 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+@@ -2829,7 +2829,10 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
      if (params->hlg_reference_peak > 0.0f &&
          src.transfer == PL_COLOR_TRC_HLG && pl_color_space_is_hdr(&dst))
          src.hdr.max_luma = params->hlg_reference_peak;
@@ -52,7 +47,7 @@ index 9cfb63f7..bfc92844 100644
  #ifdef PL_BLACK_LEVEL_DIAGNOSTICS
          blkdiag_identity(sh, obj, &src, &dst);
  #endif
-@@ -3013,7 +3016,11 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+@@ -3015,7 +3018,11 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
          can_fast = true;
      }
  
@@ -65,7 +60,7 @@ index 9cfb63f7..bfc92844 100644
      bool need_gamut_map = !pl_gamut_map_params_noop(&gamut);
  
      if (!args->prelinearized)
-@@ -3136,7 +3143,37 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+@@ -3138,7 +3145,37 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
  
          }
  
@@ -104,7 +99,7 @@ index 9cfb63f7..bfc92844 100644
          if (!metric_active && need_recovery && params->contrast_recovery && args->feature_map) {
              ident_t pos, pt;
              ident_t lowres = sh_bind(sh, args->feature_map, PL_TEX_ADDRESS_CLAMP,
-@@ -3193,7 +3230,9 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+@@ -3195,7 +3232,9 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
                  ? emit_maxrgb_metric(sh)
                  : emit_bt2020_metric(sh, src.primaries);
              GLSL("float metric_in = "$"(color.rgb);                       \n"
@@ -115,7 +110,7 @@ index 9cfb63f7..bfc92844 100644
                   "float metric_in_v = pow(clamp(metric_in, 0.0, 1.0),    \n"
                   "                          1.0/78.84375);                 \n"
                   "float metric_out_v = pow(clamp(metric_out, 0.0, 1.0),  \n"
-@@ -3205,8 +3244,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+@@ -3207,8 +3246,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
                   "    / max(18.8515625-18.6875*metric_out_v,1e-6),       \n"
                   "      1.0/.1593017578125);                             \n"
                   "float metric_scale = metric_in_lin > 1e-12            \n"
@@ -125,7 +120,7 @@ index 9cfb63f7..bfc92844 100644
  
              if (params->tone_mapping_metric == PL_TONE_MAP_METRIC_BT2020_RGB ||
                  params->tone_mapping_metric == PL_TONE_MAP_METRIC_MAXRGB_RGB) {
-@@ -3332,6 +3370,41 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+@@ -3334,6 +3372,41 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
          }
      }
  
@@ -167,7 +162,7 @@ index 9cfb63f7..bfc92844 100644
      // Convert IPT back to linear RGB
      GLSL("lmspq = "$" * ipt;                        \n"
           "lms = pow(max(lmspq, 0.0), vec3(1.0/%f)); \n"
-@@ -3367,6 +3440,10 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+@@ -3369,6 +3442,10 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
              visualize_tone_map(sh, params->visualize_rect, alpha, &tone);
          }
          GLSL("#undef tone_map \n");
@@ -179,10 +174,10 @@ index 9cfb63f7..bfc92844 100644
  
  done:
 diff --git a/src/tests/gpu_tests.c b/src/tests/gpu_tests.c
-index a43c0a9d..5d1d8db8 100644
+index 5b7c072d5f3a7137a0f848e57c7533862aa88de4..81e25225fbb798653239ff5f35b19b7e0de5dc2a 100644
 --- a/src/tests/gpu_tests.c
 +++ b/src/tests/gpu_tests.c
-@@ -2594,6 +2594,83 @@ static void pl_hdr_target_clip_test(pl_gpu gpu)
+@@ -2596,6 +2596,83 @@ static void pl_hdr_target_clip_test(pl_gpu gpu)
      pl_tex_destroy(gpu, &dst);
  }
  
@@ -266,7 +261,7 @@ index a43c0a9d..5d1d8db8 100644
  void gpu_shader_tests(pl_gpu gpu)
  {
      pl_buffer_tests(gpu);
-@@ -2610,6 +2687,7 @@ void gpu_shader_tests(pl_gpu gpu)
+@@ -2612,6 +2689,7 @@ void gpu_shader_tests(pl_gpu gpu)
      pl_causal_temporal_fixture_test(gpu);
      pl_causal_translation_fixture_test(gpu);
      pl_hdr_target_clip_test(gpu);
@@ -274,5 +269,3 @@ index a43c0a9d..5d1d8db8 100644
  
      REQUIRE(!pl_gpu_is_failed(gpu));
  }
--- 
-2.54.0.windows.1

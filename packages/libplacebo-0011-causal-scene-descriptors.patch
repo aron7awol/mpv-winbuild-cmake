@@ -1,21 +1,12 @@
-From 1fd7bf770a68856fff01cc7b1b395dcf9e701864 Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Thu, 13 Aug 2026 15:21:41 -0400
+From a8cb146e3343b81d64100059d61ad89830366688 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:52:59 -0500
 Subject: [PATCH] causal scene detection: add native descriptors and
  acceleration
 
----
- src/include/libplacebo/renderer.h           |  35 ++
- src/include/libplacebo/shaders/colorspace.h |  18 +
- src/renderer.c                              | 484 +++++++++++++++++++-
- src/shaders/colorspace.c                    | 418 ++++++++++++++++-
- src/tests/causal_test.h                     |  31 ++
- src/tests/gpu_tests.c                       | 446 ++++++++++++++++++
- 6 files changed, 1403 insertions(+), 29 deletions(-)
- create mode 100644 src/tests/causal_test.h
 
 diff --git a/src/include/libplacebo/renderer.h b/src/include/libplacebo/renderer.h
-index 44514bbf..74140f9d 100644
+index 44514bbf6fc70ae5c3b0ebbbd096d487a5b72380..74140f9d566c78427d64281fd0b5bf956189e035 100644
 --- a/src/include/libplacebo/renderer.h
 +++ b/src/include/libplacebo/renderer.h
 @@ -192,6 +192,13 @@ struct pl_render_params {
@@ -76,7 +67,7 @@ index 44514bbf..74140f9d 100644
  //
  // NOTE: Frames must be sorted by timestamp, i.e. `timestamps` must be
 diff --git a/src/include/libplacebo/shaders/colorspace.h b/src/include/libplacebo/shaders/colorspace.h
-index 837f0d16..7731b582 100644
+index 837f0d1678096d7eee6bef23fc4ff9965d021006..7731b5821c804f82a76bf6e88bf1b772bff93f02 100644
 --- a/src/include/libplacebo/shaders/colorspace.h
 +++ b/src/include/libplacebo/shaders/colorspace.h
 @@ -22,6 +22,8 @@
@@ -119,7 +110,7 @@ index 837f0d16..7731b582 100644
  // pl_get_detected_hdr_metadata it never re-labels physical CIE Y metadata.
  PL_API bool pl_get_detected_tone_map_range(const pl_shader_obj state,
 diff --git a/src/renderer.c b/src/renderer.c
-index bf839c54..2b896cba 100644
+index bf839c54f17cf427b9523c784882b6fae9906432..2b896cba7b8b95041cdee234116c6f9029b7d0a9 100644
 --- a/src/renderer.c
 +++ b/src/renderer.c
 @@ -22,6 +22,7 @@
@@ -823,7 +814,7 @@ index bf839c54..2b896cba 100644
      return true;
  }
 diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
-index 0fdb504a..b4b0186a 100644
+index 0fdb504a11fea88e7091b413bcb2a261dd02ef05..b4b0186a55ebcd01675606a113d75b1628376663 100644
 --- a/src/shaders/colorspace.c
 +++ b/src/shaders/colorspace.c
 @@ -20,8 +20,10 @@
@@ -1378,7 +1369,7 @@ index 0fdb504a..b4b0186a 100644
              return false;
 diff --git a/src/tests/causal_test.h b/src/tests/causal_test.h
 new file mode 100644
-index 00000000..5d21d29e
+index 0000000000000000000000000000000000000000..5d21d29eaf8c6b03cb9772aeafde7bf3a00b6ac3
 --- /dev/null
 +++ b/src/tests/causal_test.h
 @@ -0,0 +1,31 @@
@@ -1414,7 +1405,7 @@ index 00000000..5d21d29e
 +bool pl_get_causal_test_descriptors(pl_shader_obj state,
 +                                    struct pl_causal_test_descriptors *out);
 diff --git a/src/tests/gpu_tests.c b/src/tests/gpu_tests.c
-index 965221f5..c66299b4 100644
+index 965221f58168d408e7141aad69c752f8b2697608..c66299b41263afc047ee415166f628e43ab11f71 100644
 --- a/src/tests/gpu_tests.c
 +++ b/src/tests/gpu_tests.c
 @@ -1,5 +1,6 @@
@@ -1883,5 +1874,3 @@ index 965221f5..c66299b4 100644
  
      REQUIRE(!pl_gpu_is_failed(gpu));
  }
--- 
-2.54.0.windows.1

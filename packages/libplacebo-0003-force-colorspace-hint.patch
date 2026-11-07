@@ -1,17 +1,11 @@
-From cf7c982ec8e9be9741dd974bba127dd23758d4e4 Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Sat, 1 Aug 2026 01:58:40 -0400
+From b54bef6d7ecd33984bee013701f8afab2d017b53 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:52:56 -0500
 Subject: [PATCH] d3d11: allow forcing an unchanged colorspace hint
 
----
- src/d3d11/swapchain.c              | 16 ++++++++++++----
- src/include/libplacebo/swapchain.h |  5 +++++
- src/swapchain.c                    | 21 +++++++++++++++++++++
- src/swapchain.h                    |  1 +
- 4 files changed, 39 insertions(+), 4 deletions(-)
 
 diff --git a/src/d3d11/swapchain.c b/src/d3d11/swapchain.c
-index 33237041..66250d9e 100644
+index 33237041e0e9af550246589b729df37b6360f03f..66250d9ecbd1b951766668541a4ae5e8fe977644 100644
 --- a/src/d3d11/swapchain.c
 +++ b/src/d3d11/swapchain.c
 @@ -377,7 +377,7 @@ static enum DXGI_FORMAT pick_format(pl_swapchain sw,
@@ -66,7 +60,7 @@ index 33237041..66250d9e 100644
      success = true;
  error:
 diff --git a/src/include/libplacebo/swapchain.h b/src/include/libplacebo/swapchain.h
-index b53aa5c1..0f25cae0 100644
+index b53aa5c1b14beebd4144390f778672416e5c37fc..0f25cae003256fa2675ca719b05f56fb86f74a9e 100644
 --- a/src/include/libplacebo/swapchain.h
 +++ b/src/include/libplacebo/swapchain.h
 @@ -80,6 +80,11 @@ PL_API bool pl_swapchain_resize(pl_swapchain sw, int *width, int *height);
@@ -82,7 +76,7 @@ index b53aa5c1..0f25cae0 100644
  struct pl_swapchain_frame {
      // A texture representing the framebuffer users should use for rendering.
 diff --git a/src/swapchain.c b/src/swapchain.c
-index 47faf7ba..1a62ad3c 100644
+index 47faf7baabf9d9241245ca75e59f5b8983bcf3de..1a62ad3cd56a0f7fc50f220a777cde637bb8557d 100644
 --- a/src/swapchain.c
 +++ b/src/swapchain.c
 @@ -72,6 +72,27 @@ void pl_swapchain_colorspace_hint(pl_swapchain sw, const struct pl_color_space *
@@ -114,7 +108,7 @@ index 47faf7ba..1a62ad3c 100644
                                struct pl_swapchain_frame *out_frame)
  {
 diff --git a/src/swapchain.h b/src/swapchain.h
-index 934a2b98..dae2892f 100644
+index 934a2b9804dbf3b15609404b46e7599e0df6ab19..dae2892f18ae91126b598a50b73b5835012d41e2 100644
 --- a/src/swapchain.h
 +++ b/src/swapchain.h
 @@ -32,6 +32,7 @@ struct pl_sw_fns {
@@ -125,5 +119,3 @@ index 934a2b98..dae2892f 100644
      SW_PFN(start_frame);
      SW_PFN(submit_frame);
      SW_PFN(swap_buffers);
--- 
-2.54.0.windows.1

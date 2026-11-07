@@ -1,12 +1,12 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: mpv-ht development <development@mpv-ht.local>
-Date: Mon, 31 Aug 2026 12:00:00 -0400
+From ae9f99da8af46ae37377bc65b96042fd2360aee1 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:53:03 -0500
 Subject: [PATCH] frame queue: support analysis-only frame prefetch
 
 Allow callers to map a bounded number of future frames without changing the
 rendered mix or target timestamp, so asynchronous analysis can reuse the
 queue-owned textures.
----
+
 diff --git a/src/include/libplacebo/utils/frame_queue.h b/src/include/libplacebo/utils/frame_queue.h
 index 390beaadc852bd777d9e49fef7688ae2bfc98d50..4afede6e36c864ebe5929583601f3355a2f03478 100644
 --- a/src/include/libplacebo/utils/frame_queue.h

@@ -1,14 +1,11 @@
-From c38854d7decc56f3b76c1e9e974c1602d6a2e5a3 Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Fri, 31 Jul 2026 22:31:03 -0400
+From ba01f89c4d6fe9c8c22587cadd7707eddecde5fb Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:49:31 -0500
 Subject: [PATCH] win32: force dark theme for native menus
 
----
- video/out/w32_common.c | 21 ++++++++-------------
- 1 file changed, 8 insertions(+), 13 deletions(-)
 
 diff --git a/video/out/w32_common.c b/video/out/w32_common.c
-index ba4f382..2245f23 100644
+index ba4f3825ec176ed346360ce0efb3bce03ec7f2ae..2245f230a6bb51791d29729db8a0807569ebd2fd 100644
 --- a/video/out/w32_common.c
 +++ b/video/out/w32_common.c
 @@ -79,7 +79,6 @@ EXTERN_C IMAGE_DOS_HEADER __ImageBase;
@@ -62,5 +59,3 @@ index ba4f382..2245f23 100644
      w32->api.pSetPreferredAppMode = !uxtheme_dll ? NULL :
                  (void *)GetProcAddress(uxtheme_dll, MAKEINTRESOURCEA(135));
  }
--- 
-2.55.0

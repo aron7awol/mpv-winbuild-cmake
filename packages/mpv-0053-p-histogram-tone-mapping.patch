@@ -1,16 +1,18 @@
-From: mpv-ht <mpv-ht@localhost>
-Date: Sun, 13 Sep 2026 00:00:00 -0400
-Subject: [PATCH] Add opt-in histogram-shaped P tone mapping and bounded brightening
+From 79c11d3b19f63beedd4828c1317b84321c1fe0d9 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:52:49 -0500
+Subject: [PATCH] gpu-next: expose histogram contrast shaping and shadow
+ protection
 
-Use the measured P RGB-ray histogram to redistribute the existing tone curve.
-Strength and above-source retention default to zero; no SEP path is added.
+Consolidates the published .76 changes without modifying the final source.
+Original: 0053-p-histogram-tone-mapping.patch
+Original: 0061-hstm-near-black-protection.patch
 
----
 diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
-index 33172a9..35cc55e 100644
+index 33172a9a144573ba4a23d4bac38b8bfd20cf0b0e..cc988a3929319cbe5bc33bb3a8c3491ce5ff3e6e 100644
 --- a/DOCS/man/options.rst
 +++ b/DOCS/man/options.rst
-@@ -7776,6 +7776,23 @@ them.
+@@ -7776,6 +7776,30 @@ them.
      Dolby Vision reshape/RPU processing alone does not disable these modes.
      (``--vo=gpu-next`` only)
  
@@ -25,50 +27,68 @@ index 33172a9..35cc55e 100644
 +``--tone-mapping-hstm-overbrightening=<0..100>``
 +    Fraction of HSTM's proposed above-source P increase to retain (default:
 +    ``0``). Zero prevents above-source gain in this mapping stage. ``100``
-+    retains all proposed lift, bounded to 2x input P and target RGB headroom.
++    retains all proposed lift, bounded to 2x input P and the scalar curve ceiling.
 +    ``25`` retains one quarter of the proposed excess, with a maximum gain
 +    of 1.25x. It does not add exposure to every pixel. Later ambient or gamut
 +    processing can still change brightness. Has no effect at zero HSTM
 +    strength. (``--vo=gpu-next`` only)
 +
++``--tone-mapping-hstm-near-black-protection=<yes|no>``
++    Preserve the base curve below 0.1 input nits and smoothly introduce
++    histogram slope redistribution through 1 nit (default: ``yes``).
++    ``no`` allows Contrast Shaping down to black. Both choices preserve zero
++    and retain the normal source-gain and peak limits. Has no effect when
++    Contrast Shaping is inactive. (``--vo=gpu-next`` only)
++
  ``--tone-mapping-adaptive-chroma-strength=<0..100>``
      Controls how strongly the ``bt2020-adaptive`` and ``maxrgb-adaptive``
      modes restore chroma removed by libplacebo's normal ITP hull processing.
 diff --git a/video/out/gpu/video.c b/video/out/gpu/video.c
-index 31fc933..1a30670 100644
+index 31fc933224ae6980f487b9cef19975436e7bca67..2310d3f28548b6e09b1dacae3d6d11c0f2fa5cd6 100644
 --- a/video/out/gpu/video.c
 +++ b/video/out/gpu/video.c
-@@ -478,6 +478,8 @@ const struct m_sub_options gl_video_conf = {
+@@ -399,6 +399,7 @@ static const struct gl_video_opts gl_video_opts_def = {
+     .gamma = 1.0f,
+     .tone_map = {
+         .curve = TONE_MAPPING_AUTO,
++        .hstm_near_black_protection = true,
+         .adaptive_chroma_strength = 50.0,
+         .ambient_gamma = 1.0,
+         .curve_param = NAN,
+@@ -478,6 +479,9 @@ const struct m_sub_options gl_video_conf = {
              {"maxrgb-itp", TONE_MAPPING_METRIC_MAXRGB_ITP},
              {"maxrgb-adaptive", TONE_MAPPING_METRIC_MAXRGB_ADAPTIVE},
              {"maxrgb-rgb", TONE_MAPPING_METRIC_MAXRGB_RGB})},
 +        {"tone-mapping-hstm-strength", OPT_FLOAT(tone_map.hstm_strength), M_RANGE(0, 100)},
 +        {"tone-mapping-hstm-overbrightening", OPT_FLOAT(tone_map.hstm_overbrightening), M_RANGE(0, 100)},
++        {"tone-mapping-hstm-near-black-protection", OPT_BOOL(tone_map.hstm_near_black_protection)},
          {"tone-mapping-auto-pq-second-pass", OPT_BOOL(tone_map.auto_pq_second_pass)},
          {"tone-mapping-adaptive-chroma-strength",
              OPT_FLOAT(tone_map.adaptive_chroma_strength), M_RANGE(0.0, 100.0)},
 diff --git a/video/out/gpu/video.h b/video/out/gpu/video.h
-index dc508c1..f3df294 100644
+index dc508c1d3670366353f361e8c71034315b01cf7e..7a8283f6f37488d0249d7a689fb270069772c8d0 100644
 --- a/video/out/gpu/video.h
 +++ b/video/out/gpu/video.h
-@@ -129,6 +129,7 @@ enum gamut_mode {
+@@ -129,6 +129,8 @@ enum gamut_mode {
  struct gl_tone_map_opts {
      int curve;
      int metric;
 +    float hstm_strength, hstm_overbrightening;
++    bool hstm_near_black_protection;
      float adaptive_chroma_strength;
      bool auto_pq_second_pass;
      float ambient_gamma;
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index 5fab09e..1a7104e 100644
+index 2c86e7a74ad6371a82a303eb4d3ad6f24f603ec7..d7f7aa345cf76ac6a7ccb0b375df2ef7e42c2cd5 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
-@@ -4807,6 +4807,8 @@ AV_NOWARN_DEPRECATED(
+@@ -4972,6 +4972,9 @@ AV_NOWARN_DEPRECATED(
      }
      pars->color_map_params.adaptive_chroma_strength =
          opts->tone_map.adaptive_chroma_strength / 100.0f;
 +    pars->color_map_params.hstm_strength = opts->tone_map.hstm_strength / 100.0f;
 +    pars->color_map_params.hstm_overbrightening = opts->tone_map.hstm_overbrightening / 100.0f;
++    pars->color_map_params.hstm_near_black_protection = opts->tone_map.hstm_near_black_protection;
      pars->color_map_params.ambient_gamma = opts->tone_map.ambient_gamma;
      pars->color_map_params.hlg_reference_peak = opts->tone_map.hlg_reference_peak;
      pars->color_map_params.hard_clip_hdr_target = opts->target_peak > 0;

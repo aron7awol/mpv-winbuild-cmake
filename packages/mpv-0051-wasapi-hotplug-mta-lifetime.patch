@@ -1,16 +1,12 @@
-From 2165c470c34bfed4e84c1c794bd4995e2067cb8c Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Sat, 12 Sep 2026 14:43:18 -0400
+From bce22317b6c7ec73fbf3ffa8bfa803274f46df78 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:52:05 -0500
 Subject: [PATCH] wasapi: retain the MTA for the audio-device notifier lifetime
 
 A property query can create the notifier on a script thread. That thread may exit before command_uninit releases the notifier. Keep the MTA alive with a usage cookie, paired once during notifier destruction, instead of balancing thread-local COM initialization across different threads.
----
- audio/out/ao_wasapi.c | 14 +++++++++++---
- audio/out/ao_wasapi.h |  1 +
- 2 files changed, 12 insertions(+), 3 deletions(-)
 
 diff --git a/audio/out/ao_wasapi.c b/audio/out/ao_wasapi.c
-index 1f00ec7ba..ee3db6770 100644
+index 1f00ec7ba52edc60233dfff6bae58f22bc4b9952..ee3db6770089f54dad5abf0dc0f6c2566d1d7385 100644
 --- a/audio/out/ao_wasapi.c
 +++ b/audio/out/ao_wasapi.c
 @@ -566,9 +566,13 @@ static bool audio_set_pause(struct ao *ao, bool paused)
@@ -44,7 +40,7 @@ index 1f00ec7ba..ee3db6770 100644
  
      return 0;
 diff --git a/audio/out/ao_wasapi.h b/audio/out/ao_wasapi.h
-index 4e7a808ca..27c16f158 100644
+index 4e7a808ca6e10a5f3f069bfdf87f1b0c2a0f4ffc..27c16f1585f274bdce5eb9f32f56ac62ca7320cd 100644
 --- a/audio/out/ao_wasapi.h
 +++ b/audio/out/ao_wasapi.h
 @@ -105,6 +105,7 @@ typedef struct wasapi_state {
@@ -55,5 +51,3 @@ index 4e7a808ca..27c16f158 100644
  } wasapi_state;
  
  char *mp_PKEY_to_str_buf(char *buf, size_t buf_size, const PROPERTYKEY *pkey);
--- 
-2.54.0.windows.1

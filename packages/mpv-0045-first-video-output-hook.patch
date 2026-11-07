@@ -1,6 +1,6 @@
-From 0000000000000000000000000000000000000045 Mon Sep 17 00:00:00 2001
-From: mpv-ht development <development@mpv-ht.invalid>
-Date: Fri, 11 Sep 2026 01:00:00 -0400
+From a47c36734e42b892e93368d27192d89d24c3a104 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:52:03 -0500
 Subject: [PATCH] player: synchronize output target before first video render
 
 Expose decoded video-params through on_video_start before VO configuration.
@@ -8,7 +8,7 @@ Yield to the core while hooks run so property and option commands remain live.
 Run once per video chain, without changing seek or steady-state cadence.
 
 diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
-index da12a7fa6..245aaf19f 100644
+index 1fddc42aec859c2d122a0c324711e6651223405b..bf8377c1e44f7893462af148261012b941c3c450 100644
 --- a/DOCS/man/input.rst
 +++ b/DOCS/man/input.rst
 @@ -2082,6 +2082,18 @@ The following hooks are currently defined:
@@ -31,7 +31,7 @@ index da12a7fa6..245aaf19f 100644
      Run before closing a file, and before actually uninitializing
      everything. It's not possible to resume playback in this state.
 diff --git a/player/core.h b/player/core.h
-index dbcfc1256..323c54213 100644
+index dbcfc1256afa0ed620b1cc28b6844741d39b79c6..323c54213c8303ab0564226f0fde9c2153397278 100644
 --- a/player/core.h
 +++ b/player/core.h
 @@ -180,6 +180,8 @@ struct vo_chain {
@@ -54,10 +54,10 @@ index dbcfc1256..323c54213 100644
      // next_frame[0] is the next frame, next_frame[1] the one after that.
      // The +1 is for adding 1 additional frame in backstep mode.
 diff --git a/player/video.c b/player/video.c
-index c47787348..a28faf822 100644
+index eabd5440183570f059e893eac987cd4441270507..29b5bc6bc4e717bbfb6ed4af77513883f89f0c1a 100644
 --- a/player/video.c
 +++ b/player/video.c
-@@ -1051,6 +1051,14 @@ void write_video(struct MPContext *mpctx)
+@@ -1047,6 +1047,14 @@ void write_video(struct MPContext *mpctx)
      struct vo_chain *vo_c = mpctx->vo_chain;
      struct vo *vo = vo_c->vo;
  
@@ -72,7 +72,7 @@ index c47787348..a28faf822 100644
      if (vo_c->filter->reconfig_happened) {
          mp_notify(mpctx, MPV_EVENT_VIDEO_RECONFIG, NULL);
          vo_c->filter->reconfig_happened = false;
-@@ -1068,6 +1076,19 @@ void write_video(struct MPContext *mpctx)
+@@ -1064,6 +1072,19 @@ void write_video(struct MPContext *mpctx)
      MP_TRACE(mpctx, "video_output_image: r=%d/eof=%d/st=%s\n", r, logical_eof,
               mp_status_str(mpctx->video_status));
  

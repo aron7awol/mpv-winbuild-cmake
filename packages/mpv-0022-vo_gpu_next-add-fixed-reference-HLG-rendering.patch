@@ -1,17 +1,11 @@
-From 4f54b04701055636d8683a3dc7f22bb2a8f16994 Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Wed, 19 Aug 2026 00:01:29 -0400
+From c2541e74019eef5bbf6664aa1aad0d58ec3f2abd Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:49:52 -0500
 Subject: [PATCH] vo_gpu_next: add fixed-reference HLG rendering
 
----
- DOCS/man/options.rst    | 5 +++++
- video/out/gpu/video.c   | 2 ++
- video/out/gpu/video.h   | 1 +
- video/out/vo_gpu_next.c | 1 +
- 4 files changed, 9 insertions(+)
 
 diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
-index 41e6f4768..c9a8ca4b0 100644
+index 0ada9af70388a33346105108e7d3f88aea4ea0f2..279c1fd632f99efd175e9ea288c7eebf98654ecc 100644
 --- a/DOCS/man/options.rst
 +++ b/DOCS/man/options.rst
 @@ -7845,6 +7845,11 @@ them.
@@ -27,7 +21,7 @@ index 41e6f4768..c9a8ca4b0 100644
      When using ``--hdr-compute-peak``, allow delaying the detected peak by a
      frame when beneficial for performance. In particular, this is required to
 diff --git a/video/out/gpu/video.c b/video/out/gpu/video.c
-index 8ed9a6bda..d748805fd 100644
+index 8ed9a6bdad0b0211c7f6242562d7a8785245a6eb..d748805fd05d280e790c5daa9705c6ee52f8b9f6 100644
 --- a/video/out/gpu/video.c
 +++ b/video/out/gpu/video.c
 @@ -499,6 +499,8 @@ const struct m_sub_options gl_video_conf = {
@@ -40,7 +34,7 @@ index 8ed9a6bda..d748805fd 100644
              M_RANGE(0.0, 100.0)},
          {"hdr-peak-decay-rate", OPT_FLOAT(tone_map.decay_rate),
 diff --git a/video/out/gpu/video.h b/video/out/gpu/video.h
-index 2f2fc805c..097611b87 100644
+index 2f2fc805c0eabe363b6487238383a8b048c799f2..097611b87809c839cd70da2a72cde9a916aa6c3d 100644
 --- a/video/out/gpu/video.h
 +++ b/video/out/gpu/video.h
 @@ -133,6 +133,7 @@ struct gl_tone_map_opts {
@@ -52,10 +46,10 @@ index 2f2fc805c..097611b87 100644
      float scene_threshold_low;
      float scene_threshold_high;
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index 6f2fd0907..071ec0129 100644
+index 4c741ac977334872098538a7136fafd4abcc8369..d6bd86e055a175f1b024d1d69475978ff3732697 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
-@@ -3197,6 +3197,7 @@ AV_NOWARN_DEPRECATED(
+@@ -3353,6 +3353,7 @@ AV_NOWARN_DEPRECATED(
      }
      pars->color_map_params.adaptive_chroma_strength =
          opts->tone_map.adaptive_chroma_strength / 100.0f;
@@ -63,5 +57,3 @@ index 6f2fd0907..071ec0129 100644
      pars->color_map_params.hard_clip_hdr_target = opts->target_peak > 0;
      pars->color_map_params.inverse_tone_mapping = opts->tone_map.inverse;
      pars->color_map_params.contrast_recovery = opts->tone_map.contrast_recovery;
--- 
-2.54.0.windows.1

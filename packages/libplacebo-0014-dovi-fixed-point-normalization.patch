@@ -1,20 +1,12 @@
-From c1e1a8e3bb2e2dc38495f43b0bf43a08871c30be Mon Sep 17 00:00:00 2001
-From: mpv-ht <mpv-ht@local>
-Date: Tue, 18 Aug 2026 20:05:46 -0400
+From 8c26f6ada8ef308c126e199ec946760cc61f33b6 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:53:00 -0500
 Subject: [PATCH] colorspace: reproduce Dolby fixed-point reconstruction stages
 
 Preserve the RPU BL/VDR fixed-point representation, clamp carrier codes before mapping, truncate reshape output to the normative 16-bit intermediate, and round the reconstructed signal into VDR bit depth after optional residual composition. Add a real Profile 5 RPU GPU regression.
----
- src/include/libplacebo/colorspace.h           |  15 ++
- src/include/libplacebo/utils/libav_internal.h |  18 ++-
- src/shaders.h                                 |  10 ++
- src/shaders/colorspace.c                      | 130 ++++++++++++++++--
- src/tests/colorspace.c                        |  24 ++++
- src/tests/gpu_tests.c                         | 104 ++++++++++++++
- 6 files changed, 286 insertions(+), 15 deletions(-)
 
 diff --git a/src/include/libplacebo/colorspace.h b/src/include/libplacebo/colorspace.h
-index 64c925e9..a954ff23 100644
+index 64c925e985535257fd9a9361a2fc1a8a50047a45..a954ff23432bb91f5d0f1b4ce8398762adb03988 100644
 --- a/src/include/libplacebo/colorspace.h
 +++ b/src/include/libplacebo/colorspace.h
 @@ -130,11 +130,26 @@ PL_API bool pl_bit_encoding_equal(const struct pl_bit_encoding *b1,
@@ -45,10 +37,10 @@ index 64c925e9..a954ff23 100644
      struct pl_reshape_data {
          uint8_t num_pivots;
 diff --git a/src/include/libplacebo/utils/libav_internal.h b/src/include/libplacebo/utils/libav_internal.h
-index 94d6203c..9b93e9cf 100644
+index 4451c2ae54906becb4fbfa76cfcb07b04b3da370..0c9ae2a907d74880c88697b1f311605d856203bf 100644
 --- a/src/include/libplacebo/utils/libav_internal.h
 +++ b/src/include/libplacebo/utils/libav_internal.h
-@@ -924,20 +924,34 @@ PL_LIBAV_API void pl_map_dovi_metadata(struct pl_dovi_metadata *out,
+@@ -951,20 +951,34 @@ PL_LIBAV_API void pl_map_dovi_metadata(struct pl_dovi_metadata *out,
      mapping = av_dovi_get_mapping(data);
      color = av_dovi_get_color(data);
  
@@ -86,7 +78,7 @@ index 94d6203c..9b93e9cf 100644
          }
          for (int i = 0; i < csrc->num_pivots - 1; i++) {
 diff --git a/src/shaders.h b/src/shaders.h
-index b8e1de62..e92f10e3 100644
+index 9c912f5984952345a1cbe925888d2ce3029a9771..d8c0f9c77c37c3e6424eadbcdfaeb4a884c3dd32 100644
 --- a/src/shaders.h
 +++ b/src/shaders.h
 @@ -250,6 +250,16 @@ struct pl_dovi_metadata;
@@ -107,7 +99,7 @@ index b8e1de62..e92f10e3 100644
  
  enum pl_shader_obj_type {
 diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
-index 68cab59b..5d16a132 100644
+index d3b0b0d418cfc2c82e9075ea11eb825d125d78a1..1fc15558aa18dffe83c5230ff0084396fea7c86d 100644
 --- a/src/shaders/colorspace.c
 +++ b/src/shaders/colorspace.c
 @@ -171,7 +171,18 @@ void pl_shader_dovi_reshape(pl_shader sh, const struct pl_dovi_metadata *data)
@@ -277,7 +269,7 @@ index 68cab59b..5d16a132 100644
      if (memcmp(&tr, &pl_transform3x3_identity, sizeof(tr))) {
          ident_t cmat = sh_var(sh, (struct pl_shader_var) {
 diff --git a/src/tests/colorspace.c b/src/tests/colorspace.c
-index 7112ffba..1eb402b9 100644
+index 7112ffba73226e40066b6d4e6af6881547efe1e5..1eb402b95e351675692a5671a36a83915cf093a1 100644
 --- a/src/tests/colorspace.c
 +++ b/src/tests/colorspace.c
 @@ -169,6 +169,30 @@ int main()
@@ -312,7 +304,7 @@ index 7112ffba..1eb402b9 100644
      bt709 = pl_raw_primaries_get(PL_COLOR_PRIM_BT_709);
      bt2020 = pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020);
 diff --git a/src/tests/gpu_tests.c b/src/tests/gpu_tests.c
-index fd4a12c6..a43c0a9d 100644
+index 120f0b3e4d0462d29d661a8363820ced70a4fefb..5b7c072d5f3a7137a0f848e57c7533862aa88de4 100644
 --- a/src/tests/gpu_tests.c
 +++ b/src/tests/gpu_tests.c
 @@ -888,6 +888,110 @@ static void pl_shader_tests(pl_gpu gpu)
@@ -426,5 +418,3 @@ index fd4a12c6..a43c0a9d 100644
      // Test deinterlacing
      sh = pl_dispatch_begin(dp);
      pl_shader_deinterlace(sh, pl_deinterlace_source( .cur = pl_field_pair(src) ), NULL);
--- 
-2.54.0.windows.1

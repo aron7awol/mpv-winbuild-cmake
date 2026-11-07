@@ -1,15 +1,11 @@
-From d8518ea605f5f4bb361e657314ee8013ca52b295 Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Wed, 12 Aug 2026 14:02:54 -0400
+From e3f433d636e5e754eaf67282ba0c789b760d30cd Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:49:49 -0500
 Subject: [PATCH] windows: brand application registration as mpv-ht
 
----
- osdep/mpv.rc         |  8 +++---
- osdep/w32_register.c | 63 ++++++++++++++++++++++----------------------
- 2 files changed, 35 insertions(+), 36 deletions(-)
 
 diff --git a/osdep/mpv.rc b/osdep/mpv.rc
-index e0a20a2a2..6e322c9d1 100644
+index e0a20a2a252fc3f0b5119b0beb0ab77c55c5f519..44441fe3477f4ba4602bde743f9471ffe5f9ec80 100644
 --- a/osdep/mpv.rc
 +++ b/osdep/mpv.rc
 @@ -30,12 +30,12 @@ VS_VERSION_INFO VERSIONINFO
@@ -30,7 +26,7 @@ index e0a20a2a2..6e322c9d1 100644
              }
          }
 diff --git a/osdep/w32_register.c b/osdep/w32_register.c
-index 214ce7210..117097157 100644
+index 214ce7210d41acc4011ec08c7fae27fb203a970e..e0c762e5d4e1a1c52eff7e942c96f3eb9ed088cf 100644
 --- a/osdep/w32_register.c
 +++ b/osdep/w32_register.c
 @@ -32,8 +32,8 @@
@@ -205,5 +201,3 @@ index 214ce7210..117097157 100644
  
      wchar_t *shortcut_path = w32_get_shortcut_path(log);
      if (shortcut_path) {
--- 
-2.54.0.windows.1

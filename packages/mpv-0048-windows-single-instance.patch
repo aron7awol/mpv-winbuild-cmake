@@ -1,13 +1,14 @@
-From: mpv-ht <build@mpv-ht.invalid>
-Date: Fri, 11 Sep 2026 14:00:00 -0400
-Subject: [PATCH] win32: reuse the primary player before scripts and display setup
+From 68a6c5fe9f895467add00f0659ed40f9eb8526a0 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:52:04 -0500
+Subject: [PATCH] win32: reuse the primary player before scripts and display
+ setup
 
 Read the persistent single-instance preference, serialize startup, and forward
 files with acknowledged IPC commands. Keep independent diagnostic launches.
 
----
 diff --git a/meson.build b/meson.build
-index afb5cb79f..3ad7cb176 100644
+index afb5cb79fffec249201e6082a3a5619fce650f88..3ad7cb1762c5c75fb24f14276a79fc945f1012b8 100644
 --- a/meson.build
 +++ b/meson.build
 @@ -542,6 +542,7 @@ if features['win32-desktop']
@@ -19,7 +20,7 @@ index afb5cb79f..3ad7cb176 100644
                       'video/out/win32/displayconfig.c',
                       'video/out/win32/droptarget.c',
 diff --git a/options/options.c b/options/options.c
-index 3d7c3dc7a..15e1dee31 100644
+index 3d7c3dc7aba1617013c03749d1e825936ee73e00..15e1dee31250c15bc7cec91392716fb95b9a27c1 100644
 --- a/options/options.c
 +++ b/options/options.c
 @@ -923,6 +923,7 @@ static const m_option_t mp_opts[] = {
@@ -39,7 +40,7 @@ index 3d7c3dc7a..15e1dee31 100644
      .position_resume = true,
      .watch_history_path = "~~state/watch_history.jsonl",
 diff --git a/options/options.h b/options/options.h
-index fa48bc7c6..15324915d 100644
+index fa48bc7c67e585a0d70526bd50a5237417bfabb2..15324915d8f3f120cf42179ea0cc0089bffb3e0f 100644
 --- a/options/options.h
 +++ b/options/options.h
 @@ -405,6 +405,7 @@ typedef struct MPOpts {
@@ -52,7 +53,7 @@ index fa48bc7c6..15324915d 100644
  
 diff --git a/osdep/w32_single_instance.c b/osdep/w32_single_instance.c
 new file mode 100644
-index 000000000..144caf227
+index 0000000000000000000000000000000000000000..144caf2279127edf0f4ddbd0cfcb645241232790
 --- /dev/null
 +++ b/osdep/w32_single_instance.c
 @@ -0,0 +1,240 @@
@@ -298,7 +299,7 @@ index 000000000..144caf227
 +}
 diff --git a/osdep/w32_single_instance.h b/osdep/w32_single_instance.h
 new file mode 100644
-index 000000000..713787c7b
+index 0000000000000000000000000000000000000000..713787c7b2084cea4afe49794c902bdf72b40b17
 --- /dev/null
 +++ b/osdep/w32_single_instance.h
 @@ -0,0 +1,3 @@
@@ -306,7 +307,7 @@ index 000000000..713787c7b
 +struct MPContext;
 +int mp_w32_single_instance(struct MPContext *mpctx);
 diff --git a/player/main.c b/player/main.c
-index 6891c9d5a..cefd4cf00 100644
+index 6891c9d5a1d38fcae363bf12fc9512cb855ecc3a..cefd4cf007777f8b9d51be6d22602052d287a750 100644
 --- a/player/main.c
 +++ b/player/main.c
 @@ -82,6 +82,7 @@ static const char def_config[] =

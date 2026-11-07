@@ -1,54 +1,22 @@
-From c3ff033fbb9d429af426c31274550fb807fc6baf Mon Sep 17 00:00:00 2001
-From: HT_Player <noreply@example.com>
-Date: Wed, 29 Jul 2026 12:41:45 -0400
-Subject: [PATCH] video: expose Dolby Vision enhancement layer type
+From 02538a9ebfd2fbab7798683842cdafd603baa11b Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:49:28 -0500
+Subject: [PATCH] video: classify and preserve Dolby Vision enhancement layer
+ type
 
-Profile 7 Dolby Vision streams carry either a minimum enhancement layer
-(MEL), which has no residual picture data, or a full enhancement layer (FEL).
-FFmpeg already hands mpv the parsed RPU, but mpv exposes neither form.
-
-Add video-params/dolby-vision-el-type, reporting "mel" or "fel". Derive the
-type from the RPU's residual flag and NLQ parameters, but retain it only when
-container metadata establishes that an enhancement layer exists. MEL can
-carry LINEAR_DZ NLQ with zero offsets, slopes and thresholds and a normalized
-vdr_in_max of one in all three components; NLQ presence alone is not FEL.
-Single-layer profiles 5 and 8 must leave the property unavailable.
-
-Handle both Dolby Vision layouts:
-
-- For a single-track interleaved BL+EL stream, use the configuration record's
-  bl_present_flag && el_present_flag.
-- For a dual-track group, mark the EL-only member, preserve its classification
-  through decoding, and copy it onto the paired BL frame. Also mirror the EL
-  stream's DV profile and level onto the visible BL track.
-- Because pairing occurs after the output chain captures its input parameters,
-  let video-params use the current output-frame classification as a fallback.
-
-Keep the field out of mp_image_params_equal() and propagate it through
-mp_image_params_update_dynamic(), since RPU data is frame-dynamic and must not
-trigger VO reconfiguration.
----
- DOCS/interface-changes/dovi-el-type.txt |  1 +
- DOCS/man/input.rst                      | 11 +++++++++
- demux/demux_lavf.c                      | 11 +++++++++
- demux/stheader.h                        |  1 +
- filters/f_enhancement_pair.c            |  8 ++++++-
- player/command.c                        | 13 ++++++++++-
- video/decode/vd_lavc.c                  |  7 ++++++
- video/mp_image.c                        | 31 +++++++++++++++++++++++++
- video/mp_image.h                        | 16 +++++++++++++
- 9 files changed, 97 insertions(+), 2 deletions(-)
- create mode 100644 DOCS/interface-changes/dovi-el-type.txt
+Consolidates the published .76 changes without modifying the final source.
+Original: 0001-dovi-el-type.patch
+Original: 0075-preserve-copied-dovi-el-type.patch
 
 diff --git a/DOCS/interface-changes/dovi-el-type.txt b/DOCS/interface-changes/dovi-el-type.txt
 new file mode 100644
-index 000000000..bd0621ea3
+index 0000000000000000000000000000000000000000..bd0621ea348df197bee8f49ade2dd184b1cadb60
 --- /dev/null
 +++ b/DOCS/interface-changes/dovi-el-type.txt
 @@ -0,0 +1 @@
 +add `video-params/dolby-vision-el-type` sub-property (`fel` or `mel`)
 diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
-index 9f41019f6..55402dd64 100644
+index 9f41019f61fa482964a2cfb0ff6cfc080010c415..55402dd641c6442ea4c1611252de61ee46678b35 100644
 --- a/DOCS/man/input.rst
 +++ b/DOCS/man/input.rst
 @@ -2921,6 +2921,16 @@ Property list
@@ -77,7 +45,7 @@ index 9f41019f6..55402dd64 100644
              "prim-red-y"        MPV_FORMAT_DOUBLE
              "prim-green-x"      MPV_FORMAT_DOUBLE
 diff --git a/demux/demux_lavf.c b/demux/demux_lavf.c
-index 35f3a7bdb..4556bca60 100644
+index 35f3a7bdb4124229a9472a88cf5aa4d9729d117a..4556bca60881e21c62a27649c4086cc359f23362 100644
 --- a/demux/demux_lavf.c
 +++ b/demux/demux_lavf.c
 @@ -785,6 +785,7 @@ static void handle_new_stream(demuxer_t *demuxer, int i)
@@ -106,7 +74,7 @@ index 35f3a7bdb..4556bca60 100644
      struct sh_stream_group *group = talloc_zero(bl_sh, struct sh_stream_group);
      MP_TARRAY_APPEND(group, group->members, group->num_members, bl_sh);
 diff --git a/demux/stheader.h b/demux/stheader.h
-index 01754746b..972c9944a 100644
+index 01754746b2372c6fdeeda491d90775a1082cfa13..972c9944a95af682f5a9795fa9978314032fb5ac 100644
 --- a/demux/stheader.h
 +++ b/demux/stheader.h
 @@ -176,6 +176,7 @@ struct mp_codec_params {
@@ -118,7 +86,7 @@ index 01754746b..972c9944a 100644
      // STREAM_VIDEO + STREAM_AUDIO
      int bits_per_coded_sample;
 diff --git a/filters/f_enhancement_pair.c b/filters/f_enhancement_pair.c
-index 7b74d10fc..8ee9b165e 100644
+index 7b74d10fc119fc21817c10540ea32d1ab22efa72..8ee9b165e1fdd605262ab8a6e6f8ab7812312177 100644
 --- a/filters/f_enhancement_pair.c
 +++ b/filters/f_enhancement_pair.c
 @@ -100,7 +100,13 @@ static struct mp_image *take_head(struct mp_image ***queue, int *num)
@@ -137,7 +105,7 @@ index 7b74d10fc..8ee9b165e 100644
      bl->dovi = av_buffer_ref(el->dovi);
      if (!bl->dovi)
 diff --git a/player/command.c b/player/command.c
-index b6d4f639a..e467d4441 100644
+index b6d4f639a4a98668e6954b4133e39fc35708a87b..e467d44411c6596a3dd7374fddfd3ca0af4183ae 100644
 --- a/player/command.c
 +++ b/player/command.c
 @@ -2574,6 +2574,9 @@ static int property_imgparams(const struct mp_image_params *p, int action, void
@@ -168,7 +136,7 @@ index b6d4f639a..e467d4441 100644
          // Simplistic fallback for stupid scripts querying "width"/"height"
          // before the first frame is decoded.
 diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
-index 6ecb233b4..36fad3b3c 100644
+index 6ecb233b49d837a33474777fcc305590264b5543..36fad3b3c6a92107eb7d3b9e7c8d061e501d51b6 100644
 --- a/video/decode/vd_lavc.c
 +++ b/video/decode/vd_lavc.c
 @@ -1319,6 +1319,13 @@ static int decode_frame(struct mp_filter *vd)
@@ -186,10 +154,18 @@ index 6ecb233b4..36fad3b3c 100644
          MP_ERR(vd, "CUDA frame without data. This is a FFmpeg bug.\n");
          talloc_free(mpi);
 diff --git a/video/mp_image.c b/video/mp_image.c
-index 1ce055580..3146660c1 100644
+index 1ce05558070a49ddd1061994ca5841a68eab0d9b..82b5f032ee95e34fc191afc0bf0d982336485369 100644
 --- a/video/mp_image.c
 +++ b/video/mp_image.c
-@@ -900,6 +900,10 @@ void mp_image_params_update_dynamic(struct mp_image_params *dst,
+@@ -561,6 +561,7 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
+     dst->params.primaries_orig = src->params.primaries_orig;
+     dst->params.transfer_orig = src->params.transfer_orig;
+     dst->params.sys_orig = src->params.sys_orig;
++    dst->params.dovi_el_type = src->params.dovi_el_type;
+     dst->params.no_dovi = src->params.no_dovi;
+     dst->params.no_enhancement_layer = src->params.no_enhancement_layer;
+ 
+@@ -900,6 +901,10 @@ void mp_image_params_update_dynamic(struct mp_image_params *dst,
                                      bool has_peak_detect_values)
  {
      dst->repr.dovi = src->repr.dovi;
@@ -200,7 +176,7 @@ index 1ce055580..3146660c1 100644
      // Don't overwrite peak-detected HDR metadata if available.
      float max_pq_y = dst->color.hdr.max_pq_y;
      float avg_pq_y = dst->color.hdr.avg_pq_y;
-@@ -1185,6 +1189,33 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
+@@ -1185,6 +1190,33 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
      if (sd) {
  #ifdef PL_HAVE_LAV_DOLBY_VISION
          const AVDOVIMetadata *metadata = (const AVDOVIMetadata *)sd->buf->data;
@@ -235,7 +211,7 @@ index 1ce055580..3146660c1 100644
          const AVDOVIRpuDataHeader *header = av_dovi_get_header(metadata);
          if (header->disable_residual_flag)
 diff --git a/video/mp_image.h b/video/mp_image.h
-index f5c156281..20643388c 100644
+index f5c1562815a2124a1e591dd3f8ab58d7265de203..20643388cbe19e819516c3762831be1d6abeaba5 100644
 --- a/video/mp_image.h
 +++ b/video/mp_image.h
 @@ -38,6 +38,18 @@
@@ -268,5 +244,3 @@ index f5c156281..20643388c 100644
      // Flags for f_enhancement_pair.c to not inherit flags from EL.
      bool no_dovi;
      bool no_enhancement_layer;
--- 
-2.54.0.windows.1

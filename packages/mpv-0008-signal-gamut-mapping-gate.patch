@@ -1,17 +1,14 @@
-From b2dfbe050e84f393d1e787c2070f931e52ed8c2b Mon Sep 17 00:00:00 2001
-From: mpv-ht <mpv-ht@local>
-Date: Sat, 1 Aug 2026 23:54:21 -0400
+From 02b426c71f1618568b0ec3b1686e53e7d244af31 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:49:32 -0500
 Subject: [PATCH] vo_gpu_next: gate gamut mapping on signal primaries
 
----
- video/out/vo_gpu_next.c | 34 +++++++++++++++++++++++++++++++++-
- 1 file changed, 33 insertions(+), 1 deletion(-)
 
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index f84d73d..48dd15d 100644
+index 8e2073ba2202dc87111eccac901ebf010d332de2..2b8560fbe5a7e390e92b415c0f1c21ab6a70e865 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
-@@ -1484,7 +1484,39 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1564,7 +1564,39 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
      bool strict_sw_params = target_hint && p->next_opts->target_hint_strict;
      apply_target_options(p, &target, hint.hdr.min_luma, strict_sw_params,
                           target_ref_luma, &target_csp);
@@ -52,5 +49,3 @@ index f84d73d..48dd15d 100644
  #if PL_API_VER >= 362
      clip_gamut = clip_gamut && target.color.transfer != PL_COLOR_TRC_SCRGB;
  #endif
--- 
-2.55.0

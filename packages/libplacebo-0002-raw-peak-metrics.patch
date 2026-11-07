@@ -1,19 +1,11 @@
-From c98ed1f6c62361584137ba75306866b535ee3fcc Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Wed, 29 Jul 2026 16:57:53 -0400
+From 3591c0ee7912e26be6ffbdfd428e32131505cd66 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:52:56 -0500
 Subject: [PATCH] peak detection: expose raw frame metrics
 
----
- meson.build                                 |   1 +
- src/include/libplacebo/renderer.h           |   5 +
- src/include/libplacebo/shaders/colorspace.h |  29 ++++
- src/renderer.c                              |   8 +-
- src/shaders/colorspace.c                    | 139 +++++++++++++++++---
- src/tests/gpu_tests.c                       |  20 ++-
- 6 files changed, 180 insertions(+), 22 deletions(-)
 
 diff --git a/meson.build b/meson.build
-index 521f4c01..7801d57a 100644
+index 521f4c01ae4554e445639b7fc13f8192b985b976..7801d57a7d5ec62b095815e131248b906fd99fa3 100644
 --- a/meson.build
 +++ b/meson.build
 @@ -12,6 +12,7 @@ project('libplacebo', ['c', 'cpp'],
@@ -25,7 +17,7 @@ index 521f4c01..7801d57a 100644
        '370': 'deprecate pl_avdovi_metadata_supported and pl_avframe_params.map_dovi_force',
        '369': 'add pl_color_decode_args.enhancement_layer',
 diff --git a/src/include/libplacebo/renderer.h b/src/include/libplacebo/renderer.h
-index 08466bd3..81f3f712 100644
+index 08466bd318169974bad0f3f87b6f465b0ae5223d..81f3f712c7072be14f0aec6561737b2d126590a5 100644
 --- a/src/include/libplacebo/renderer.h
 +++ b/src/include/libplacebo/renderer.h
 @@ -754,6 +754,11 @@ PL_API void pl_renderer_flush_cache(pl_renderer rr);
@@ -41,7 +33,7 @@ index 08466bd3..81f3f712 100644
  //
  // NOTE: Frames must be sorted by timestamp, i.e. `timestamps` must be
 diff --git a/src/include/libplacebo/shaders/colorspace.h b/src/include/libplacebo/shaders/colorspace.h
-index 81236997..373e3f6b 100644
+index 81236997a86ad7da87935a25c514ab93c148633f..373e3f6bc1e10270c53d6f1c32caaf08d4e9f749 100644
 --- a/src/include/libplacebo/shaders/colorspace.h
 +++ b/src/include/libplacebo/shaders/colorspace.h
 @@ -168,6 +168,11 @@ struct pl_peak_detect_params {
@@ -88,7 +80,7 @@ index 81236997..373e3f6b 100644
  // the detected dynamic HDR10+ metadata parameters. The other fields of
  // `metadata` are not written to. Returns whether or not any values were
 diff --git a/src/renderer.c b/src/renderer.c
-index f2fa8913..9cf9a907 100644
+index f2fa89138a5539c5a5fc38f3e24d8b6e1477b2aa..9cf9a90727532b62c63bafb119e3b637a3800cdc 100644
 --- a/src/renderer.c
 +++ b/src/renderer.c
 @@ -1212,7 +1212,7 @@ static void hdr_update_peak(struct pass_state *pass)
@@ -114,7 +106,7 @@ index f2fa8913..9cf9a907 100644
      enum plane_type type;
      struct pl_plane plane;
 diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
-index 197f819f..4a1fa61c 100644
+index b91e971ad060972bea211d4386868e632c272ec3..703822aef1d32925ed40791692be36d1e86e85f2 100644
 --- a/src/shaders/colorspace.c
 +++ b/src/shaders/colorspace.c
 @@ -996,6 +996,11 @@ enum {
@@ -423,7 +415,7 @@ index 197f819f..4a1fa61c 100644
  {
      if (!state || state->type != PL_SHADER_OBJ_COLOR_MAP)
 diff --git a/src/tests/gpu_tests.c b/src/tests/gpu_tests.c
-index df2c7f8e..965221f5 100644
+index df2c7f8ed29baa145e11c60b6196914f78a86613..965221f58168d408e7141aad69c752f8b2697608 100644
 --- a/src/tests/gpu_tests.c
 +++ b/src/tests/gpu_tests.c
 @@ -768,22 +768,36 @@ static void pl_shader_tests(pl_gpu gpu)
@@ -466,5 +458,3 @@ index df2c7f8e..965221f5 100644
      }
  
      pl_dispatch_abort(dp, &sh);
--- 
-2.54.0.windows.1

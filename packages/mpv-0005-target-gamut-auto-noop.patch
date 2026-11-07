@@ -1,6 +1,6 @@
-From 4b1f7c9d0e2a3b5c6d7e8f9a0b1c2d3e4f5a6b70 Mon Sep 17 00:00:00 2001
-From: mpv-ht <mpv-ht@local>
-Date: Thu, 30 Jul 2026 00:00:00 -0400
+From e52ac76d15a9bd64d03fa222be1a1fd7f7af506c Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:49:30 -0500
 Subject: [PATCH] vo_gpu_next: ignore unparsable --target-gamut values
 
 --target-gamut is a string option and both use sites gate on
@@ -15,14 +15,12 @@ the intended "no gamut constraint".
 Parse into a temporary and assign only when the result is a valid primaries
 triangle, so `--target-gamut=auto` - and any other unrecognised value - is a
 no-op instead of silent metadata corruption.
----
- video/out/vo_gpu_next.c | 16 ++++++++++++----
- 1 file changed, 12 insertions(+), 4 deletions(-)
 
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index df7cf522a1cc6664e972b888a02677b53ca639dd..5afb4c71f54e40d7fc4e75cfde10ecfd0c5d8dc5 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
-@@ -1112,8 +1112,12 @@ static void apply_target_options(struct priv *p, struct pl_frame *target,
+@@ -1192,8 +1192,12 @@ static void apply_target_options(struct priv *p, struct pl_frame *target,
      }
      if ((!target->color.hdr.min_luma || !hint))
          apply_target_contrast(p, &target->color, min_luma);
@@ -37,7 +35,7 @@ diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
      int dither_depth = opts->dither_depth;
      if (dither_depth == 0) {
          struct ra_swapchain *sw = p->ra_ctx->swapchain;
-@@ -1390,8 +1394,12 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1470,8 +1474,12 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
          }
          if (opts->target_prim)
              hint.primaries = opts->target_prim;
@@ -52,5 +50,3 @@ diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
          if (opts->target_trc)
              hint.transfer = opts->target_trc;
          if (opts->target_peak)
--- 
-2.50.1

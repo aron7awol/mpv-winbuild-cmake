@@ -1,14 +1,15 @@
-From: mpv-ht <mpv-ht@localhost>
-Date: Thu, 1 Oct 2026 12:00:00 -0400
-Subject: [PATCH] color map: raise Perceptual endpoint before clipping to physical display
+From c46171f488234a9e4c68750bb63b5ee3fd5280b6 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:54:45 -0500
+Subject: [PATCH] color map: raise Perceptual endpoint before clipping to
+ physical display
 
 Map measured forward Perceptual HDR to an optional higher endpoint, then clip
 RGB channels at the real display peak. Keep output metadata unchanged and
 report both the creative curve target and physical ceiling to the Analyzer.
 
----
 diff --git a/src/include/libplacebo/shaders/colorspace.h b/src/include/libplacebo/shaders/colorspace.h
-index dda6c920..815c28de 100644
+index dda6c920e75bb2663c29680f90a4acc32cd64cbb..815c28de3d52d01aff1196761a0d81120884c3c6 100644
 --- a/src/include/libplacebo/shaders/colorspace.h
 +++ b/src/include/libplacebo/shaders/colorspace.h
 @@ -411,6 +411,11 @@ struct pl_color_map_params {
@@ -32,10 +33,10 @@ index dda6c920..815c28de 100644
      float base[PL_TONE_CURVE_SAMPLES];
      float output[PL_TONE_CURVE_SAMPLES];
 diff --git a/src/renderer.c b/src/renderer.c
-index 68857a57..76d28989 100644
+index 702684792af9bf3fa24ee9bd04c039ddb7bf9ebe..d649a797121e3b3b82ed03f8afa290c79a0d8583 100644
 --- a/src/renderer.c
 +++ b/src/renderer.c
-@@ -3080,7 +3080,10 @@ static pl_tex measure_rgb_ray_peak(struct pass_state *pass,
+@@ -3107,7 +3107,10 @@ static pl_tex measure_rgb_ray_peak(struct pass_state *pass,
          pl_hash_merge(&signature, pl_var_hash(pass->image.color.transfer));
          pl_hash_merge(&signature, ((uint64_t) src->params.w << 32) | src->params.h);
          return pcurve_fit(rr->gpu, rr->dp, &rr->p_curve_state, prev,
@@ -48,7 +49,7 @@ index 68857a57..76d28989 100644
              pass->image.scene_cut);
      }
 diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
-index 0d9db79e..6ae3eb6d 100644
+index 0d9db79ed98fe47e5256141cbe2b9fd7e4f02ddb..6ae3eb6dce3fde977eb6197b070181dba54f194b 100644
 --- a/src/shaders/colorspace.c
 +++ b/src/shaders/colorspace.c
 @@ -3054,6 +3054,7 @@ static void record_tone_curve(struct pl_tone_curve *out,

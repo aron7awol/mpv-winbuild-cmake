@@ -1,16 +1,11 @@
-From 5df9dda143cc224cc2bd1a05d5aa1bd92b3fa691 Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Wed, 19 Aug 2026 00:01:29 -0400
+From 01592fd2eb242416a5b76e4e70b1cb3d79b02862 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:53:01 -0500
 Subject: [PATCH] colorspace: add fixed-reference HLG rendering
 
----
- src/include/libplacebo/shaders/colorspace.h |  5 +++++
- src/renderer.c                              | 12 ++++++++++--
- src/shaders/colorspace.c                    |  3 +++
- 3 files changed, 18 insertions(+), 2 deletions(-)
 
 diff --git a/src/include/libplacebo/shaders/colorspace.h b/src/include/libplacebo/shaders/colorspace.h
-index cae1cfec..d948a4ac 100644
+index cae1cfece6e5622540e554d1843f3e38e61a55ae..d948a4ac033a0d5bca9d3e742b73d1834f04c99b 100644
 --- a/src/include/libplacebo/shaders/colorspace.h
 +++ b/src/include/libplacebo/shaders/colorspace.h
 @@ -370,6 +370,11 @@ struct pl_color_map_params {
@@ -26,10 +21,10 @@ index cae1cfec..d948a4ac 100644
      // result is present. They are intentionally ignored for authored metadata.
      enum pl_tone_map_metric tone_mapping_metric;
 diff --git a/src/renderer.c b/src/renderer.c
-index 56ccaab0..f5e78ea2 100644
+index 1a8b829d6e126470712f56ae47e5dcf6eb1dffb1..aecc683ac36a1bb6dd806d2688c22fcfea5f0317 100644
 --- a/src/renderer.c
 +++ b/src/renderer.c
-@@ -1248,10 +1248,12 @@ hook_error:
+@@ -1270,10 +1270,12 @@ hook_error:
  static bool causal_scene_eligible(const struct pass_state *pass)
  {
      const struct pl_render_params *params = pass->params;
@@ -44,7 +39,7 @@ index 56ccaab0..f5e78ea2 100644
             !pl_color_space_equal(&pass->image.color, &pass->target.color);
  }
  
-@@ -4078,6 +4080,12 @@ static void pass_fix_frames(struct pass_state *pass)
+@@ -4104,6 +4106,12 @@ static void pass_fix_frames(struct pass_state *pass)
      if (image) {
          fix_frame(image);
          pl_color_space_infer_map(&image->color, &target->color);
@@ -58,10 +53,10 @@ index 56ccaab0..f5e78ea2 100644
      } else {
          fix_frame(target);
 diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
-index 5d16a132..9cfb63f7 100644
+index 1fc15558aa18dffe83c5230ff0084396fea7c86d..862a78946c9deefe57cab7f55019d8e8a242b7ba 100644
 --- a/src/shaders/colorspace.c
 +++ b/src/shaders/colorspace.c
-@@ -2824,6 +2824,9 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+@@ -2826,6 +2826,9 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
  
      params = PL_DEF(params, &pl_color_map_default_params);
      pl_color_space_infer_map(&src, &dst);
@@ -71,5 +66,3 @@ index 5d16a132..9cfb63f7 100644
      if (pl_color_space_equal(&src, &dst)) {
  #ifdef PL_BLACK_LEVEL_DIAGNOSTICS
          blkdiag_identity(sh, obj, &src, &dst);
--- 
-2.54.0.windows.1

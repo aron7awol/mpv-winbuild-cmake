@@ -1,19 +1,12 @@
-From edc7e042f431fb5683036ca1537578741260e7d0 Mon Sep 17 00:00:00 2001
-From: mpv-ht development <development@mpv-ht.local>
-Date: Wed, 26 Aug 2026 11:32:25 -0400
+From 120639ec172b56882905aa70caac0fa12210a31d Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:49:54 -0500
 Subject: [PATCH] video: add persistent gpu-next thumbnail renderer
 
 Keep a Vulkan/libplacebo offscreen renderer alive across thumbnail seeks, accept explicit SDR or BT.2020/PQ targets, and preserve Dolby metadata through the normal gpu-next reconstruction path. Use a static Spline curve driven by maxRGB and apply it along a linear RGB ray for the thumbnail color map.
----
- filters/user_filters.c           |   1 +
- filters/user_filters.h           |   1 +
- meson.build                      |   1 +
- video/filter/vf_gpu_next_thumb.c | 302 +++++++++++++++++++++++++++++++
- 4 files changed, 305 insertions(+)
- create mode 100644 video/filter/vf_gpu_next_thumb.c
 
 diff --git a/filters/user_filters.c b/filters/user_filters.c
-index ea7b69c99..0f73f3308 100644
+index ea7b69c990e76e4c7f7fd4a13a706f3342cfce59..0f73f3308546492b481cb103c84eba70535f7b05 100644
 --- a/filters/user_filters.c
 +++ b/filters/user_filters.c
 @@ -83,6 +83,7 @@ const struct m_obj_list af_obj_list = {
@@ -25,7 +18,7 @@ index ea7b69c99..0f73f3308 100644
      &vf_lavfi_bridge,
      &vf_sub,
 diff --git a/filters/user_filters.h b/filters/user_filters.h
-index f2c31ef66..efadc400b 100644
+index f2c31ef66b094744b68663c28cdbfadcacab3ab9..efadc400bfe98f417308b8fe3e306b8bcb9bcf6d 100644
 --- a/filters/user_filters.h
 +++ b/filters/user_filters.h
 @@ -39,3 +39,4 @@ extern const struct mp_user_filter_entry vf_d3d11vpp;
@@ -34,7 +27,7 @@ index f2c31ef66..efadc400b 100644
  extern const struct mp_user_filter_entry vf_gpu;
 +extern const struct mp_user_filter_entry vf_gpu_next_thumb;
 diff --git a/meson.build b/meson.build
-index 80bd39d7e..a91498396 100644
+index e571904378f48030790d5c1014d6fff1f49fe057..84a6602759a22432413ae30c3b662813d1fa1ccd 100644
 --- a/meson.build
 +++ b/meson.build
 @@ -221,6 +221,7 @@ sources = files(
@@ -47,7 +40,7 @@ index 80bd39d7e..a91498396 100644
      'video/hwdec.c',
 diff --git a/video/filter/vf_gpu_next_thumb.c b/video/filter/vf_gpu_next_thumb.c
 new file mode 100644
-index 000000000..a55c498a6
+index 0000000000000000000000000000000000000000..a8d01aaa47a5605eec803c536c21eb8d5a8492fb
 --- /dev/null
 +++ b/video/filter/vf_gpu_next_thumb.c
 @@ -0,0 +1,302 @@
@@ -353,5 +346,3 @@ index 000000000..a55c498a6
 +    },
 +    .create = create,
 +};
--- 
-2.54.0.windows.1

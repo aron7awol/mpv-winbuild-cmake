@@ -1,16 +1,11 @@
-From 261f82d381fd0b5eda33939822ac45ab53e297d0 Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Sun, 2 Aug 2026 16:37:14 -0400
+From aea1a6726be56eb400d8d1b803d93e2917ab4f03 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:52:57 -0500
 Subject: [PATCH] colorspace: add opt-in black-level diagnostics
 
----
- meson.build              |   1 +
- meson_options.txt        |   3 +
- src/shaders/colorspace.c | 312 +++++++++++++++++++++++++++++++++++++++
- 3 files changed, 316 insertions(+)
 
 diff --git a/meson.build b/meson.build
-index 7801d57a..3832230b 100644
+index 7801d57a7d5ec62b095815e131248b906fd99fa3..3832230bc4c8ba3e55552791d703643674e76a53 100644
 --- a/meson.build
 +++ b/meson.build
 @@ -407,6 +407,7 @@ conf_public.set('apiver', apiver)
@@ -22,7 +17,7 @@ index 7801d57a..3832230b 100644
  
  ### Global build options
 diff --git a/meson_options.txt b/meson_options.txt
-index 95a96c73..d5754471 100644
+index 95a96c73fe90c29359df8cf3e6eb4d55acf9c5af..d5754471a985a69e5a3991c92659963f58a650ad 100644
 --- a/meson_options.txt
 +++ b/meson_options.txt
 @@ -56,3 +56,6 @@ option('xxhash', type: 'feature', value: 'auto',
@@ -33,7 +28,7 @@ index 95a96c73..d5754471 100644
 +option('black-level-diagnostics', type: 'boolean', value: false,
 +       description: 'enable private black-level diagnostics (development only)')
 diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
-index 7821c84d..8fc3363b 100644
+index 4969cbc918bf29e564e7e3799979ec72bf8b3e2f..27528465e1a206bf446b23c6013d788e2d9fbe84 100644
 --- a/src/shaders/colorspace.c
 +++ b/src/shaders/colorspace.c
 @@ -1056,6 +1056,13 @@ static const struct pl_buffer_var peak_buf_vars[] = {
@@ -376,5 +371,3 @@ index 7821c84d..8fc3363b 100644
      // Fast path: simply convert between primaries (if needed)
      if (!need_tone_map && !need_gamut_map) {
          if (src.primaries != dst.primaries) {
--- 
-2.54.0.windows.1

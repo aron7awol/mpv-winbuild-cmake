@@ -1,16 +1,12 @@
-From 59da2efd842602943ebc8fd5202b14df8dd173e2 Mon Sep 17 00:00:00 2001
-From: mpv-ht <build@mpv-ht.invalid>
-Date: Fri, 11 Sep 2026 09:47:42 -0400
+From a2ad26adbb80a003a8ce4db16a1546cdcb06d64d Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:52:03 -0500
 Subject: [PATCH] osd: retain unchanged libass images until track or geometry
  changes
 
----
- sub/osd_libass.c | 19 ++++++++++++++++++-
- sub/osd_state.h  |  3 +++
- 2 files changed, 21 insertions(+), 1 deletion(-)
 
 diff --git a/sub/osd_libass.c b/sub/osd_libass.c
-index 7b0850954..47f27494d 100644
+index 7b0850954ccdb57f63db1bdaa755efc2e92a0a5b..47f27494dcc19a7df4dc322ce52b5299e66c171a 100644
 --- a/sub/osd_libass.c
 +++ b/sub/osd_libass.c
 @@ -63,6 +63,8 @@ static void create_ass_renderer(struct osd_state *osd, struct ass_state *ass)
@@ -75,7 +71,7 @@ index 7b0850954..47f27494d 100644
          *changed |= ass->changed;
          ass->changed = false;
 diff --git a/sub/osd_state.h b/sub/osd_state.h
-index cd4ca15a0..14fd44485 100644
+index cd4ca15a04e3d63e7da536458f0e6ca325fd8b6c..14fd4448502fe9744d1d955796de5de2791ece2d 100644
 --- a/sub/osd_state.h
 +++ b/sub/osd_state.h
 @@ -24,6 +24,9 @@ struct ass_state {
@@ -88,6 +84,3 @@ index cd4ca15a0..14fd44485 100644
      bool changed;
      struct mp_osd_res vo_res; // last known value
  };
--- 
-2.54.0.windows.1
-

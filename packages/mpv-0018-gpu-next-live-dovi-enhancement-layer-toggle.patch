@@ -1,15 +1,11 @@
-From c45a39fe68957c73b50e7aef140c36ae67548022 Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Fri, 14 Aug 2026 08:26:52 -0400
+From 26b88d5b0614aeeb38355bc43ab687da39d17a4a Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:49:50 -0500
 Subject: [PATCH] gpu-next: add live Dolby Vision EL toggle
 
----
- DOCS/man/options.rst    |  6 ++++++
- video/out/vo_gpu_next.c | 35 ++++++++++++++++++++++++++++++-----
- 2 files changed, 36 insertions(+), 5 deletions(-)
 
 diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
-index fcca228eb4bf06acbb19f2d1a19eeda9b2ab4199..41e6f476820d241b60085bed1b3636a69cf70add 100644
+index b50c9f0ca5042890a1efeaff266cc5f8efd06793..0ada9af70388a33346105108e7d3f88aea4ea0f2 100644
 --- a/DOCS/man/options.rst
 +++ b/DOCS/man/options.rst
 @@ -7853,6 +7853,12 @@ them.
@@ -26,10 +22,10 @@ index fcca228eb4bf06acbb19f2d1a19eeda9b2ab4199..41e6f476820d241b60085bed1b3636a6
      When measured HDR peak detection is active, reset its temporal smoothing at
      authored scene boundaries. Dolby Vision uses the RPU scene refresh flag.
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index a65b0ce746f1b374489d064206b4aea8de54f66c..c883c006daad7d6bd5cc5298659ed9b400754ace 100644
+index e97058d041135caf47ad0830dd4a3f05a24867f2..4bb033e06840b16a8c4ca2f94675079b05d6b975 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
-@@ -185,6 +185,7 @@ static void update_lut(struct priv *p, struct user_lut *lut);
+@@ -191,6 +191,7 @@ static void update_lut(struct priv *p, struct user_lut *lut);
  
  struct gl_next_opts {
      bool delayed_peak;
@@ -37,7 +33,7 @@ index a65b0ce746f1b374489d064206b4aea8de54f66c..c883c006daad7d6bd5cc5298659ed9b4
      bool causal_scene_diagnostics;
      bool causal_scene_acceleration;
      bool authored_scene_reset;
-@@ -220,6 +221,7 @@ const struct m_sub_options gl_next_conf = {
+@@ -226,6 +227,7 @@ const struct m_sub_options gl_next_conf = {
          {"image-subs-hdr-peak", OPT_CHOICE(image_subs_hdr_peak, {"sdr", PL_COLOR_SDR_WHITE},
              {"video", -1}, {"video-static", -2}, {"video-dynamic", -3}),  M_RANGE(10, 10000)},
          {"allow-delayed-peak-detect", OPT_BOOL(delayed_peak)},
@@ -45,7 +41,7 @@ index a65b0ce746f1b374489d064206b4aea8de54f66c..c883c006daad7d6bd5cc5298659ed9b4
          // Hidden Stage 1 instrumentation. This collects descriptors only and
          // must never alter tone-map state or rendered output.
          {"hdr-causal-scene-diagnostics", OPT_BOOL(causal_scene_diagnostics), M_OPT_NOCFG},
-@@ -254,6 +256,7 @@ const struct m_sub_options gl_next_conf = {
+@@ -260,6 +262,7 @@ const struct m_sub_options gl_next_conf = {
          .image_subs_hdr_peak = 1000,
          .target_hint = -1,
          .target_hint_strict = true,
@@ -53,7 +49,7 @@ index a65b0ce746f1b374489d064206b4aea8de54f66c..c883c006daad7d6bd5cc5298659ed9b4
          .authored_scene_reset = true,
          .causal_scene_diagnostics = false,
          .causal_scene_acceleration = false,
-@@ -500,12 +503,22 @@ struct frame_priv {
+@@ -585,12 +588,22 @@ struct frame_priv {
      struct ra_hwdec *el_hwdec;
      pl_tex el_tex[4];
      struct pl_frame el_frame;
@@ -76,7 +72,7 @@ index a65b0ce746f1b374489d064206b4aea8de54f66c..c883c006daad7d6bd5cc5298659ed9b4
  static void reset_authored_scene_state(struct priv *p)
  {
      p->hdr10plus_stable_signature = 0;
-@@ -1051,6 +1064,7 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
+@@ -1142,6 +1155,7 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
  
          if (el_ok) {
              pl_frame_set_chroma_location(&fp->el_frame, el_par.chroma_location);
@@ -84,7 +80,7 @@ index a65b0ce746f1b374489d064206b4aea8de54f66c..c883c006daad7d6bd5cc5298659ed9b4
              frame->enhancement_layer = &fp->el_frame;
          } else {
              MP_WARN(vo, "Failed setting up enhancement layer; "
-@@ -1121,10 +1135,13 @@ static void update_options(struct vo *vo)
+@@ -1212,10 +1226,13 @@ static void update_options(struct vo *vo)
  {
      struct priv *p = vo->priv;
      pl_options pars = p->pars;
@@ -98,7 +94,7 @@ index a65b0ce746f1b374489d064206b4aea8de54f66c..c883c006daad7d6bd5cc5298659ed9b4
  
      update_lut(p, &p->next_opts->lut);
      pars->params.lut = p->next_opts->lut.lut;
-@@ -1376,6 +1393,13 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1480,6 +1497,13 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
          }
      }
  
@@ -112,7 +108,7 @@ index a65b0ce746f1b374489d064206b4aea8de54f66c..c883c006daad7d6bd5cc5298659ed9b4
      // Push all incoming frames into the frame queue
      for (int n = 0; n < frame->num_frames; n++) {
          int id = frame->frame_id + n;
-@@ -1386,12 +1410,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1490,12 +1514,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
              p->last_id = 0;
              reset_authored_scene_state(p);
              p->want_reset = false;
@@ -125,7 +121,7 @@ index a65b0ce746f1b374489d064206b4aea8de54f66c..c883c006daad7d6bd5cc5298659ed9b4
          }
  
          if (id <= p->last_id)
-@@ -1731,6 +1750,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1835,6 +1854,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
              struct pl_frame *image = (struct pl_frame *) mix.frames[i];
              struct mp_image *mpi = image->user_data;
              struct frame_priv *fp = mpi->priv;
@@ -135,7 +131,7 @@ index a65b0ce746f1b374489d064206b4aea8de54f66c..c883c006daad7d6bd5cc5298659ed9b4
              apply_crop(image, p->src, vo->params->w, vo->params->h);
              if (opts->blend_subs) {
                  if (frame->redraw)
-@@ -2205,6 +2227,9 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
+@@ -2371,6 +2393,9 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
          osd_flags |= OSD_DRAW_SUB_ONLY;
  
      struct frame_priv *fp = mpi->priv;

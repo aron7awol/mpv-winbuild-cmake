@@ -1,6 +1,6 @@
-From 8c0ff53d4295fa05901404a85d769b1380aef00d Mon Sep 17 00:00:00 2001
-From: mpv-ht <mpv-ht@local>
-Date: Thu, 30 Jul 2026 00:00:00 -0400
+From 5572e2f2fa9abfe803432ea437f8bb0727f806a6 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:49:30 -0500
 Subject: [PATCH] vo_gpu_next: preserve source hint minimum luminance
 
 target-contrast describes the target display and is useful for rendering,
@@ -11,14 +11,12 @@ which violates the documented source passthrough behavior.
 Continue applying target contrast to target-mode hints, but leave source and
 source-dynamic metadata unchanged. Target contrast remains active on the
 render target through apply_target_options().
----
- video/out/vo_gpu_next.c | 5 ++++-
- 1 file changed, 4 insertions(+), 1 deletion(-)
 
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index db39db387a77a20c15d93c7efdfe91489f122b25..df7cf522a1cc6664e972b888a02677b53ca639dd 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
-@@ -1412,7 +1412,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1492,7 +1492,10 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
          }
          if (hint.hdr.max_cll && hint.hdr.max_fall > hint.hdr.max_cll)
              hint.hdr.max_fall = 0;
@@ -30,5 +28,3 @@ diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
          if (p->icc_profile)
              hint = p->icc_profile->csp;
          if (opts->icc_opts->icc_use_luma) {
--- 
-2.50.1

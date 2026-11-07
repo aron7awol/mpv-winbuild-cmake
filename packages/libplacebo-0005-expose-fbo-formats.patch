@@ -1,15 +1,11 @@
-From 4c5ff1080df34a3694ea50c2eb9c7901f8fbe2e8 Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Sun, 2 Aug 2026 16:35:00 -0400
+From 2b4615b6332e3f1f3e859809339504ecfd16099f Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:52:57 -0500
 Subject: [PATCH] renderer: expose effective intermediate FBO formats
 
----
- src/include/libplacebo/renderer.h |  5 +++++
- src/renderer.c                    | 10 ++++++++++
- 2 files changed, 15 insertions(+)
 
 diff --git a/src/include/libplacebo/renderer.h b/src/include/libplacebo/renderer.h
-index 08466bd3..e5751998 100644
+index 81f3f712c7072be14f0aec6561737b2d126590a5..2ffc32ea4acb3a9f7fa9fef20c292753b2b83b28 100644
 --- a/src/include/libplacebo/renderer.h
 +++ b/src/include/libplacebo/renderer.h
 @@ -73,6 +73,11 @@ PL_API void pl_renderer_destroy(pl_renderer *rr);
@@ -25,7 +21,7 @@ index 08466bd3..e5751998 100644
  // be cleared. Otherwise only selected errors/hooks will be cleared.
  // If `PL_RENDER_ERR_HOOKS` is set and `num_disabled_hooks` is 0, clear all hooks.
 diff --git a/src/renderer.c b/src/renderer.c
-index f2fa8913..31b7e20f 100644
+index 9cf9a90727532b62c63bafb119e3b637a3800cdc..5d70743d296d027a066b1feb2c2862bd1a2d3579 100644
 --- a/src/renderer.c
 +++ b/src/renderer.c
 @@ -61,6 +61,9 @@ struct pl_renderer_t {
@@ -38,7 +34,7 @@ index f2fa8913..31b7e20f 100644
      // List containing signatures of disabled hooks
      PL_ARRAY(uint64_t) disabled_hooks;
  
-@@ -3541,6 +3544,8 @@ static bool pass_init(struct pass_state *pass, bool acquire_image)
+@@ -3547,6 +3550,8 @@ static bool pass_init(struct pass_state *pass, bool acquire_image)
          goto error;
  
      find_fbo_format(pass);
@@ -47,7 +43,7 @@ index f2fa8913..31b7e20f 100644
      pass_fix_frames(pass);
  
      pass->tmp = pl_tmp(NULL);
-@@ -4392,6 +4397,11 @@ struct pl_render_errors pl_renderer_get_errors(pl_renderer rr)
+@@ -4398,6 +4403,11 @@ struct pl_render_errors pl_renderer_get_errors(pl_renderer rr)
      };
  }
  
@@ -59,5 +55,3 @@ index f2fa8913..31b7e20f 100644
  void pl_renderer_reset_errors(pl_renderer rr,
                                const struct pl_render_errors *errors)
  {
--- 
-2.54.0.windows.1

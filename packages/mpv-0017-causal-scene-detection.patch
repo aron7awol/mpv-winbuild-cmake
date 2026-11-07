@@ -1,24 +1,11 @@
-From 56c46e8afde34320f3d6bde78c82244aeca4f008 Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Thu, 13 Aug 2026 14:59:33 -0400
+From 76397760fff6beae97e76daa24677a36a4570c95 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:49:49 -0500
 Subject: [PATCH] gpu-next: add causal scene detection and acceleration
 
----
- DOCS/man/input.rst                  |  11 ++
- DOCS/man/options.rst                |  15 +++
- TOOLS/causal_scene_validate.md      |  24 +++++
- TOOLS/causal_scene_validate.py      | 125 ++++++++++++++++++++++
- TOOLS/test_causal_scene_validate.py |  55 ++++++++++
- player/command.c                    |  60 +++++++++++
- video/mp_image.h                    |  23 ++++
- video/out/vo_gpu_next.c             | 160 ++++++++++++++++++++++++++++
- 8 files changed, 473 insertions(+)
- create mode 100644 TOOLS/causal_scene_validate.md
- create mode 100644 TOOLS/causal_scene_validate.py
- create mode 100644 TOOLS/test_causal_scene_validate.py
 
 diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
-index b0e856579dffaf0e32d14dce56e6cf74716b51ab..aa347c90864ac3a7f301f5be2adaaa59b446a4a4 100644
+index 4665cd2f833858187a1f9590d1ef9ddaf959e90d..b49de15bfd4bccce6c7a3c9efb988879171ae6a8 100644
 --- a/DOCS/man/input.rst
 +++ b/DOCS/man/input.rst
 @@ -2950,6 +2950,17 @@ Property list
@@ -40,7 +27,7 @@ index b0e856579dffaf0e32d14dce56e6cf74716b51ab..aa347c90864ac3a7f301f5be2adaaa59
          Unsmoothed percentile peak and PQ-domain frame average for the selected
          non-standard ``--tone-mapping-metric``, expressed in cd/mÂ². Unavailable
 diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
-index a17e45a9c5c32d6280792b8c3c8f9854a8b4f55d..e5b024cbcbbaa47ef65a3c6795977056501fef92 100644
+index a17e45a9c5c32d6280792b8c3c8f9854a8b4f55d..b50c9f0ca5042890a1efeaff266cc5f8efd06793 100644
 --- a/DOCS/man/options.rst
 +++ b/DOCS/man/options.rst
 @@ -7861,6 +7861,21 @@ them.
@@ -373,7 +360,7 @@ index c7e0f863b15590444d5de599cbf6e7b230ce0b4c..c3064b5375275155f4160ca8074f204c
                              .unavailable = !peak->tone_metric_valid},
          {"raw-avg-tone-metric-nits", SUB_PROP_FLOAT(peak->raw_avg_tone_metric),
 diff --git a/video/mp_image.h b/video/mp_image.h
-index defe0e61a42f3005cb0bc9642ae9f303384eeb5a..ccc620098380278987eee400a27d560d4764ccea 100644
+index 82d1c154df9d178e1a61c7d82216cfea131467b1..3e9df2ad377c15d49c2b4e74470da3d3d6797a51 100644
 --- a/video/mp_image.h
 +++ b/video/mp_image.h
 @@ -73,6 +73,29 @@ struct mp_peak_detect_metrics {

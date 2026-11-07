@@ -1,6 +1,6 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Thu, 27 Aug 2026 12:00:00 -0400
+From a61bee807a5a0d376094ab3631b890881a121d0d Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:53:02 -0500
 Subject: [PATCH] colorspace: preserve chroma during inverse tone mapping
 
 The ordinary conservative ITP hull correction contains I_in / I_out.  That
@@ -11,15 +11,12 @@ Keep source ITP P/T during a genuine inverse expansion and leave the existing
 output-gamut mapper responsible for colors that actually cross the target
 boundary.  Normal tone mapping and non-expanding inverse requests are
 unchanged.
----
- src/shaders/colorspace.c | 9 +++++++--
- 1 file changed, 7 insertions(+), 2 deletions(-)
 
 diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
-index bfc92844..00000000 100644
+index 40841eef8bfd103c0b1888b0441d474560f2668c..7ca998ad0aad22ee4bbfd10a33883c649ff3f9db 100644
 --- a/src/shaders/colorspace.c
 +++ b/src/shaders/colorspace.c
-@@ -3020,6 +3020,8 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+@@ -3022,6 +3022,8 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
          params->ambient_gamma > 0.0f ? params->ambient_gamma : 1.0f;
      const bool ambient_active = fabsf(ambient_gamma - 1.0f) > 1e-6f;
      const bool base_need_tone_map = !pl_tone_map_params_noop(&tone);
@@ -28,7 +25,7 @@ index bfc92844..00000000 100644
      bool need_tone_map = base_need_tone_map || ambient_active;
      bool need_gamut_map = !pl_gamut_map_params_noop(&gamut);
  
-@@ -3291,11 +3294,15 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+@@ -3282,11 +3284,15 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
          // Avoid raising saturation excessively when raising brightness, and
          // also desaturate when reducing brightness greatly to account for the
          // reduction in gamut volume.
@@ -46,6 +43,3 @@ index bfc92844..00000000 100644
              GLSL("vec2 hull = vec2(i_orig, ipt.x);                       \n"
                   "hull = ((hull - 6.0) * hull + 9.0) * hull;             \n"
                   "float chroma_scale = min(i_orig / max(ipt.x, 1e-6),   \n"
- 
--- 
-2.54.0.windows.1

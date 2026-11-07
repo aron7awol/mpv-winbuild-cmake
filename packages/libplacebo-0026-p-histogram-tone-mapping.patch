@@ -1,13 +1,17 @@
-From: mpv-ht <mpv-ht@localhost>
-Date: Sun, 13 Sep 2026 00:00:00 -0400
-Subject: [PATCH] Add opt-in histogram-shaped P tone mapping and bounded brightening
+From 6187106d40a6302e486e8aefd0bd16e2a6fab0ce Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:54:17 -0500
+Subject: [PATCH] colorspace: shape contrast with smooth gain and shadow limits
 
-Use the measured P RGB-ray histogram to redistribute the existing tone curve.
-Strength and above-source retention default to zero; no SEP path is added.
+Consolidates the published .76 changes without modifying the final source.
+Original: libplacebo-0026-p-histogram-tone-mapping.patch
+Original: libplacebo-0029-hstm-preserve-highlight-order.patch
+Original: libplacebo-0031-hstm-smooth-near-black.patch
+Original: libplacebo-0032-hstm-near-black-option.patch
+Original: libplacebo-0036-hstm-smooth-gain-limits.patch
 
----
 diff --git a/src/include/libplacebo/shaders/colorspace.h b/src/include/libplacebo/shaders/colorspace.h
-index ac59d8a..ad6c98e 100644
+index ac59d8ad5ea191c9b1b423c42b6c834da7ba9524..5a9f7d3e9bd401aed127392efb6e79cfa9ba50df 100644
 --- a/src/include/libplacebo/shaders/colorspace.h
 +++ b/src/include/libplacebo/shaders/colorspace.h
 @@ -190,6 +190,9 @@ struct pl_peak_detect_params {
@@ -20,7 +24,7 @@ index ac59d8a..ad6c98e 100644
      // One-shot tag for the measurement submitted with these parameters. When
      // its GPU result is consumed, temporal peak/average smoothing is reseeded
      // from that frame. Deliberately excluded from parameter equality.
-@@ -353,6 +356,11 @@ struct pl_color_map_params {
+@@ -353,6 +356,14 @@ struct pl_color_map_params {
      // mapping function capable of bidirectional mapping.
      bool gamut_expansion;
  
@@ -28,15 +32,26 @@ index ac59d8a..ad6c98e 100644
 +    // Defaults off. At full retention above-source gain is bounded to 2x.
 +    float hstm_strength;
 +    float hstm_overbrightening;
++    // Retain the near-black base slope and fade shaping in from 0.1 to 1 nit.
++    // False allows redistribution down to black; source/peak limits still apply.
++    bool hstm_near_black_protection;
 +
      // --- Tone mapping options
  
      // Tone mapping function to use to handle out-of-range colors.
+@@ -451,6 +462,7 @@ struct pl_color_map_params {
+     .tone_constants         = { PL_TONE_MAP_CONSTANTS },        \
+     .metadata               = PL_HDR_METADATA_ANY,              \
+     .adaptive_chroma_strength = 0.5f,                           \
++    .hstm_near_black_protection = true,                         \
+     .ambient_gamma          = 1.0f,                             \
+     .lut3d_size             = {48, 32, 256},                    \
+     .lut_size               = 256,                              \
 diff --git a/src/renderer.c b/src/renderer.c
-index f6f749b..abbcf37 100644
+index ed14d31158bda502ca8b47215ca667d3e8e543dd..ca0715612b3abe0edff26e2d8e878ae9e30493b0 100644
 --- a/src/renderer.c
 +++ b/src/renderer.c
-@@ -1389,6 +1389,10 @@ static void hdr_update_peak(struct pass_state *pass)
+@@ -1411,6 +1411,10 @@ static void hdr_update_peak(struct pass_state *pass)
      if (!rr->gpu->limits.max_ssbo_size)
          goto cleanup;
  
@@ -47,7 +62,7 @@ index f6f749b..abbcf37 100644
      float max_peak = pl_color_transfer_nominal_peak(pass->image.color.transfer) *
                       PL_COLOR_SDR_WHITE;
      if (pass->image.color.transfer == PL_COLOR_TRC_HLG)
-@@ -1398,10 +1402,10 @@ static void hdr_update_peak(struct pass_state *pass)
+@@ -1420,10 +1424,10 @@ static void hdr_update_peak(struct pass_state *pass)
          pl_color_space_is_hdr(&pass->target.color) &&
          max_peak <= pass->target.color.hdr.max_luma + 1e-6;
      if (max_peak <= pass->target.color.hdr.max_luma + 1e-6 &&
@@ -60,7 +75,7 @@ index f6f749b..abbcf37 100644
          goto cleanup; // DV metadata already present
  
      enum pl_hdr_metadata_type metadata = PL_HDR_METADATA_ANY;
-@@ -1430,6 +1434,7 @@ static void hdr_update_peak(struct pass_state *pass)
+@@ -1452,6 +1456,7 @@ static void hdr_update_peak(struct pass_state *pass)
      struct pl_peak_detect_params peak_params = *params->peak_detect_params;
      peak_params.metric = cpars ? cpars->tone_mapping_metric
                                 : PL_TONE_MAP_METRIC_STANDARD;
@@ -69,7 +84,7 @@ index f6f749b..abbcf37 100644
      peak_params.scene_reset_tag = pass->image.scene_cut_tag;
      peak_params.scene_reset_source = pass->image.scene_cut_source;
 diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
-index b9575ee..61ead47 100644
+index b9575ee4c7d4de4b9152fec4a133abe653d2a843..5f866b825e21dc58f38b99ee3c3abd31fadfb1f4 100644
 --- a/src/shaders/colorspace.c
 +++ b/src/shaders/colorspace.c
 @@ -25,6 +25,7 @@
@@ -366,7 +381,7 @@ index b9575ee..61ead47 100644
      });
      GLSL("// native-cie-y-v1 causal descriptor reduction\n"
           "uvec2 p = gl_GlobalInvocationID.xy;\n"
-@@ -2780,10 +2864,33 @@ static void visualize_gamut_map(pl_shader sh, pl_rect2df rc,
+@@ -2780,10 +2864,34 @@ static void visualize_gamut_map(pl_shader sh, pl_rect2df rc,
           lut);
  }
  
@@ -374,6 +389,7 @@ index b9575ee..61ead47 100644
 +    const struct pl_tone_map_params *tone;
 +    const float *hist;
 +    float strength, brightening;
++    bool protect_shadows;
 +};
 +
  static void fill_tone_lut(void *data, const struct sh_lut_params *params)
@@ -394,14 +410,14 @@ index b9575ee..61ead47 100644
 +        base[i] = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, out[i]);
 +    }
 +    hstm_shape_curve(ctx->hist, input, base, base, scratch, n,
-+                     ctx->strength, ctx->brightening);
++                     ctx->strength, ctx->brightening, ctx->protect_shadows);
 +    for (int i = 0; i < n; i++)
 +        out[i] = pl_hdr_rescale(PL_HDR_NITS, PL_HDR_PQ, base[i]);
 +    pl_free(tmp);
  }
  
  static void fill_gamut_lut(void *data, const struct sh_lut_params *params)
-@@ -2833,7 +2940,10 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+@@ -2833,7 +2941,10 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
      const bool ambient_requested = isfinite(params->ambient_gamma) &&
          params->ambient_gamma > 0.0f &&
          fabsf(params->ambient_gamma - 1.0f) > 1e-6f;
@@ -413,7 +429,7 @@ index b9575ee..61ead47 100644
          params->gamut_mapping != &pl_gamut_map_ipt_path &&
          !args->measure_rgb_ray && !args->rgb_ray_peak) {
  #ifdef PL_BLACK_LEVEL_DIAGNOSTICS
-@@ -3005,7 +3115,17 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+@@ -3005,7 +3116,18 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
          pl_unreachable();
      }
  
@@ -427,12 +443,13 @@ index b9575ee..61ead47 100644
 +            pl_hash_merge(&hstm_signature, pl_var_hash(obj->peak.hstm_hist[i]));
 +        pl_hash_merge(&hstm_signature, pl_var_hash(params->hstm_strength));
 +        pl_hash_merge(&hstm_signature, pl_var_hash(params->hstm_overbrightening));
++        pl_hash_merge(&hstm_signature, pl_var_hash(params->hstm_near_black_protection));
 +    }
 +    bool can_fast = !params->force_tone_mapping_lut && !hstm_active;
      if (!args->state) {
          // No state object provided, forcibly disable advanced methods
          can_fast = true;
-@@ -3027,7 +3147,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+@@ -3027,7 +3149,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
      const bool base_need_tone_map = !pl_tone_map_params_noop(&tone);
      const bool inverse_expansion = params->inverse_tone_mapping &&
          tone.output_max > tone.input_max + 1e-6f;
@@ -441,7 +458,7 @@ index b9575ee..61ead47 100644
          args->measure_rgb_ray || args->rgb_ray_peak;
      bool need_gamut_map = !pl_gamut_map_params_noop(&gamut);
  
-@@ -3126,6 +3246,12 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+@@ -3126,6 +3248,13 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
          } else {
  
              pl_assert(obj);
@@ -449,12 +466,13 @@ index b9575ee..61ead47 100644
 +                .tone = &tone, .hist = hstm_active ? obj->peak.hstm_hist : NULL,
 +                .strength = params->hstm_strength,
 +                .brightening = params->hstm_overbrightening,
++                .protect_shadows = params->hstm_near_black_protection,
 +            };
 +            if (hstm_active) sh_describe(sh, "HSTM(P)");
              ident_t lut = sh_lut(sh, sh_lut_params(
                  .object     = &obj->tone.lut,
                  .var_type   = PL_VAR_FLOAT,
-@@ -3133,12 +3259,14 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+@@ -3133,12 +3262,14 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
                  .method     = SH_LUT_LINEAR,
                  .width      = tone.lut_size,
                  .comps      = 1,
@@ -472,12 +490,16 @@ index b9575ee..61ead47 100644
              if (!lut) {
                  SH_FAIL(sh, "Failed generating tone-mapping LUT!");
                  return;
-@@ -3254,6 +3382,12 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+@@ -3254,6 +3385,16 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
                   "float metric_scale = metric_in_lin > 1e-12            \n"
                   "    ? metric_out_lin / metric_in_lin : 1.0;           \n");
  
 +            if (hstm_active) {
 +                // Bound final P gain even between interpolated LUT samples.
++                // Destination RGB fitting belongs to the ordinary overflow and
++                // gamut stages. A per-pixel RGB headroom cap here can reverse
++                // highlight ordering as chromaticity changes, and would hide
++                // the overflow from the measurement pass below.
 +                GLSL("metric_scale = min(metric_scale, "$"); \n",
 +                     SH_FLOAT_DYN(1.0f + hstm_clamp(params->hstm_overbrightening, 0, 1)));
 +            }
@@ -485,30 +507,12 @@ index b9575ee..61ead47 100644
              if (params->tone_mapping_metric == PL_TONE_MAP_METRIC_BT2020_RGB ||
                  params->tone_mapping_metric == PL_TONE_MAP_METRIC_MAXRGB_RGB) {
                  // Homogeneity makes this the exact fixed-hue inverse:
-@@ -3294,6 +3428,17 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
-                          SH_FLOAT_DYN(tone.output_max),
-                          PQ_M2, PQ_C1, PQ_C2, PQ_C3, PQ_M1, 10000/PL_COLOR_SDR_WHITE);
-                 }
-+                if (hstm_active) {
-+                    const pl_matrix3x3 hstm_to_dst = pl_get_color_mapping_matrix(
-+                        pl_raw_primaries_get(src.primaries),
-+                        pl_raw_primaries_get(dst.primaries),
-+                        PL_INTENT_RELATIVE_COLORIMETRIC);
-+                    GLSL("vec3 hstm_dst = "$" * color.rgb; \n"
-+                         "float hstm_max = max(max(hstm_dst.r, hstm_dst.g), hstm_dst.b); \n"
-+                         "metric_scale = min(metric_scale, "$" / max(hstm_max, 1e-12)); \n",
-+                         SH_MAT3(hstm_to_dst),
-+                         SH_FLOAT_DYN(pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NORM, tone.output_max)));
-+                }
-                 GLSL("color.rgb *= metric_scale;                           \n"
-                  "lms = "$" * color.rgb;                                \n"
-                  "lmspq = %f * lms;                                      \n"
 diff --git a/src/shaders/hstm.h b/src/shaders/hstm.h
 new file mode 100644
-index 0000000..41f5bfb
+index 0000000000000000000000000000000000000000..a41cf5de53c158ec396842860cbe8b69ec23b3fe
 --- /dev/null
 +++ b/src/shaders/hstm.h
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,180 @@
 +/* Private mpv-ht histogram-shaped P mapping. No spatial filtering or SEP.
 + * SPDX-License-Identifier: LGPL-2.1-or-later */
 +#ifndef PL_SHADERS_HSTM_H_
@@ -578,16 +582,58 @@ index 0000000..41f5bfb
 +    return (hist[lo] + (p - lo) * (hist[hi] - hist[lo])) * HSTM_BINS;
 +}
 +
++/* Bring in slope redistribution over one decade of input brightness. Both
++ * derivatives of the quintic vanish at the ends, avoiding a new corner where
++ * near-black protection starts or ends. This blends positive slopes, not the
++ * completed curves: blending the latter can introduce a negative slope. */
++static inline float hstm_shadow_weight(float nits)
++{
++    if (nits <= 0.1f) return 0;
++    if (nits >= 1.0f) return 1;
++    const float t = log10f(nits / 0.1f);
++    return hstm_clamp(t*t*t * (t * (6*t - 15) + 10), 0, 1);
++}
++
++/* C1 soft minimum in log brightness, with compact support around a crossing.
++ * A hard min makes a corner whenever the shaped curve meets the source-gain
++ * limit. Round below that limit instead; never relax the brightness bound.
++ *
++ * The radius depends symmetrically on the mean, not min(a,b), which would put
++ * another cusp at a == b. Its value AND derivative vanish at the protected
++ * anchor and peak, retaining their values/slopes. With radius = span/2 *
++ * t^2*(1-t)^2, |dr/dmean| <= 0.097: both partial derivatives of this smooth min
++ * stay nonnegative. Thus two monotonic curves cannot produce a reversal.
++ * Outside this small neighborhood the original minimum is returned exactly. */
++static inline float hstm_soft_limit(float value, float limit, float lower,
++                                    float upper, float strength)
++{
++    const float minimum = fminf(value, limit);
++    const float a = hstm_coord(value), b = hstm_coord(limit);
++    if (fminf(a, b) <= lower || fmaxf(a, b) >= upper || upper <= lower)
++        return minimum;
++    const float span = upper - lower;
++    const float t = ((a + b) * 0.5f - lower) / span;
++    const float radius = 0.5f * strength * span * t*t * (1-t)*(1-t);
++    const float distance = fabsf(a - b);
++    if (distance >= radius)
++        return minimum;
++    const float h = 1 - distance / radius;
++    return fminf(minimum, hstm_nits(fminf(a, b) - 0.25f * radius * h*h));
++}
++
 +/* input/base/out contain linear P in nits on the same monotonic input grid.
 + * Redistribute the base curve's log-brightness increments, then normalize its
-+ * endpoints. Positive bounded weights preserve order. Near-black is anchored.
-+ * Above-source retention is a separate final operation and never affects an
-+ * already dimmed value. At 100%, maximum above-source gain is 2x (one stop).
++ * endpoints. Positive bounded weights preserve order. Near-black retains its
++ * base slope, with a smooth transition to full redistribution from 0.1 to 1 nit.
++ * Above-source retention is a separate final operation. Limits use smooth
++ * shoulders, slightly dimming either side of a crossing without changing
++ * values outside that neighborhood. At 100%, maximum gain is 2x (one stop).
 + * The caller supplies scratch[n] and may alias base and out. */
 +static inline void hstm_shape_curve(const float hist[HSTM_BINS],
 +                                    const float *input, const float *base,
 +                                    float *out, float *scratch, int n,
-+                                    float strength, float brightening)
++                                    float strength, float brightening,
++                                    bool protect_shadows)
 +{
 +    if (n < 2) return;
 +    strength = hstm_clamp(strength, 0, 1);
@@ -597,11 +643,10 @@ index 0000000..41f5bfb
 +        return;
 +    }
 +    int anchor = 0;
-+    while (anchor + 1 < n && input[anchor + 1] <= 0.1f) anchor++;
++    while (protect_shadows && anchor + 1 < n && input[anchor + 1] <= 0.1f) anchor++;
 +    const float lower = hstm_coord(base[anchor]);
-+    const float upper = hstm_coord(base[n - 1]);
 +    scratch[anchor] = 0;
-+    float previous = lower;
++    float previous = lower, shaped_span = 0;
 +    for (int i = anchor + 1; i < n; i++) {
 +        const float current = fmaxf(previous, hstm_coord(base[i]));
 +        const float p = sqrtf(fmaxf(input[i - 1], 0) * fmaxf(input[i], 0));
@@ -609,22 +654,41 @@ index 0000000..41f5bfb
 +        // Log softens large populations; clamp bounds local slope allocation.
 +        const float weight = hstm_clamp(0.5f + log1pf(8.0f*density) / logf(9.0f),
 +                                        0.5f, 4.0f);
-+        scratch[i] = scratch[i - 1] + (current - previous) * weight;
++        const float span = (current - previous) *
++            (protect_shadows ? hstm_shadow_weight(p) : 1);
++        shaped_span += span;
++        scratch[i] = scratch[i - 1] + span * weight;
 +        previous = current;
 +    }
++    // Normalize only the redistributed span. Scaling the complete curve would
++    // change the protected slope at the anchor and recreate the original kink.
 +    const float scale = scratch[n - 1] > 1e-12f
-+        ? (upper - lower) / scratch[n - 1] : 0;
++        ? shaped_span / scratch[n - 1] : 0;
 +    const float ceiling = base[n - 1];
++    const float limit_lower = hstm_coord(fminf(base[anchor], input[anchor]));
++    const float limit_upper = hstm_coord(ceiling);
++    float fixed = lower;
++    previous = lower;
 +    for (int i = 0; i < n; i++) {
 +        float candidate = base[i];
 +        if (i > anchor) {
-+            const float target = lower + scratch[i] * scale;
++            // Retain previous before writing out[i], since base may alias out.
++            const float current = fmaxf(previous, hstm_coord(base[i]));
++            const float p = sqrtf(fmaxf(input[i - 1], 0) * fmaxf(input[i], 0));
++            if (protect_shadows)
++                fixed += (current - previous) * (1 - hstm_shadow_weight(p));
++            const float target = fixed + scratch[i] * scale;
++            previous = current;
 +            candidate = hstm_nits(hstm_coord(base[i]) * (1 - strength)
 +                                  + strength * target);
 +        }
-+        candidate = fminf(candidate, 2.0f * input[i]);
-+        const float below = fminf(candidate, input[i]);
-+        out[i] = fminf(ceiling, below + brightening * fmaxf(candidate - input[i], 0));
++        candidate = hstm_soft_limit(fminf(candidate, ceiling), 2.0f * input[i],
++                                    limit_lower, limit_upper, strength);
++        const float below = hstm_soft_limit(candidate, input[i],
++                                            limit_lower, limit_upper, strength);
++        // A convex blend retains monotonicity, including as brightening rises.
++        // below <= input, candidate <= 2*input, so out <= (1+brightening)*input.
++        out[i] = below + brightening * (candidate - below);
 +        if (input[i] <= 0) out[i] = 0;
 +    }
 +}

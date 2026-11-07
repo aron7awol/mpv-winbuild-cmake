@@ -1,29 +1,12 @@
-From c52429cd61dc131e7fcf159978c67a66a2405455 Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Sat, 26 Sep 2026 11:32:10 -0400
+From bfbee316bd14be270c41a47cc278bcadb58296dc Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:52:52 -0500
 Subject: [PATCH] Add default-off presentation feedback and guarded
  display-vdrop timing
 
----
- DOCS/man/options.rst              |  14 +++
- options/options.c                 |   2 +
- options/options.h                 |   1 +
- player/audio.c                    |   1 +
- player/command.c                  |  34 +++++++
- player/core.h                     |   2 +
- player/video.c                    |  18 +++-
- video/filter/vf_gpu_vulkan.c      |   2 +-
- video/out/d3d11/context.c         |  36 +++++++-
- video/out/presentation_feedback.h | 146 ++++++++++++++++++++++++++++++
- video/out/vo.c                    |  76 +++++++++++++++-
- video/out/vo.h                    |  14 +++
- video/out/vulkan/context.c        |  35 ++++++-
- video/out/vulkan/context.h        |   2 +-
- 14 files changed, 374 insertions(+), 9 deletions(-)
- create mode 100644 video/out/presentation_feedback.h
 
 diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
-index 3581fd1b1..0d9301656 100644
+index 3581fd1b11042ad8e7bff9898d90cfa25ea11f8e..0d9301656073d0cf03c45fcb4b9eade9dfdcac64 100644
 --- a/DOCS/man/options.rst
 +++ b/DOCS/man/options.rst
 @@ -8316,6 +8316,20 @@ Video Sync
@@ -48,7 +31,7 @@ index 3581fd1b1..0d9301656 100644
      Maximum multiple for which to try to fit the video's FPS to the display's
      FPS (default: 5).
 diff --git a/options/options.c b/options/options.c
-index 15e1dee31..30153d902 100644
+index 15e1dee31250c15bc7cec91392716fb95b9a27c1..30153d902cec1ed607792611cff3748c0987084f 100644
 --- a/options/options.c
 +++ b/options/options.c
 @@ -190,6 +190,8 @@ static const m_option_t mp_vo_opt_list[] = {
@@ -61,7 +44,7 @@ index 15e1dee31..30153d902 100644
          {"audio", VS_DEFAULT},
          {"display-resample", VS_DISP_RESAMPLE},
 diff --git a/options/options.h b/options/options.h
-index 15324915d..e596a3f4e 100644
+index 15324915d8f3f120cf42179ea0cc0089bffb3e0f..e596a3f4e7a6e881eb50a5e5a7cd2f2a07b829e1 100644
 --- a/options/options.h
 +++ b/options/options.h
 @@ -84,6 +84,7 @@ typedef struct mp_vo_opts {
@@ -73,7 +56,7 @@ index 15324915d..e596a3f4e 100644
      struct m_geometry android_surface_size;
  
 diff --git a/player/audio.c b/player/audio.c
-index 64e5326f4..c8a962dfe 100644
+index 64e5326f4fbdbded652ef9237e287a26195d5f69..c8a962dfe60aec1b5ee98e0bc3ba048636d22a46 100644
 --- a/player/audio.c
 +++ b/player/audio.c
 @@ -229,6 +229,7 @@ static void ao_chain_reset_state(struct ao_chain *ao_c)
@@ -85,7 +68,7 @@ index 64e5326f4..c8a962dfe 100644
      if (mpctx->ao_chain) {
          ao_chain_reset_state(mpctx->ao_chain);
 diff --git a/player/command.c b/player/command.c
-index 8bc64bb8e..8e97b33d5 100644
+index 8bc64bb8e57156d246a6964b4f3407c201a157e3..8e97b33d577ad05170876d26b5e0d76e35f56f69 100644
 --- a/player/command.c
 +++ b/player/command.c
 @@ -3189,6 +3189,39 @@ static int mp_property_estimated_display_fps(void *ctx, struct m_property *prop,
@@ -137,7 +120,7 @@ index 8bc64bb8e..8e97b33d5 100644
      {"ambient-light", mp_property_ambient_light},
  
 diff --git a/player/core.h b/player/core.h
-index 323c54213..462f80295 100644
+index 323c54213c8303ab0564226f0fde9c2153397278..462f8029507466bda06b2223573652f5348c266f 100644
 --- a/player/core.h
 +++ b/player/core.h
 @@ -31,6 +31,7 @@
@@ -157,7 +140,7 @@ index 323c54213..462f80295 100644
       * (or at least queued to be flipped by VO) */
      double video_pts;
 diff --git a/player/video.c b/player/video.c
-index 29b5bc6bc..cf41b2021 100644
+index 29b5bc6bc4e717bbfb6ed4af77513883f89f0c1a..cf41b2021d17a91aa41ce11164c4b699f424ccb8 100644
 --- a/player/video.c
 +++ b/player/video.c
 @@ -98,6 +98,7 @@ static void vo_chain_reset_state(struct vo_chain *vo_c)
@@ -200,7 +183,7 @@ index 29b5bc6bc..cf41b2021 100644
  
      // We can only drop all frames at most. We can repeat much more frames,
 diff --git a/video/filter/vf_gpu_vulkan.c b/video/filter/vf_gpu_vulkan.c
-index 71628fe91..53c4fcf25 100644
+index 71628fe91ecea90af74e5da80218c3683891ecb5..53c4fcf25ccd230e1979953bd4727b848ba35a73 100644
 --- a/video/filter/vf_gpu_vulkan.c
 +++ b/video/filter/vf_gpu_vulkan.c
 @@ -77,7 +77,7 @@ static struct offscreen_ctx *vk_offscreen_ctx_create(struct mpv_global *global,
@@ -213,7 +196,7 @@ index 71628fe91..53c4fcf25 100644
          goto error;
  
 diff --git a/video/out/d3d11/context.c b/video/out/d3d11/context.c
-index 8bac900b2..74ac184be 100644
+index 8bac900b2f996b5e642993a872681e7f3425346c..74ac184be620fb0cb0a82f671d9946592986fea5 100644
 --- a/video/out/d3d11/context.c
 +++ b/video/out/d3d11/context.c
 @@ -27,6 +27,7 @@
@@ -303,7 +286,7 @@ index 8bac900b2..74ac184be 100644
      if (p->vsync.duration && stats.PresentCount &&
 diff --git a/video/out/presentation_feedback.h b/video/out/presentation_feedback.h
 new file mode 100644
-index 000000000..daf7cc125
+index 0000000000000000000000000000000000000000..daf7cc12589bf6c909f4d798bd73d3ef62ec7fc2
 --- /dev/null
 +++ b/video/out/presentation_feedback.h
 @@ -0,0 +1,146 @@
@@ -454,7 +437,7 @@ index 000000000..daf7cc125
 +    return correction;
 +}
 diff --git a/video/out/vo.c b/video/out/vo.c
-index dfea9efc2..3c7b9e7f9 100644
+index dfea9efc2d5e7f59d1ab0b03f6ea9b5abc2aa632..3c7b9e7f958d0f06b0cac7c4116e7711d12fc483 100644
 --- a/video/out/vo.c
 +++ b/video/out/vo.c
 @@ -26,6 +26,7 @@
@@ -590,7 +573,7 @@ index dfea9efc2..3c7b9e7f9 100644
  {
      struct vo_internal *in = vo->in;
 diff --git a/video/out/vo.h b/video/out/vo.h
-index f7a72a5f6..e3243365b 100644
+index f7a72a5f615c006f2e527e388573eb5f48627745..e3243365b152a69bdb70b9ec8062c6871deb9782 100644
 --- a/video/out/vo.h
 +++ b/video/out/vo.h
 @@ -348,6 +348,11 @@ struct vo_frame {
@@ -622,7 +605,7 @@ index f7a72a5f6..e3243365b 100644
      // Encoding functionality, which can be invoked via --o only.
      bool encode;
 diff --git a/video/out/vulkan/context.c b/video/out/vulkan/context.c
-index 4fcdf1156..80b48787e 100644
+index 4fcdf11567c557e47c0d4ee10caf04dbd2b050d7..80b48787ee60157790aef29da46dfed937b8f1fe 100644
 --- a/video/out/vulkan/context.c
 +++ b/video/out/vulkan/context.c
 @@ -24,6 +24,7 @@
@@ -717,7 +700,7 @@ index 4fcdf1156..80b48787e 100644
          p->params.get_vsync(sw->ctx, info);
  }
 diff --git a/video/out/vulkan/context.h b/video/out/vulkan/context.h
-index c3013edbd..12306a848 100644
+index c3013edbd132f0cf5cb95355ba152d55e8ff3705..12306a8486107329e9bcaa72dfc232655ca87cb4 100644
 --- a/video/out/vulkan/context.h
 +++ b/video/out/vulkan/context.h
 @@ -14,7 +14,7 @@ pl_vulkan mppl_create_vulkan(struct vulkan_opts *opts,
@@ -729,6 +712,3 @@ index c3013edbd..12306a848 100644
  
  // Handles a resize request, and updates ctx->vo->dwidth/dheight
  bool ra_vk_ctx_resize(struct ra_ctx *ctx, int width, int height);
--- 
-2.54.0.windows.1
-

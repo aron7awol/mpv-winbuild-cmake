@@ -1,14 +1,11 @@
-From a5635ca9dc626ece6c339357a8408b8462eae24d Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Tue, 22 Sep 2026 23:01:45 -0400
+From 790fe2bd7c3e1c93a9b60e0de6e66755a353f133 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:52:51 -0500
 Subject: [PATCH] Make user-data payload logging trace-only
 
----
- player/command.c | 14 +++++++++++++-
- 1 file changed, 13 insertions(+), 1 deletion(-)
 
 diff --git a/player/command.c b/player/command.c
-index 3505a102f..dde9f9729 100644
+index 3505a102fce38e0822b5f216cbbb4eec2034af7d..dde9f9729b694f64f2923f4cc27b00c1dc138673 100644
 --- a/player/command.c
 +++ b/player/command.c
 @@ -5314,6 +5314,11 @@ static bool is_property_set(int action, void *val)
@@ -46,6 +43,3 @@ index 3505a102f..dde9f9729 100644
      mp_cmd_dump(mpctx->log, noise ? MSGL_TRACE : MSGL_DEBUG, "Run command:", cmd);
  
      if (cmd->flags & MP_EXPAND_PROPERTIES) {
--- 
-2.54.0.windows.1
-

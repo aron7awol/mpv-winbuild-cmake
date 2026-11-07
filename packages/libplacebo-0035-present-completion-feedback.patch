@@ -1,15 +1,11 @@
-From 4300bcbc94e3e0f98b7e829eadd616c0c11cf91d Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Sat, 26 Sep 2026 11:32:11 -0400
+From 5ff0239da550574f8f236877240c30be67a175c8 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:54:44 -0500
 Subject: [PATCH] Add opt-in nonblocking Vulkan present-completion accounting
 
----
- src/include/libplacebo/vulkan.h | 10 +++++
- src/vulkan/swapchain.c          | 67 +++++++++++++++++++++++++++++++++
- 2 files changed, 77 insertions(+)
 
 diff --git a/src/include/libplacebo/vulkan.h b/src/include/libplacebo/vulkan.h
-index a121da30..732901a4 100644
+index a121da302312a5c844af8eea9cfb7aec157b086a..732901a4f2da8fd1f8112a63e621de50e72e92cc 100644
 --- a/src/include/libplacebo/vulkan.h
 +++ b/src/include/libplacebo/vulkan.h
 @@ -647,6 +647,16 @@ struct pl_vulkan_sem_params {
@@ -30,7 +26,7 @@ index a121da30..732901a4 100644
  
  #endif // LIBPLACEBO_VULKAN_H_
 diff --git a/src/vulkan/swapchain.c b/src/vulkan/swapchain.c
-index 90f5da31..13dfd0c2 100644
+index 90f5da3101f38b2bcc8df385e74bd730546dabae..13dfd0c2c7c1e1edee350e3141469ecfbac4165e 100644
 --- a/src/vulkan/swapchain.c
 +++ b/src/vulkan/swapchain.c
 @@ -25,6 +25,8 @@
@@ -139,6 +135,3 @@ index 90f5da31..13dfd0c2 100644
  static const struct pl_sw_fns vulkan_swapchain = {
      .destroy            = vk_sw_destroy,
      .latency            = vk_sw_latency,
--- 
-2.54.0.windows.1
-

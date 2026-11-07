@@ -1,19 +1,14 @@
-From 8b19f91f62e7b20b7e27473678cb20ea450f6880 Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Sun, 23 Aug 2026 14:00:00 -0400
+From 8e6af60114e4abf4055525df5cd4cbdf38c3714b Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:49:53 -0500
 Subject: [PATCH] msg: optionally retain previous log files
 
----
- DOCS/man/options.rst |  7 +++++++
- common/msg.c         | 19 +++++++++++++++++++
- options/options.c    |  2 ++
- options/options.h    |  1 +
- 4 files changed, 29 insertions(+)
 
 diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index 23c1d3b629bb705730c049c42fb99f96072aa072..33172a9a144573ba4a23d4bac38b8bfd20cf0b0e 100644
 --- a/DOCS/man/options.rst
 +++ b/DOCS/man/options.rst
-@@ -828,6 +828,13 @@ Program Behavior
+@@ -827,6 +827,13 @@ Program Behavior
      A special case is the macOS bundle, it will create a log file at
      ``~/Library/Logs/mpv.log`` by default.
  
@@ -28,9 +23,10 @@ diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
      Force a different configuration directory. If this is set, the given
      directory is used to load configuration files, and all other configuration
 diff --git a/common/msg.c b/common/msg.c
+index 2454dcea8d341d495b30a721fea33c5f68441549..f33a75f3fc5ec88136015ecc7730b16770e0d449 100644
 --- a/common/msg.c
 +++ b/common/msg.c
-@@ -843,6 +843,24 @@ static bool check_new_path(struct mpv_global *global, char *opt,
+@@ -848,6 +848,24 @@ static bool check_new_path(struct mpv_global *global, char *opt,
      return res;
  }
  
@@ -64,9 +60,11 @@ diff --git a/common/msg.c b/common/msg.c
              if (root->log_file) {
  
 diff --git a/options/options.c b/options/options.c
+index ff01972ecff4ace5654fd9578db9a0b7d9a4453f..cb2e145d51bf64559a9ff4bb8dada0f48879a48b 100644
 --- a/options/options.c
 +++ b/options/options.c
-@@ -541,5 +541,7 @@ static const m_option_t mp_opts[] = {
+@@ -540,6 +540,8 @@ static const m_option_t mp_opts[] = {
+ #ifndef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
      {"log-file", OPT_STRING(log_file),
          .flags = M_OPT_PRE_PARSE | M_OPT_FILE | UPDATE_TERM},
 +    {"log-file-backups", OPT_INT(log_file_backups), M_RANGE(0, 100),
@@ -75,9 +73,10 @@ diff --git a/options/options.c b/options/options.c
      {"msg-module", OPT_BOOL(msg_module), .flags = UPDATE_TERM},
      {"msg-time", OPT_BOOL(msg_time), .flags = UPDATE_TERM},
 diff --git a/options/options.h b/options/options.h
+index fe0c5eee1fced3695d2ba1fc04e400d580a68011..7934fa4f030d9a8972c00de3dbc8288c6e75e4bd 100644
 --- a/options/options.h
 +++ b/options/options.h
-@@ -179,6 +179,7 @@ typedef struct MPOpts {
+@@ -177,6 +177,7 @@ typedef struct MPOpts {
      bool msg_module;
      bool msg_time;
      char *log_file;
@@ -85,5 +84,3 @@ diff --git a/options/options.h b/options/options.h
  
      int operation_mode;
  
--- 
-2.51.0.windows.1

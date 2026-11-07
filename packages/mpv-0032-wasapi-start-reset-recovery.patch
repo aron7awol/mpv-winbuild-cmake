@@ -1,11 +1,30 @@
+From 46404c11a88147c4b76342657ba65728714051fe Mon Sep 17 00:00:00 2001
 From: mpv-ht development <mpv-ht@localhost>
-Subject: [PATCH] wasapi: recover from failed start/reset with a per-file retry limit
+Date: Sat, 7 Nov 2026 16:51:59 -0500
+Subject: [PATCH] wasapi: recover from failed start/reset with a per-file retry
+ limit
 
 Keep device-change reload events independent; bound control-error recovery to
 three attempts per file, with the counter surviving AO recreation.
 
+diff --git a/audio/out/ao.c b/audio/out/ao.c
+index 4e5e9e3df7942f3a2a1385446db9fa514862a344..5cb24bda0434354d26c0b8e423f931ec513a112e 100644
+--- a/audio/out/ao.c
++++ b/audio/out/ao.c
+@@ -384,6 +384,11 @@ void ao_request_reload(struct ao *ao)
+     ao_add_events(ao, AO_EVENT_RELOAD);
+ }
+ 
++void ao_request_reload_failure(struct ao *ao)
++{
++    ao_add_events(ao, AO_EVENT_RELOAD_FAILURE);
++}
++
+ // Notify the player that the device list changed. Fully thread-safe.
+ void ao_hotplug_event(struct ao *ao)
+ {
 diff --git a/audio/out/ao.h b/audio/out/ao.h
-index 843b1bc..7f37ef5 100644
+index 843b1bc1d9526b7f2bc972ad0bac0b7a0203a092..7f37ef5192b066e11ea34776547ebb13b94a997d 100644
 --- a/audio/out/ao.h
 +++ b/audio/out/ao.h
 @@ -45,6 +45,7 @@ enum aocontrol {
@@ -24,24 +43,8 @@ index 843b1bc..7f37ef5 100644
  void ao_hotplug_event(struct ao *ao);
  
  struct ao_hotplug;
-diff --git a/audio/out/ao.c b/audio/out/ao.c
-index 4e5e9e3..5cb24bd 100644
---- a/audio/out/ao.c
-+++ b/audio/out/ao.c
-@@ -384,6 +384,11 @@ void ao_request_reload(struct ao *ao)
-     ao_add_events(ao, AO_EVENT_RELOAD);
- }
- 
-+void ao_request_reload_failure(struct ao *ao)
-+{
-+    ao_add_events(ao, AO_EVENT_RELOAD_FAILURE);
-+}
-+
- // Notify the player that the device list changed. Fully thread-safe.
- void ao_hotplug_event(struct ao *ao)
- {
 diff --git a/audio/out/ao_wasapi.c b/audio/out/ao_wasapi.c
-index 337c24f..c96542d 100644
+index 3991237b53d08f22ea9326b0d3385d832011a65d..16d826e09924855d49c6e17cbdbb8c4f20b66190 100644
 --- a/audio/out/ao_wasapi.c
 +++ b/audio/out/ao_wasapi.c
 @@ -180,6 +180,7 @@ static void thread_unpause(struct ao *ao)
@@ -65,20 +68,8 @@ index 337c24f..c96542d 100644
  
      atomic_store(&state->sample_count, 0);
  }
-diff --git a/player/core.h b/player/core.h
-index ec67844..b7992bb 100644
---- a/player/core.h
-+++ b/player/core.h
-@@ -342,6 +342,7 @@ typedef struct MPContext {
-     struct mp_image *saved_frame;   // for hrseek_lastframe and hrseek_backstep
- 
-     enum playback_status video_status, audio_status;
-+    int audio_failure_reloads; // survives AO recreation, reset for each new file
-     bool restart_complete;
-     int play_dir;
-     // Factors to multiply with opts->playback_speed to get the total audio or
 diff --git a/player/audio.c b/player/audio.c
-index bb3a301..87cc427 100644
+index bb3a30196a90930bbb450853307e1153759cdf2e..87cc427cc5f60b02694012d33e6a9bf58644e6aa 100644
 --- a/player/audio.c
 +++ b/player/audio.c
 @@ -875,8 +875,24 @@ void fill_audio_out_buffers(struct MPContext *mpctx)
@@ -108,8 +99,20 @@ index bb3a301..87cc427 100644
  
      update_throttle(mpctx);
  
+diff --git a/player/core.h b/player/core.h
+index ec6784411c9699c2db9e03fe929750955b7bf139..b7992bbdef4dffaf0efd2084a2bd3fb25841d3e6 100644
+--- a/player/core.h
++++ b/player/core.h
+@@ -342,6 +342,7 @@ typedef struct MPContext {
+     struct mp_image *saved_frame;   // for hrseek_lastframe and hrseek_backstep
+ 
+     enum playback_status video_status, audio_status;
++    int audio_failure_reloads; // survives AO recreation, reset for each new file
+     bool restart_complete;
+     int play_dir;
+     // Factors to multiply with opts->playback_speed to get the total audio or
 diff --git a/player/loadfile.c b/player/loadfile.c
-index 3ded4e7..f833a14 100644
+index 3ded4e71c45a49ae9ce1f29cceaacdc5df57912c..f833a148c3c58a930378b06213102bfb667db670 100644
 --- a/player/loadfile.c
 +++ b/player/loadfile.c
 @@ -1789,6 +1789,7 @@ static void play_current_file(struct MPContext *mpctx)

@@ -1,17 +1,11 @@
-From 8d5d1b62c3ffe1cb8b1ea4c6927d6dd22b792076 Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Sat, 22 Aug 2026 17:48:13 -0400
+From ab2c16f7cef85ddbf725e90a926952389938bf6c Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:49:52 -0500
 Subject: [PATCH] gpu-next: expose HDR ambient exponent
 
----
- DOCS/man/options.rst    | 7 +++++++
- video/out/gpu/video.c   | 3 +++
- video/out/gpu/video.h   | 1 +
- video/out/vo_gpu_next.c | 1 +
- 4 files changed, 12 insertions(+)
 
 diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
-index c9a8ca4b0..f4562a3a2 100644
+index 279c1fd632f99efd175e9ea288c7eebf98654ecc..0455bf778d127325d4b7391ab1fd46adf5352022 100644
 --- a/DOCS/man/options.rst
 +++ b/DOCS/man/options.rst
 @@ -7765,6 +7765,13 @@ them.
@@ -29,7 +23,7 @@ index c9a8ca4b0..f4562a3a2 100644
      If set, allows inverse tone mapping (expanding dynamic range). Can be used
      for upscaling SDR content to HDR, or for making HDR content brighter.
 diff --git a/video/out/gpu/video.c b/video/out/gpu/video.c
-index d748805fd..1bd3bcf5c 100644
+index d748805fd05d280e790c5daa9705c6ee52f8b9f6..1bd3bcf5c35d0ecaec54c990619507a0db9080f3 100644
 --- a/video/out/gpu/video.c
 +++ b/video/out/gpu/video.c
 @@ -400,6 +400,7 @@ static const struct gl_video_opts gl_video_opts_def = {
@@ -50,7 +44,7 @@ index d748805fd..1bd3bcf5c 100644
          {"tone-mapping-max-boost", OPT_FLOAT(tone_map.max_boost),
              M_RANGE(1.0, 10.0)},
 diff --git a/video/out/gpu/video.h b/video/out/gpu/video.h
-index 097611b87..3ee712576 100644
+index 097611b87809c839cd70da2a72cde9a916aa6c3d..3ee712576d5672e95d9f63c5b65aafa7ab5c1952 100644
 --- a/video/out/gpu/video.h
 +++ b/video/out/gpu/video.h
 @@ -129,6 +129,7 @@ struct gl_tone_map_opts {
@@ -62,10 +56,10 @@ index 097611b87..3ee712576 100644
      float max_boost;
      bool inverse;
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index 071ec0129..793275e73 100644
+index d6bd86e055a175f1b024d1d69475978ff3732697..3920b15f3ff0bceb17edf48075bbdc4b173e58c0 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
-@@ -3197,6 +3197,7 @@ AV_NOWARN_DEPRECATED(
+@@ -3353,6 +3353,7 @@ AV_NOWARN_DEPRECATED(
      }
      pars->color_map_params.adaptive_chroma_strength =
          opts->tone_map.adaptive_chroma_strength / 100.0f;
@@ -73,5 +67,3 @@ index 071ec0129..793275e73 100644
      pars->color_map_params.hlg_reference_peak = opts->tone_map.hlg_reference_peak;
      pars->color_map_params.hard_clip_hdr_target = opts->target_peak > 0;
      pars->color_map_params.inverse_tone_mapping = opts->tone_map.inverse;
--- 
-2.54.0.windows.1

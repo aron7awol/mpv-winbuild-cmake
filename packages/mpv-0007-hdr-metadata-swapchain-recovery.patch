@@ -1,18 +1,11 @@
-From 07a6ef39a8e45414d93eb73f3ddcdc306652fe40 Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Sat, 1 Aug 2026 01:58:40 -0400
+From ac2c6ad1e06b31ca02d7fa32c45a6ed10cecf77e Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:49:31 -0500
 Subject: [PATCH] d3d11: recover HDR metadata with a fresh swapchain
 
----
- video/out/d3d11/context.c    | 49 ++++++++++++++++++++++++++++++++++++
- video/out/d3d11/context.h    |  4 +++
- video/out/gpu_next/context.c | 30 ++++++++++++++++++++++
- video/out/gpu_next/context.h |  1 +
- video/out/vo_gpu_next.c      | 44 ++++++++++++++++++++++++++++++++
- 5 files changed, 128 insertions(+)
 
 diff --git a/video/out/d3d11/context.c b/video/out/d3d11/context.c
-index fc8802e60..9fb65e283 100644
+index fc8802e607e4e30b0351771e58f55d917f7ac6ac..9fb65e2838f540a8fdfcbec44b29f08b5f594699 100644
 --- a/video/out/d3d11/context.c
 +++ b/video/out/d3d11/context.c
 @@ -598,6 +598,55 @@ IDXGISwapChain *ra_d3d11_ctx_get_swapchain(struct ra_ctx *ra)
@@ -72,7 +65,7 @@ index fc8802e60..9fb65e283 100644
  void ra_d3d11_ctx_set_swapchain_params(struct ra_ctx *ra,
                                         struct pl_d3d11_swapchain_params *params)
 diff --git a/video/out/d3d11/context.h b/video/out/d3d11/context.h
-index 640533b87..2f7d53ad8 100644
+index 640533b878d93dd14a0602cb651fe5928a767b41..2f7d53ad87e0d56aa342db3aa5fd867ee96def38 100644
 --- a/video/out/d3d11/context.h
 +++ b/video/out/d3d11/context.h
 @@ -8,6 +8,10 @@
@@ -87,7 +80,7 @@ index 640533b87..2f7d53ad8 100644
  // an RA context.
  struct pl_d3d11_swapchain_params;
 diff --git a/video/out/gpu_next/context.c b/video/out/gpu_next/context.c
-index 369921cfc..259c6ef09 100644
+index 369921cfc51b877bae8fdc07520727121a3174a1..259c6ef09373413904e5cc813d14ecff9b76b358 100644
 --- a/video/out/gpu_next/context.c
 +++ b/video/out/gpu_next/context.c
 @@ -191,6 +191,36 @@ bool gpu_ctx_resize(struct gpu_ctx *ctx, int w, int h)
@@ -128,7 +121,7 @@ index 369921cfc..259c6ef09 100644
  {
      struct gpu_ctx *ctx = *ctxp;
 diff --git a/video/out/gpu_next/context.h b/video/out/gpu_next/context.h
-index aa441964f..9b1c48d05 100644
+index aa441964fb0984161445b532858bbb9aa6acf2cd..9b1c48d05e518faa858cec639a858be6926adbc2 100644
 --- a/video/out/gpu_next/context.h
 +++ b/video/out/gpu_next/context.h
 @@ -37,4 +37,5 @@ struct gpu_ctx {
@@ -138,10 +131,10 @@ index aa441964f..9b1c48d05 100644
 +bool gpu_ctx_recreate_d3d11_swapchain(struct gpu_ctx *ctx);
  void gpu_ctx_destroy(struct gpu_ctx **ctxp);
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index 27567827e..f84d73d74 100644
+index 5afb4c71f54e40d7fc4e75cfde10ecfd0c5d8dc5..8e2073ba2202dc87111eccac901ebf010d332de2 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
-@@ -169,6 +169,10 @@ struct priv {
+@@ -170,6 +170,10 @@ struct priv {
      struct frame_info perf_redraw;
  
      struct mp_image_params target_params;
@@ -152,7 +145,7 @@ index 27567827e..f84d73d74 100644
  };
  
  static void update_render_options(struct vo *vo);
-@@ -188,6 +192,7 @@ struct gl_next_opts {
+@@ -189,6 +193,7 @@ struct gl_next_opts {
      int target_hint;
      int target_hint_mode;
      bool target_hint_strict;
@@ -160,7 +153,7 @@ index 27567827e..f84d73d74 100644
      char **raw_opts;
  };
  
-@@ -223,6 +228,8 @@ const struct m_sub_options gl_next_conf = {
+@@ -224,6 +229,8 @@ const struct m_sub_options gl_next_conf = {
          {"target-colorspace-hint", OPT_CHOICE(target_hint, {"auto", -1}, {"no", 0}, {"yes", 1})},
          {"target-colorspace-hint-mode", OPT_CHOICE(target_hint_mode, {"target", 0}, {"source", 1}, {"source-dynamic", 2})},
          {"target-colorspace-hint-strict", OPT_BOOL(target_hint_strict)},
@@ -169,7 +162,7 @@ index 27567827e..f84d73d74 100644
          // No `target-lut-type` because we don't support non-RGB targets
          {"libplacebo-opts", OPT_KEYVALUELIST(raw_opts)},
          {0},
-@@ -1175,6 +1182,9 @@ static void apply_crop(struct pl_frame *frame, struct mp_rect crop,
+@@ -1255,6 +1262,9 @@ static void apply_crop(struct pl_frame *frame, struct mp_rect crop,
  static bool set_colorspace_hint(struct priv *p, struct pl_color_space *hint)
  {
      struct ra_swapchain *sw = p->ra_ctx->swapchain;
@@ -179,7 +172,7 @@ index 27567827e..f84d73d74 100644
  
      struct mp_image_params params = {
          .color = hint ? *hint : pl_color_space_srgb,
-@@ -1686,6 +1696,8 @@ static void flip_page(struct vo *vo)
+@@ -1766,6 +1776,8 @@ static void flip_page(struct vo *vo)
  {
      struct priv *p = vo->priv;
      struct ra_swapchain *sw = p->ra_ctx->swapchain;
@@ -188,7 +181,7 @@ index 27567827e..f84d73d74 100644
  
      if (p->frame_pending) {
          if (!pl_swapchain_submit_frame(p->sw))
-@@ -1693,7 +1705,37 @@ static void flip_page(struct vo *vo)
+@@ -1773,7 +1785,37 @@ static void flip_page(struct vo *vo)
          p->frame_pending = false;
      }
  
@@ -226,7 +219,7 @@ index 27567827e..f84d73d74 100644
  }
  
  static void get_vsync(struct vo *vo, struct vo_vsync_info *info)
-@@ -2413,6 +2455,8 @@ static int preinit(struct vo *vo)
+@@ -2493,6 +2535,8 @@ static int preinit(struct vo *vo)
      p->opts_cache = m_config_cache_alloc(p, vo->global, &gl_video_conf);
      p->next_opts_cache = m_config_cache_alloc(p, vo->global, &gl_next_conf);
      p->next_opts = p->next_opts_cache->opts;
@@ -235,5 +228,3 @@ index 27567827e..f84d73d74 100644
      p->video_eq = mp_csp_equalizer_create(p, vo->global);
      p->global = vo->global;
      p->log = vo->log;
--- 
-2.54.0.windows.1

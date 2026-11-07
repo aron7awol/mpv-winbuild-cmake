@@ -1,17 +1,14 @@
-From 14d8a86a27c74e9dff0d9236595df6bca2074cf0 Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Fri, 14 Aug 2026 16:37:46 -0400
+From 5715c5a25c596bc2f09400d935499c11b917c0aa Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:49:50 -0500
 Subject: [PATCH] gpu-next: hard-clip explicit HDR targets
 
----
- video/out/vo_gpu_next.c | 1 +
- 1 file changed, 1 insertion(+)
 
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index aa69685bd..1bb6f8398 100644
+index 4bb033e06840b16a8c4ca2f94675079b05d6b975..5209f42406fd558e4374e053440f2c774eda0722 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
-@@ -3192,6 +3192,7 @@ AV_NOWARN_DEPRECATED(
+@@ -3351,6 +3351,7 @@ AV_NOWARN_DEPRECATED(
      }
      pars->color_map_params.adaptive_chroma_strength =
          opts->tone_map.adaptive_chroma_strength / 100.0f;
@@ -19,5 +16,3 @@ index aa69685bd..1bb6f8398 100644
      pars->color_map_params.inverse_tone_mapping = opts->tone_map.inverse;
      pars->color_map_params.contrast_recovery = opts->tone_map.contrast_recovery;
      pars->color_map_params.visualize_lut = opts->tone_map.visualize;
--- 
-2.54.0.windows.1

@@ -1,14 +1,11 @@
-From cac28699a9f8766a6d28cd5737b8b43f4531b1f0 Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Sun, 2 Aug 2026 00:52:48 -0400
+From b485c7b9115313b6f928690c8b0f74d9d2598cfa Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:52:56 -0500
 Subject: [PATCH] colorspace: use PQ signal black for tone input
 
----
- src/shaders/colorspace.c | 9 +++++++++
- 1 file changed, 9 insertions(+)
 
 diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
-index 4a1fa61c..7821c84d 100644
+index 703822aef1d32925ed40791692be36d1e86e85f2..4969cbc918bf29e564e7e3799979ec72bf8b3e2f 100644
 --- a/src/shaders/colorspace.c
 +++ b/src/shaders/colorspace.c
 @@ -1835,6 +1835,15 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
@@ -27,5 +24,3 @@ index 4a1fa61c..7821c84d 100644
      pl_color_space_nominal_luma_ex(pl_nominal_luma_params(
          .color      = &dst,
          .metadata   = PL_HDR_METADATA_HDR10,
--- 
-2.54.0.windows.1

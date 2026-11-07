@@ -1,16 +1,11 @@
-From cd621f19419f763d989d21b18f627c8c2da110a6 Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Mon, 10 Aug 2026 14:31:30 -0400
+From ed39fc07529fbba72654f9975741d0850e25ef18 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:49:48 -0500
 Subject: [PATCH] win32: focus window after accepted file drop
 
----
- video/out/w32_common.c       |  3 ++-
- video/out/win32/droptarget.c | 13 ++++++++++++-
- video/out/win32/droptarget.h |  3 ++-
- 3 files changed, 16 insertions(+), 3 deletions(-)
 
 diff --git a/video/out/w32_common.c b/video/out/w32_common.c
-index 2245f230a..bd1f09438 100644
+index 2245f230a6bb51791d29729db8a0807569ebd2fd..bd1f09438705f69d34899ade52120f07a421acde 100644
 --- a/video/out/w32_common.c
 +++ b/video/out/w32_common.c
 @@ -2116,7 +2116,8 @@ static MP_THREAD_VOID gui_thread(void *ptr)
@@ -24,7 +19,7 @@ index 2245f230a..bd1f09438 100644
  
          // ITaskbarList2 has the MarkFullscreenWindow method, which is used to
 diff --git a/video/out/win32/droptarget.c b/video/out/win32/droptarget.c
-index 4582e441c..14a075616 100644
+index 4582e441cfa68457f2445d8bebc2b1891431b37c..14a075616af2304f4f4759b1905fe55f7ddcadcd 100644
 --- a/video/out/win32/droptarget.c
 +++ b/video/out/win32/droptarget.c
 @@ -37,6 +37,7 @@ struct droptarget {
@@ -90,7 +85,7 @@ index 4582e441c..14a075616 100644
      return &dt->iface;
  }
 diff --git a/video/out/win32/droptarget.h b/video/out/win32/droptarget.h
-index 1c18c06d9..24e8a53ef 100644
+index 1c18c06d9bd697887afc874d21782ef1042b375f..24e8a53ef413fee34e5c72d980b5f95f3b7f4382 100644
 --- a/video/out/win32/droptarget.h
 +++ b/video/out/win32/droptarget.h
 @@ -30,6 +30,7 @@
@@ -102,5 +97,3 @@ index 1c18c06d9..24e8a53ef 100644
 +                                      HWND window);
  
  #endif
--- 
-2.54.0.windows.1

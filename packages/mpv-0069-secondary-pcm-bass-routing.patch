@@ -1,17 +1,64 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Codex <noreply@openai.com>
-Date: Wed, 7 Oct 2026 19:30:00 -0400
+From 5298b72d64c3ac7a7676d6d6c0b3d156c883fc1c Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:52:53 -0500
 Subject: [PATCH] audio: secondary stereo LFE and bass management
 
 Keep full PCM as the default. Route LFE to both stereo channels, or
 sum all main-channel bass with LFE using a common crossover and
 20.2 dB fixed headroom. Preserve primary bitstream and PCM clock control.
 
----
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index 0d9301656073d0cf03c45fcb4b9eade9dfdcac64..195b72d6aae66a11fc158a289ffb121ca88427ca 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -2107,6 +2107,42 @@ Audio
+             ``--audio-device=alsa/dmix:default``
+ 
+ 
++``--audio-pcm-content=<all|lfe|bass|lfe-bass>``
++    Select the content of the secondary decoded PCM output configured with
++    ``--audio-pcm-device`` (default: ``all``). Requires primary bitstream playback.
++
++    ``all`` preserves the decoded channel layout. ``lfe`` copies the named LFE
++    channel at its decoded level to both left and right of a stereo output,
++    suitable for a two-channel USB DAC/DSP. A track without an LFE channel sends
++    stereo silence. This does not redirect bass from the other channels or add
++    an LFE gain boost. The primary bitstream is unaffected. Summing both identical
++    channels downstream increases their combined level.
++
++    ``bass`` redirects every main channel through a fourth-order Linkwitz-Riley
++    low-pass filter and combines the result with LFE at +10 dB relative gain.
++    The identical bass signal is sent to both stereo channels. LFE retains its
++    authored bandwidth. The fixed 20.2 dB headroom rounds up the 20.14 dB
++    worst-case coherent 7.1 channel sum. Layouts larger than 7.1 reserve additional
++    headroom. This is constant attenuation, with no limiter or normalization of
++    program peaks. Calibrate the external device for this output level. The
++    summation allowance assumes nominal full-scale decoded PCM; filter/resampler
++    overshoot and downstream gain, EQ or summation are not bounded by it.
++
++    ``lfe-bass`` sends raw LFE to the left channel, as in ``lfe`` mode, and the
++    bass-managed mix to the right, as in ``bass`` mode. Only the right channel
++    uses the crossover and 20.2 dB bass headroom. Without LFE, left is silent
++    while right still carries redirected main-channel bass. Calibrate the two
++    downstream signal paths independently: the LFE component in the right
++    channel is 10.2 dB below the left.
++
++    The secondary output retains its existing delay and clock synchronization.
++    Changing content during playback reinitializes audio and refreshes playback.
++
++``--audio-pcm-crossover=<20-250>``
++    Common crossover in Hz for all main channels in secondary bass-managed PCM
++    (default: 80). LFE is not filtered by this crossover. The primary bitstream
++    and the receiver's speaker crossover settings are unaffected.
++
+ ``--audio-exclusive=<yes|no>``
+     Enable exclusive output mode. In this mode, the system is usually locked
+     out, and only mpv will be able to output audio.
 diff --git a/audio/aframe.c b/audio/aframe.c
+index fbba7a3b104451f788a966d8f1093100f954a562..fa1d319867af8d6f42c392900b27ea564c0e7259 100644
 --- a/audio/aframe.c
 +++ b/audio/aframe.c
-@@ -550,6 +550,60 @@
+@@ -550,6 +550,60 @@ bool mp_aframe_copy_samples(struct mp_aframe *dst, int dst_offset,
      return true;
  }
  
@@ -73,9 +120,10 @@ diff --git a/audio/aframe.c b/audio/aframe.c
  {
      if (mp_aframe_get_size(f) < offset + samples)
 diff --git a/audio/aframe.h b/audio/aframe.h
+index d19c7e8bcbf3f82d59e7b9fe42730dc67a5ad907..695fbc80721c1d9c911cd7372c142d1a7ddd2b64 100644
 --- a/audio/aframe.h
 +++ b/audio/aframe.h
-@@ -73,3 +73,8 @@
+@@ -73,3 +73,8 @@ struct mp_aframe_pool;
  struct mp_aframe_pool *mp_aframe_pool_create(void *ta_parent);
  int mp_aframe_pool_allocate(struct mp_aframe_pool *pool, struct mp_aframe *frame,
                              int samples);
@@ -86,6 +134,7 @@ diff --git a/audio/aframe.h b/audio/aframe.h
 +                                     struct mp_aframe *src, bool *has_lfe);
 diff --git a/audio/bass_redirect.c b/audio/bass_redirect.c
 new file mode 100644
+index 0000000000000000000000000000000000000000..be28d39c5f2d9020d476f6c3f43b7a8f28c923ef
 --- /dev/null
 +++ b/audio/bass_redirect.c
 @@ -0,0 +1,111 @@
@@ -202,6 +251,7 @@ new file mode 100644
 +}
 diff --git a/audio/bass_redirect.h b/audio/bass_redirect.h
 new file mode 100644
+index 0000000000000000000000000000000000000000..34489dd45a92c16d9bc965bd2f579ec5907c6821
 --- /dev/null
 +++ b/audio/bass_redirect.h
 @@ -0,0 +1,22 @@
@@ -227,7 +277,56 @@ new file mode 100644
 +struct mp_aframe *mp_bass_redirect_frame(struct mp_bass_redirect *state,
 +    struct mp_aframe_pool *pool, struct mp_aframe *src, double crossover,
 +    bool lfe_left);
+diff --git a/meson.build b/meson.build
+index 3ad7cb1762c5c75fb24f14276a79fc945f1012b8..a4226a158d80e9fbe50cedcdf60e79b31d31ac7d 100644
+--- a/meson.build
++++ b/meson.build
+@@ -57,6 +57,7 @@ features = {
+ sources = files(
+     ## Audio
+     'audio/aframe.c',
++    'audio/bass_redirect.c',
+     'audio/chmap.c',
+     'audio/chmap_avchannel.c',
+     'audio/chmap_sel.c',
+diff --git a/options/options.c b/options/options.c
+index 30153d902cec1ed607792611cff3748c0987084f..8241b3342de38711df293ba7358d004327ab3959 100644
+--- a/options/options.c
++++ b/options/options.c
+@@ -773,6 +773,10 @@ static const m_option_t mp_opts[] = {
+     {"audio-exclusive", OPT_BOOL(audio_exclusive), .flags = UPDATE_AUDIO},
+     {"audio-pcm-device", OPT_STRING(audio_pcm_device), .flags = UPDATE_AD},
+     {"audio-pcm-delay", OPT_DOUBLE(audio_pcm_delay), M_RANGE(-1, 1)},
++    {"audio-pcm-content", OPT_CHOICE(audio_pcm_content,
++        {"all", 0}, {"lfe", 1}, {"bass", 2}, {"lfe-bass", 3}), .flags = UPDATE_AD},
++    {"audio-pcm-crossover", OPT_INT(audio_pcm_crossover), M_RANGE(20, 250),
++        .flags = UPDATE_AD},
+     {"audio-fallback-to-null", OPT_BOOL(ao_null_fallback)},
+     {"audio-stream-silence", OPT_BOOL(audio_stream_silence)},
+     {"audio-wait-open", OPT_FLOAT(audio_wait_open), M_RANGE(0, 60)},
+@@ -1016,6 +1020,7 @@ static const m_option_t mp_opts[] = {
+ };
+ 
+ static const struct MPOpts mp_default_opts = {
++    .audio_pcm_crossover = 80,
+     .use_terminal = true,
+     .msg_color = true,
+     .softvol_max = 130,
+diff --git a/options/options.h b/options/options.h
+index e596a3f4e7a6e881eb50a5e5a7cd2f2a07b829e1..7e3b5461de125b412e845636b0af46aa8ead4969 100644
+--- a/options/options.h
++++ b/options/options.h
+@@ -203,6 +203,8 @@ typedef struct MPOpts {
+     bool audio_exclusive;
+     char *audio_pcm_device;
+     double audio_pcm_delay;
++    int audio_pcm_content;
++    int audio_pcm_crossover;
+     bool ao_null_fallback;
+     bool audio_stream_silence;
+     float audio_wait_open;
 diff --git a/player/audio_secondary.c b/player/audio_secondary.c
+index e11a4f132d97cefe6e468d1ee7503feed99ee5ad..2c3a07176dbead20f66a4d4490e56e0c9bd685b2 100644
 --- a/player/audio_secondary.c
 +++ b/player/audio_secondary.c
 @@ -5,6 +5,7 @@
@@ -247,7 +346,7 @@ diff --git a/player/audio_secondary.c b/player/audio_secondary.c
      struct mp_decoder *decoder;
      struct mp_output_chain *chain;
      struct ao *ao;
-@@ -28,7 +29,61 @@
+@@ -28,9 +29,63 @@ struct secondary_audio {
      double paused_at;
      double next_clock;
      bool planned, started, eof, failed, primary_start_known;
@@ -257,8 +356,8 @@ diff --git a/player/audio_secondary.c b/player/audio_secondary.c
 +    int crossover;
 +    int lfe_present; // -1 before the first decoded frame, 0 absent, 1 present.
      const char *error;
-+};
-+
+ };
+ 
 +struct lfe_route {
 +    struct secondary_audio *owner;
 +    struct mp_aframe_pool *pool;
@@ -306,10 +405,12 @@ diff --git a/player/audio_secondary.c b/player/audio_secondary.c
 +static const struct mp_filter_info lfe_info = {
 +    .name = "secondary-lfe", .priv_size = sizeof(struct lfe_route),
 +    .process = route_lfe, .reset = reset_route,
- };
- 
++};
++
  static bool enabled(struct MPContext *mpctx)
-@@ -112,6 +167,7 @@
+ {
+     return mpctx->opts->audio_pcm_device && mpctx->opts->audio_pcm_device[0];
+@@ -112,6 +167,7 @@ static void reset(struct mp_filter *f)
      s->drift = 0;
      s->paused_at = 0;
      s->next_clock = 0;
@@ -317,7 +418,7 @@ diff --git a/player/audio_secondary.c b/player/audio_secondary.c
      if (s->chain)
          mp_output_chain_set_audio_speed(s->chain, 1, 1, 1);
  }
-@@ -168,7 +224,11 @@
+@@ -168,7 +224,11 @@ static bool create(struct MPContext *mpctx)
      struct mp_filter *f = mp_filter_create(mpctx->filter_root, &info);
      struct secondary_audio *s = f->priv;
      *s = (struct secondary_audio){.mpctx = mpctx, .f = f,
@@ -330,7 +431,7 @@ diff --git a/player/audio_secondary.c b/player/audio_secondary.c
      mpctx->secondary_audio = s;
      // ad_lavc updates codec metadata; do not modify the primary decoder's copy.
      s->codec = *t->stream->codec;
-@@ -181,7 +241,18 @@
+@@ -181,7 +241,18 @@ static bool create(struct MPContext *mpctx)
      s->reader = mp_async_queue_create_filter(f, MP_PIN_OUT, t->dec->pcm_packets);
      s->chain = mp_output_chain_create(f, MP_OUTPUT_CHAIN_AUDIO);
      mp_pin_connect(s->decoder->f->pins[0], s->reader->pins[0]);
@@ -350,7 +451,7 @@ diff --git a/player/audio_secondary.c b/player/audio_secondary.c
      mp_pin_set_manual_connection_for(s->chain->f->pins[1], f);
      mp_filter_wakeup(f);
      return true;
-@@ -253,7 +324,8 @@
+@@ -253,7 +324,8 @@ void secondary_audio_update(struct MPContext *mpctx)
          fail(s, "simultaneous passthrough requires forward, normal-speed playback");
          return;
      }
@@ -360,7 +461,7 @@ diff --git a/player/audio_secondary.c b/player/audio_secondary.c
          fail(s, "PCM decoding or format conversion failed");
          return;
      }
-@@ -276,7 +348,8 @@
+@@ -276,7 +348,8 @@ void secondary_audio_update(struct MPContext *mpctx)
          struct mp_chmap actual;
          ao_get_format(s->ao, &rate, &format, &actual);
          if (af_fmt_is_spdif(format) || !mp_chmap_equals(&channels, &actual)) {
@@ -370,7 +471,7 @@ diff --git a/player/audio_secondary.c b/player/audio_secondary.c
              return;
          }
          mp_output_chain_set_ao(s->chain, s->ao);
-@@ -343,7 +416,15 @@
+@@ -343,7 +416,15 @@ char *secondary_audio_status(struct MPContext *mpctx)
          return talloc_strdup(NULL, "PCM: waiting for passthrough audio");
      if (s->failed)
          return talloc_asprintf(NULL, "error: PCM %s", s->error);
@@ -389,9 +490,10 @@ diff --git a/player/audio_secondary.c b/player/audio_secondary.c
          (s->speed - 1) * 1e6);
  }
 diff --git a/player/command.c b/player/command.c
+index 405c6988541c6081182e88627ce30042947c7abd..759d763dab3a70cb29ee4089bd6d3dd96863e60a 100644
 --- a/player/command.c
 +++ b/player/command.c
-@@ -8749,10 +8749,12 @@
+@@ -8783,10 +8783,12 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
  
      if (flags & UPDATE_AD && mpctx->ao_chain) {
          uninit_audio_chain(mpctx);
@@ -406,217 +508,9 @@ diff --git a/player/command.c b/player/command.c
              issue_refresh_seek(mpctx, MPSEEK_EXACT);
      }
  
-diff --git a/options/options.c b/options/options.c
---- a/options/options.c
-+++ b/options/options.c
-@@ -771,6 +771,10 @@
-     {"audio-exclusive", OPT_BOOL(audio_exclusive), .flags = UPDATE_AUDIO},
-     {"audio-pcm-device", OPT_STRING(audio_pcm_device), .flags = UPDATE_AD},
-     {"audio-pcm-delay", OPT_DOUBLE(audio_pcm_delay), M_RANGE(-1, 1)},
-+    {"audio-pcm-content", OPT_CHOICE(audio_pcm_content,
-+        {"all", 0}, {"lfe", 1}, {"bass", 2}, {"lfe-bass", 3}), .flags = UPDATE_AD},
-+    {"audio-pcm-crossover", OPT_INT(audio_pcm_crossover), M_RANGE(20, 250),
-+        .flags = UPDATE_AD},
-     {"audio-fallback-to-null", OPT_BOOL(ao_null_fallback)},
-     {"audio-stream-silence", OPT_BOOL(audio_stream_silence)},
-     {"audio-wait-open", OPT_FLOAT(audio_wait_open), M_RANGE(0, 60)},
-@@ -1014,6 +1018,7 @@
- };
- 
- static const struct MPOpts mp_default_opts = {
-+    .audio_pcm_crossover = 80,
-     .use_terminal = true,
-     .msg_color = true,
-     .softvol_max = 130,
-diff --git a/options/options.h b/options/options.h
---- a/options/options.h
-+++ b/options/options.h
-@@ -202,6 +202,8 @@
-     bool audio_exclusive;
-     char *audio_pcm_device;
-     double audio_pcm_delay;
-+    int audio_pcm_content;
-+    int audio_pcm_crossover;
-     bool ao_null_fallback;
-     bool audio_stream_silence;
-     float audio_wait_open;
-diff --git a/meson.build b/meson.build
---- a/meson.build
-+++ b/meson.build
-@@ -57,6 +57,7 @@
- sources = files(
-     ## Audio
-     'audio/aframe.c',
-+    'audio/bass_redirect.c',
-     'audio/chmap.c',
-     'audio/chmap_avchannel.c',
-     'audio/chmap_sel.c',
-diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
---- a/DOCS/man/options.rst
-+++ b/DOCS/man/options.rst
-@@ -2106,6 +2106,42 @@
- 
-             ``--audio-device=alsa/dmix:default``
- 
-+
-+``--audio-pcm-content=<all|lfe|bass|lfe-bass>``
-+    Select the content of the secondary decoded PCM output configured with
-+    ``--audio-pcm-device`` (default: ``all``). Requires primary bitstream playback.
-+
-+    ``all`` preserves the decoded channel layout. ``lfe`` copies the named LFE
-+    channel at its decoded level to both left and right of a stereo output,
-+    suitable for a two-channel USB DAC/DSP. A track without an LFE channel sends
-+    stereo silence. This does not redirect bass from the other channels or add
-+    an LFE gain boost. The primary bitstream is unaffected. Summing both identical
-+    channels downstream increases their combined level.
-+
-+    ``bass`` redirects every main channel through a fourth-order Linkwitz-Riley
-+    low-pass filter and combines the result with LFE at +10 dB relative gain.
-+    The identical bass signal is sent to both stereo channels. LFE retains its
-+    authored bandwidth. The fixed 20.2 dB headroom rounds up the 20.14 dB
-+    worst-case coherent 7.1 channel sum. Layouts larger than 7.1 reserve additional
-+    headroom. This is constant attenuation, with no limiter or normalization of
-+    program peaks. Calibrate the external device for this output level. The
-+    summation allowance assumes nominal full-scale decoded PCM; filter/resampler
-+    overshoot and downstream gain, EQ or summation are not bounded by it.
-+
-+    ``lfe-bass`` sends raw LFE to the left channel, as in ``lfe`` mode, and the
-+    bass-managed mix to the right, as in ``bass`` mode. Only the right channel
-+    uses the crossover and 20.2 dB bass headroom. Without LFE, left is silent
-+    while right still carries redirected main-channel bass. Calibrate the two
-+    downstream signal paths independently: the LFE component in the right
-+    channel is 10.2 dB below the left.
-+
-+    The secondary output retains its existing delay and clock synchronization.
-+    Changing content during playback reinitializes audio and refreshes playback.
-+
-+``--audio-pcm-crossover=<20-250>``
-+    Common crossover in Hz for all main channels in secondary bass-managed PCM
-+    (default: 80). LFE is not filtered by this crossover. The primary bitstream
-+    and the receiver's speaker crossover settings are unaffected.
- 
- ``--audio-exclusive=<yes|no>``
-     Enable exclusive output mode. In this mode, the system is usually locked
-diff --git a/test/meson.build b/test/meson.build
---- a/test/meson.build
-+++ b/test/meson.build
-@@ -83,6 +83,19 @@
-                    link_with: test_utils)
- test('chmap', chmap)
- 
-+lfe_objects = libmpv.extract_objects('audio/aframe.c', 'audio/chmap_avchannel.c',
-+                                    'audio/fmt-conversion.c')
-+lfe = executable('audio-lfe', 'audio_lfe.c', include_directories: incdir,
-+                 dependencies: [libavutil], objects: lfe_objects,
-+                 link_with: test_utils)
-+test('audio-lfe', lfe)
-+
-+bass = executable('audio-bass', 'audio_bass.c', include_directories: incdir,
-+                  dependencies: [libavutil, libswresample],
-+                  objects: [lfe_objects, libmpv.extract_objects('audio/bass_redirect.c')],
-+                  link_with: test_utils)
-+test('audio-bass', bass)
-+
- gl_video_objects = libmpv.extract_objects('video/out/gpu/ra.c',
-                                           'video/out/gpu/utils.c')
- gl_video = executable('gl-video', 'gl_video.c', objects: gl_video_objects,
-diff --git a/test/audio_lfe.c b/test/audio_lfe.c
-new file mode 100644
---- /dev/null
-+++ b/test/audio_lfe.c
-@@ -0,0 +1,90 @@
-+#include <string.h>
-+
-+#include "audio/aframe.h"
-+#include "audio/chmap.h"
-+#include "audio/format.h"
-+#include "test_utils.h"
-+
-+static void check(int format, struct mp_chmap channels, int samples, int lfe)
-+{
-+    struct mp_aframe_pool *pool = mp_aframe_pool_create(NULL);
-+    struct mp_aframe *src = mp_aframe_create();
-+    assert_true(mp_aframe_set_format(src, format));
-+    assert_true(mp_aframe_set_chmap(src, &channels));
-+    assert_true(mp_aframe_set_rate(src, 48000));
-+    assert_true(mp_aframe_pool_allocate(pool, src, samples) >= 0);
-+    mp_aframe_set_pts(src, 12.25);
-+    mp_aframe_set_speed(src, 1.002);
-+    int bytes = af_fmt_to_bytes(format);
-+    bool planar = af_fmt_is_planar(format);
-+    uint8_t **data = mp_aframe_get_data_rw(src);
-+    for (int n = 0; n < samples; n++) {
-+        for (int c = 0; c < channels.num; c++) {
-+            uint8_t *p = data[planar ? c : 0] +
-+                (planar ? n : n * channels.num + c) * bytes;
-+            for (int b = 0; b < bytes; b++)
-+                p[b] = 1 + (n * 7 + c * 23 + b) % 126;
-+        }
-+    }
-+    // Keep a reference to detect inadvertent input mutation and exercise COW.
-+    struct mp_aframe *retained = mp_aframe_new_ref(src);
-+    bool found = lfe < 0;
-+    struct mp_aframe *out = mp_aframe_lfe_stereo(pool, src, &found);
-+    assert_true(out);
-+    assert_true(found == (lfe >= 0));
-+    assert_int_equal(mp_aframe_get_format(out), format);
-+    assert_int_equal(mp_aframe_get_size(out), samples);
-+    assert_int_equal(mp_aframe_get_rate(out), 48000);
-+    assert_true(mp_aframe_get_pts(out) == 12.25);
-+    assert_true(mp_aframe_get_speed(out) == 1.002);
-+    struct mp_chmap actual, stereo = MP_CHMAP2(FL, FR);
-+    mp_aframe_get_chmap(out, &actual);
-+    assert_true(mp_chmap_equals(&actual, &stereo));
-+    uint8_t **r = mp_aframe_get_data_ro(out);
-+    for (int n = 0; n < samples; n++) {
-+        for (int c = 0; c < 2; c++) {
-+            uint8_t *p = r[planar ? c : 0] + (planar ? n : n * 2 + c) * bytes;
-+            for (int b = 0; b < bytes; b++) {
-+                int expected = lfe < 0 ? (af_fmt_is_unsigned(format) ? 128 : 0) :
-+                               1 + (n * 7 + lfe * 23 + b) % 126;
-+                assert_int_equal(p[b], expected);
-+            }
-+        }
-+    }
-+    data = mp_aframe_get_data_ro(src);
-+    for (int n = 0; n < samples; n++) {
-+        for (int c = 0; c < channels.num; c++) {
-+            uint8_t *p = data[planar ? c : 0] +
-+                (planar ? n : n * channels.num + c) * bytes;
-+            for (int b = 0; b < bytes; b++)
-+                assert_int_equal(p[b], 1 + (n * 7 + c * 23 + b) % 126);
-+        }
-+    }
-+    talloc_free(retained);
-+    talloc_free(src);
-+    talloc_free(out);
-+    talloc_free(pool);
-+}
-+
-+int main(void)
-+{
-+    for (int format = 1; format < AF_FORMAT_COUNT; format++) {
-+        if (!af_fmt_is_pcm(format))
-+            continue;
-+        check(format, (struct mp_chmap)MP_CHMAP6(FL, FR, FC, LFE, BL, BR), 257, 3);
-+        check(format, (struct mp_chmap)MP_CHMAP8(FL, FR, FC, LFE, BL, BR, SL, SR), 33, 3);
-+        check(format, (struct mp_chmap)MP_CHMAP3(LFE, FL, FR), 17, 0);
-+        check(format, (struct mp_chmap)MP_CHMAP2(FL, FR), 31, -1);
-+        check(format, (struct mp_chmap)MP_CHMAP5(FL, FR, FC, BL, BR), 31, -1);
-+        struct mp_chmap unknown;
-+        mp_chmap_set_unknown(&unknown, 6);
-+        check(format, unknown, 11, -1);
-+    }
-+    struct mp_aframe_pool *pool = mp_aframe_pool_create(NULL);
-+    struct mp_aframe *empty = mp_aframe_create();
-+    bool found;
-+    assert_true(!mp_aframe_lfe_stereo(pool, empty, &found));
-+    talloc_free(empty);
-+    talloc_free(pool);
-+    return 0;
-+}
 diff --git a/test/audio_bass.c b/test/audio_bass.c
 new file mode 100644
+index 0000000000000000000000000000000000000000..e7efedebfb06a0e8faed9893c78f2760f9790345
 --- /dev/null
 +++ b/test/audio_bass.c
 @@ -0,0 +1,193 @@
@@ -813,3 +707,123 @@ new file mode 100644
 +    split_routing();
 +    return 0;
 +}
+diff --git a/test/audio_lfe.c b/test/audio_lfe.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..949500e3096097483c3bdab96bf0c96e86004178
+--- /dev/null
++++ b/test/audio_lfe.c
+@@ -0,0 +1,90 @@
++#include <string.h>
++
++#include "audio/aframe.h"
++#include "audio/chmap.h"
++#include "audio/format.h"
++#include "test_utils.h"
++
++static void check(int format, struct mp_chmap channels, int samples, int lfe)
++{
++    struct mp_aframe_pool *pool = mp_aframe_pool_create(NULL);
++    struct mp_aframe *src = mp_aframe_create();
++    assert_true(mp_aframe_set_format(src, format));
++    assert_true(mp_aframe_set_chmap(src, &channels));
++    assert_true(mp_aframe_set_rate(src, 48000));
++    assert_true(mp_aframe_pool_allocate(pool, src, samples) >= 0);
++    mp_aframe_set_pts(src, 12.25);
++    mp_aframe_set_speed(src, 1.002);
++    int bytes = af_fmt_to_bytes(format);
++    bool planar = af_fmt_is_planar(format);
++    uint8_t **data = mp_aframe_get_data_rw(src);
++    for (int n = 0; n < samples; n++) {
++        for (int c = 0; c < channels.num; c++) {
++            uint8_t *p = data[planar ? c : 0] +
++                (planar ? n : n * channels.num + c) * bytes;
++            for (int b = 0; b < bytes; b++)
++                p[b] = 1 + (n * 7 + c * 23 + b) % 126;
++        }
++    }
++    // Keep a reference to detect inadvertent input mutation and exercise COW.
++    struct mp_aframe *retained = mp_aframe_new_ref(src);
++    bool found = lfe < 0;
++    struct mp_aframe *out = mp_aframe_lfe_stereo(pool, src, &found);
++    assert_true(out);
++    assert_true(found == (lfe >= 0));
++    assert_int_equal(mp_aframe_get_format(out), format);
++    assert_int_equal(mp_aframe_get_size(out), samples);
++    assert_int_equal(mp_aframe_get_rate(out), 48000);
++    assert_true(mp_aframe_get_pts(out) == 12.25);
++    assert_true(mp_aframe_get_speed(out) == 1.002);
++    struct mp_chmap actual, stereo = MP_CHMAP2(FL, FR);
++    mp_aframe_get_chmap(out, &actual);
++    assert_true(mp_chmap_equals(&actual, &stereo));
++    uint8_t **r = mp_aframe_get_data_ro(out);
++    for (int n = 0; n < samples; n++) {
++        for (int c = 0; c < 2; c++) {
++            uint8_t *p = r[planar ? c : 0] + (planar ? n : n * 2 + c) * bytes;
++            for (int b = 0; b < bytes; b++) {
++                int expected = lfe < 0 ? (af_fmt_is_unsigned(format) ? 128 : 0) :
++                               1 + (n * 7 + lfe * 23 + b) % 126;
++                assert_int_equal(p[b], expected);
++            }
++        }
++    }
++    data = mp_aframe_get_data_ro(src);
++    for (int n = 0; n < samples; n++) {
++        for (int c = 0; c < channels.num; c++) {
++            uint8_t *p = data[planar ? c : 0] +
++                (planar ? n : n * channels.num + c) * bytes;
++            for (int b = 0; b < bytes; b++)
++                assert_int_equal(p[b], 1 + (n * 7 + c * 23 + b) % 126);
++        }
++    }
++    talloc_free(retained);
++    talloc_free(src);
++    talloc_free(out);
++    talloc_free(pool);
++}
++
++int main(void)
++{
++    for (int format = 1; format < AF_FORMAT_COUNT; format++) {
++        if (!af_fmt_is_pcm(format))
++            continue;
++        check(format, (struct mp_chmap)MP_CHMAP6(FL, FR, FC, LFE, BL, BR), 257, 3);
++        check(format, (struct mp_chmap)MP_CHMAP8(FL, FR, FC, LFE, BL, BR, SL, SR), 33, 3);
++        check(format, (struct mp_chmap)MP_CHMAP3(LFE, FL, FR), 17, 0);
++        check(format, (struct mp_chmap)MP_CHMAP2(FL, FR), 31, -1);
++        check(format, (struct mp_chmap)MP_CHMAP5(FL, FR, FC, BL, BR), 31, -1);
++        struct mp_chmap unknown;
++        mp_chmap_set_unknown(&unknown, 6);
++        check(format, unknown, 11, -1);
++    }
++    struct mp_aframe_pool *pool = mp_aframe_pool_create(NULL);
++    struct mp_aframe *empty = mp_aframe_create();
++    bool found;
++    assert_true(!mp_aframe_lfe_stereo(pool, empty, &found));
++    talloc_free(empty);
++    talloc_free(pool);
++    return 0;
++}
+diff --git a/test/meson.build b/test/meson.build
+index ed2064034675ee949180773d686e309445002230..06da4adc850be2bc154fa67aa206ec1204828fb7 100644
+--- a/test/meson.build
++++ b/test/meson.build
+@@ -83,6 +83,19 @@ chmap = executable('chmap', 'chmap.c', include_directories: incdir,
+                    link_with: test_utils)
+ test('chmap', chmap)
+ 
++lfe_objects = libmpv.extract_objects('audio/aframe.c', 'audio/chmap_avchannel.c',
++                                    'audio/fmt-conversion.c')
++lfe = executable('audio-lfe', 'audio_lfe.c', include_directories: incdir,
++                 dependencies: [libavutil], objects: lfe_objects,
++                 link_with: test_utils)
++test('audio-lfe', lfe)
++
++bass = executable('audio-bass', 'audio_bass.c', include_directories: incdir,
++                  dependencies: [libavutil, libswresample],
++                  objects: [lfe_objects, libmpv.extract_objects('audio/bass_redirect.c')],
++                  link_with: test_utils)
++test('audio-bass', bass)
++
+ gl_video_objects = libmpv.extract_objects('video/out/gpu/ra.c',
+                                           'video/out/gpu/utils.c')
+ gl_video = executable('gl-video', 'gl_video.c', objects: gl_video_objects,

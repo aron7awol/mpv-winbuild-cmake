@@ -1,19 +1,11 @@
-From fba46554623396982e24244069b549668606f1cc Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Tue, 8 Sep 2026 12:33:28 -0400
+From 69dc48b2a27cfa4a6bbc1258b03ce98c5c6c29ae Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:52:02 -0500
 Subject: [PATCH] gpu-next: capture live output without rerendering
 
----
- DOCS/man/input.rst         |  31 ++++++++
- player/command.c           |  42 +++++++++++
- video/out/output_capture.h | 145 +++++++++++++++++++++++++++++++++++++
- video/out/vo.h             |  15 ++++
- video/out/vo_gpu_next.c    |  21 ++++++
- 5 files changed, 254 insertions(+)
- create mode 100644 video/out/output_capture.h
 
 diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
-index 77500750a..da12a7fa6 100644
+index b49de15bfd4bccce6c7a3c9efb988879171ae6a8..1fddc42aec859c2d122a0c324711e6651223405b 100644
 --- a/DOCS/man/input.rst
 +++ b/DOCS/man/input.rst
 @@ -1525,6 +1525,37 @@ Screenshot Commands
@@ -55,7 +47,7 @@ index 77500750a..da12a7fa6 100644
      Take a screenshot and save it to a given file. The format of the file will
      be guessed by the extension (and ``--screenshot-format`` is ignored - the
 diff --git a/player/command.c b/player/command.c
-index 9d6286b5e..001123ee1 100644
+index 49893785723c191e161330c99ca65b7a92785d93..ee57f722a0c57f9a89bdbbc926a6024e6fd5721c 100644
 --- a/player/command.c
 +++ b/player/command.c
 @@ -2774,6 +2774,26 @@ static int mp_property_gpu_render_formats(void *ctx, struct m_property *prop,
@@ -85,7 +77,7 @@ index 9d6286b5e..001123ee1 100644
  static int mp_property_async_probe(void *ctx, struct m_property *prop, int action, void *arg)
  {
      MPContext *mpctx = ctx;
-@@ -4986,6 +5006,7 @@ static const struct m_property mp_properties_base[] = {
+@@ -4990,6 +5010,7 @@ static const struct m_property mp_properties_base[] = {
      {"video-out-params", mp_property_vo_imgparams},
      {"gpu-render-formats", mp_property_gpu_render_formats},
      {"video-active-image", mp_property_video_active_image},
@@ -93,7 +85,7 @@ index 9d6286b5e..001123ee1 100644
      {"analyzer-async-result", mp_property_async_probe},
      {"analyzer-chromaticity", mp_property_analyzer_chromaticity},
      {"video-dec-params", mp_property_dec_imgparams},
-@@ -7727,6 +7748,21 @@ static void cmd_flush_status_line(void *p)
+@@ -7731,6 +7752,21 @@ static void cmd_flush_status_line(void *p)
      mp_msg_flush_status_line(mpctx->log, cmd->args[0].v.b);
  }
  
@@ -115,7 +107,7 @@ index 9d6286b5e..001123ee1 100644
  static void cmd_notify_property(void *p)
  {
      struct mp_cmd_ctx *cmd = p;
-@@ -7995,6 +8031,12 @@ const struct mp_cmd_def mp_cmds[] = {
+@@ -7999,6 +8035,12 @@ const struct mp_cmd_def mp_cmds[] = {
          },
          .spawn_thread = true,
      },
@@ -130,7 +122,7 @@ index 9d6286b5e..001123ee1 100644
              {"filename", OPT_STRING(v.s)},
 diff --git a/video/out/output_capture.h b/video/out/output_capture.h
 new file mode 100644
-index 000000000..cfb8a324e
+index 0000000000000000000000000000000000000000..cfb8a324e86afaf75449e84a8be70686190c20c0
 --- /dev/null
 +++ b/video/out/output_capture.h
 @@ -0,0 +1,145 @@
@@ -280,7 +272,7 @@ index 000000000..cfb8a324e
 +#endif
 +}
 diff --git a/video/out/vo.h b/video/out/vo.h
-index 51e63595e..d43bc660b 100644
+index 000f97092226b5ed5e176b90db6378f169801591..9befceb9446076583eb9311d6a3488f1624d7304 100644
 --- a/video/out/vo.h
 +++ b/video/out/vo.h
 @@ -91,6 +91,8 @@ enum mp_voctrl {
@@ -313,10 +305,10 @@ index 51e63595e..d43bc660b 100644
      int wave_x, wave_y, wave_w, wave_h;
      int64_t wave_sequence;
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index 3359e5c37..b9b2c22fd 100644
+index 8e99a99664b58725c03db8a7cebd800dd07c8fe6..ae28e12f09ee9ca84a9c1fce0df43f42d9e4df7e 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
-@@ -187,6 +187,9 @@ struct priv {
+@@ -192,6 +192,9 @@ struct priv {
      uint64_t bar_indeterminate_count;
      uint64_t bar_generation;
      pl_swapchain sw;
@@ -326,7 +318,7 @@ index 3359e5c37..b9b2c22fd 100644
      pl_fmt osd_fmt[SUBBITMAP_COUNT];
      pl_tex *sub_tex;
      int num_sub_tex;
-@@ -2576,6 +2579,8 @@ static const char *causal_scene_withheld_reason_name(int reason)
+@@ -2793,6 +2796,8 @@ static const char *causal_scene_withheld_reason_name(int reason)
      }
  }
  
@@ -335,7 +327,7 @@ index 3359e5c37..b9b2c22fd 100644
  static bool draw_frame(struct vo *vo, struct vo_frame *frame)
  {
      struct priv *p = vo->priv;
-@@ -3302,6 +3307,12 @@ done:
+@@ -3520,6 +3525,12 @@ done:
          pl_tex_clear(gpu, swframe.fbo, (float[4]){ 0.5, 0.0, 1.0, 1.0 });
  
      pl_gpu_flush(gpu);
@@ -348,7 +340,7 @@ index 3359e5c37..b9b2c22fd 100644
      p->frame_pending = true;
      return VO_TRUE;
  }
-@@ -3787,10 +3798,18 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -4013,10 +4024,18 @@ static int control(struct vo *vo, uint32_t request, void *data)
      }
  
      case VOCTRL_RESET:
@@ -367,7 +359,7 @@ index 3359e5c37..b9b2c22fd 100644
      case VOCTRL_PERFORMANCE_DATA: {
          struct voctrl_performance_data *perf = data;
          copy_frame_info_to_mp(&p->perf_fresh, &perf->fresh, &p->hwdec_perf, &p->sw_upload_perf);
-@@ -4114,6 +4133,8 @@ done:
+@@ -4340,6 +4359,8 @@ done:
  static void uninit(struct vo *vo)
  {
      struct priv *p = vo->priv;
@@ -376,6 +368,3 @@ index 3359e5c37..b9b2c22fd 100644
  
      if (p->bar_commit_count) {
          MP_VERBOSE(p, "Active image coverage first=%" PRIu64 " last=%" PRIu64
--- 
-2.54.0.windows.1
-

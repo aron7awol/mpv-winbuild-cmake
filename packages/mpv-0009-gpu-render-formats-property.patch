@@ -1,19 +1,14 @@
-From d0636712289838dc5026930333a8ad4e70251e58 Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Sun, 2 Aug 2026 16:36:00 -0400
+From 91901b394e89672210692e33b26fd5efc6aa9555 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:49:32 -0500
 Subject: [PATCH] gpu-next: expose effective render formats
 
----
- player/command.c        | 28 ++++++++++++++++++++++++++--
- video/out/vo.h          | 11 +++++++++++
- video/out/vo_gpu_next.c | 35 +++++++++++++++++++++++++++++++++++
- 3 files changed, 72 insertions(+), 2 deletions(-)
 
 diff --git a/player/command.c b/player/command.c
-index 5df0837..9dac03c 100644
+index e14f3fd18f8faf5ecebc0ba2f0b5a993458bddb3..455f7a9973250afbbaa53721350d518db5902866 100644
 --- a/player/command.c
 +++ b/player/command.c
-@@ -2637,6 +2637,28 @@ static int mp_property_vo_imgparams(void *ctx, struct m_property *prop,
+@@ -2650,6 +2650,28 @@ static int mp_property_vo_imgparams(void *ctx, struct m_property *prop,
      return property_imgparams(&p, action, arg);
  }
  
@@ -42,7 +37,7 @@ index 5df0837..9dac03c 100644
  static int mp_property_tgt_imgparams(void *ctx, struct m_property *prop,
                                       int action, void *arg)
  {
-@@ -4715,6 +4737,7 @@ static const struct m_property mp_properties_base[] = {
+@@ -4728,6 +4750,7 @@ static const struct m_property mp_properties_base[] = {
      // Video
      {"video-target-params", mp_property_tgt_imgparams},
      {"video-out-params", mp_property_vo_imgparams},
@@ -50,7 +45,7 @@ index 5df0837..9dac03c 100644
      {"video-dec-params", mp_property_dec_imgparams},
      {"video-params", mp_property_vd_imgparams},
      {"video-frame-info", mp_property_video_frame_info},
-@@ -4869,13 +4892,14 @@ static const char *const *const mp_event_property_change[] = {
+@@ -4882,13 +4905,14 @@ static const char *const *const mp_event_property_change[] = {
        "decoder-frame-drop-count", "frame-drop-count", "video-frame-info",
        "vf-metadata", "af-metadata", "sub-start", "sub-end", "secondary-sub-start",
        "secondary-sub-end", "sub-lines", "secondary-sub-lines", "video-out-params",
@@ -68,7 +63,7 @@ index 5df0837..9dac03c 100644
        "samplerate", "channels", "audio", "volume", "volume-gain", "mute",
        "current-ao", "audio-codec-name", "audio-params", "track-list", "current-tracks",
 diff --git a/video/out/vo.h b/video/out/vo.h
-index f24918d..f9c0365 100644
+index f24918d4607e08ff4eeb0f6fdf9823ded0670c3b..f9c0365a29cd11cff0f92e2cc5be12841d5d5906 100644
 --- a/video/out/vo.h
 +++ b/video/out/vo.h
 @@ -85,6 +85,9 @@ enum mp_voctrl {
@@ -97,10 +92,10 @@ index f24918d..f9c0365 100644
  enum mp_content_type {
      MP_CONTENT_NONE, // used for force-window
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index bf4f80b..37fd0bd 100644
+index 2b8560fbe5a7e390e92b415c0f1c21ab6a70e865..86ff957936173aa448794842477ccf22a8c2e361 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
-@@ -2089,6 +2089,41 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -2266,6 +2266,41 @@ static int control(struct vo *vo, uint32_t request, void *data)
          return true;
      }
  
@@ -142,5 +137,3 @@ index bf4f80b..37fd0bd 100644
      case VOCTRL_SCREENSHOT:
          video_screenshot(vo, data);
          return true;
--- 
-2.54.0.windows.1

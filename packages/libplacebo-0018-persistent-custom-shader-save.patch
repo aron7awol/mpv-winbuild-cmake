@@ -1,6 +1,6 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: mpv-ht development <development@mpv-ht.local>
-Date: Wed, 26 Aug 2026 19:30:00 -0400
+From b793b59f7b2bd4aec74bce6972fda8253beb19b0 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:53:02 -0500
 Subject: [PATCH] custom shader: allow persistent named SAVE textures
 
 OUTPUT hooks are rerun when mpv redraws a paused cached frame, but earlier
@@ -8,16 +8,9 @@ stages used to lose their named SAVE textures at the start of every renderer
 call. Add an opt-in PERSIST directive backed by a caller-owned renderer-format
 texture. This lets a later output hook reuse source-stage analysis data without
 reprocessing the frame or advancing tone-mapping state.
----
- docs/custom-shaders.md                  | 10 ++++++++
- src/include/libplacebo/shaders/custom.h |  8 ++++++
- src/renderer.c                          | 21 ++++++++++++++++
- src/shaders/custom_mpv.c                | 45 ++++++++++++++++++++++++++++++---
- src/tests/gpu_tests.c                   | 11 ++++++++
- 5 files changed, 91 insertions(+), 4 deletions(-)
 
 diff --git a/docs/custom-shaders.md b/docs/custom-shaders.md
-index c6dc1073..76654b29 100644
+index c6dc10732b7c00cf4bc20f3bf115ee5018582fba..76654b29bbbbb8166bbaa723d1b8cc881c3a67dd 100644
 --- a/docs/custom-shaders.md
 +++ b/docs/custom-shaders.md
 @@ -186,6 +186,16 @@ vec4 hook()
@@ -38,7 +31,7 @@ index c6dc1073..76654b29 100644
  size of the chroma plane, saving the result as a new texture `LUMA_LOWRES`. In
  general, you can pick any name you want, here.
 diff --git a/src/include/libplacebo/shaders/custom.h b/src/include/libplacebo/shaders/custom.h
-index a4eec695..c3df8b9b 100644
+index a4eec695c4d6dd06d1092c11c7d3e7a8679ac790..19e870dec23a6891cceccbf5ea782189fdc0eec4 100644
 --- a/src/include/libplacebo/shaders/custom.h
 +++ b/src/include/libplacebo/shaders/custom.h
 @@ -223,6 +223,14 @@ struct pl_hook_params {
@@ -57,10 +50,10 @@ index a4eec695..c3df8b9b 100644
  
  struct pl_hook_res {
 diff --git a/src/renderer.c b/src/renderer.c
-index f5e78ea2..09936222 100644
+index aecc683ac36a1bb6dd806d2688c22fcfea5f0317..267b9fa6e90f6a09a20a7ae2a1eda1d2044588c9 100644
 --- a/src/renderer.c
 +++ b/src/renderer.c
-@@ -1095,6 +1095,26 @@ static pl_tex get_hook_tex(void *priv, int width, int height)
+@@ -1117,6 +1117,26 @@ static pl_tex get_hook_tex(void *priv, int width, int height)
      return get_fbo(pass, width, height, NULL, 4, PL_DEBUG_TAG);
  }
  
@@ -87,7 +80,7 @@ index f5e78ea2..09936222 100644
  // Returns if any hook was applied (even if there were errors)
  static bool pass_hook(struct pass_state *pass, struct img *img,
                        enum pl_hook_stage stage)
-@@ -1126,6 +1146,7 @@ static bool pass_hook(struct pass_state *pass, struct img *img,
+@@ -1148,6 +1168,7 @@ static bool pass_hook(struct pass_state *pass, struct img *img,
              .gpu = rr->gpu,
              .dispatch = rr->dp,
              .get_tex = get_hook_tex,
@@ -96,7 +89,7 @@ index f5e78ea2..09936222 100644
              .stage = stage,
              .rect = img->rect,
 diff --git a/src/shaders/custom_mpv.c b/src/shaders/custom_mpv.c
-index 1c93da50..bdac4fc3 100644
+index 1c93da504966ce92d3ed045fb55da44e3e24969a..bdac4fc326355c70d31770fdc282e34ae27e38dc 100644
 --- a/src/shaders/custom_mpv.c
 +++ b/src/shaders/custom_mpv.c
 @@ -66,6 +66,8 @@ struct custom_shader_hook {
@@ -211,7 +204,7 @@ index 1c93da50..bdac4fc3 100644
          switch (p->descriptors.elem[i].desc.type) {
              case PL_DESC_BUF_UNIFORM:
 diff --git a/src/tests/gpu_tests.c b/src/tests/gpu_tests.c
-index 5d1d8db8..13858548 100644
+index 81e25225fbb798653239ff5f35b19b7e0de5dc2a..b7d72b83d2a01e11a4dc1997bf2409ca9427abed 100644
 --- a/src/tests/gpu_tests.c
 +++ b/src/tests/gpu_tests.c
 @@ -1144,6 +1144,17 @@ static const char *user_shader_tests[] = {
@@ -232,5 +225,3 @@ index 5d1d8db8..13858548 100644
      // Test use of textures
      "//!HOOK MAIN                                                           \n"
      "//!DESC turn everything into colorful pixels                           \n"
--- 
-2.50.1

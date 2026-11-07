@@ -1,6 +1,6 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Codex <noreply@openai.com>
-Date: Tue, 13 Oct 2026 12:00:00 -0400
+From 985aa79db613a273c65c275dc0508d73ea5ba87d Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:52:54 -0500
 Subject: [PATCH] d3d11: default-on conservative redundant resize guard
 
 Standalone production replacement for tester-only 0072. Apply after 0069,
@@ -9,9 +9,8 @@ state checks, notification processing and existing feedback resets.
 No recorder, GPU sampling, detailed tracing or per-frame diagnostic queries.
 Keep d3d11-skip-redundant-resize=no as a manual rollback option.
 
----
 diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
-index 195b72d6a..851300846 100644
+index 195b72d6aae66a11fc158a289ffb121ca88427ca..851300846df2a3bda4fd4c91c3e7592317032ed8 100644
 --- a/DOCS/man/options.rst
 +++ b/DOCS/man/options.rst
 @@ -6430,6 +6430,19 @@ them.
@@ -35,7 +34,7 @@ index 195b72d6a..851300846 100644
      Use WARP (Windows Advanced Rasterization Platform) with the D3D11 GPU
      backend (default: auto). This is a high performance software renderer. By
 diff --git a/video/out/d3d11/context.c b/video/out/d3d11/context.c
-index 74ac184be..de9e39784 100644
+index 74ac184be620fb0cb0a82f671d9946592986fea5..de9e39784a2931b3b0312662e02d36b7085ca7c2 100644
 --- a/video/out/d3d11/context.c
 +++ b/video/out/d3d11/context.c
 @@ -43,6 +43,7 @@ struct d3d11_opts {
@@ -277,7 +276,7 @@ index 74ac184be..de9e39784 100644
          IDXGISwapChain_SetFullscreenState(p->swapchain, TRUE, NULL);
  
 diff --git a/video/out/w32_common.c b/video/out/w32_common.c
-index bd1f09438..f23077c4c 100644
+index bd1f09438705f69d34899ade52120f07a421acde..f23077c4c57765f94777d9649d1285be3ae4cc67 100644
 --- a/video/out/w32_common.c
 +++ b/video/out/w32_common.c
 @@ -137,6 +137,9 @@ struct vo_w32_state {
@@ -433,7 +432,7 @@ index bd1f09438..f23077c4c 100644
  {
      struct vo_w32_state *w32 = ptr;
 diff --git a/video/out/w32_common.h b/video/out/w32_common.h
-index c2f30dabe..135759d54 100644
+index c2f30dabea315bca4c112327cd49d76fe4bfb28d..135759d546d62316d22438ee6a6e86d776382ccc 100644
 --- a/video/out/w32_common.h
 +++ b/video/out/w32_common.h
 @@ -23,12 +23,16 @@
@@ -455,7 +454,7 @@ index c2f30dabe..135759d54 100644
  void vo_w32_swapchain(struct vo *vo, void *swapchain);
 diff --git a/video/out/w32_resize.h b/video/out/w32_resize.h
 new file mode 100644
-index 000000000..b0ca76cca
+index 0000000000000000000000000000000000000000..b0ca76cca7d7338dee6e505b029c9b4c4e7ef7f5
 --- /dev/null
 +++ b/video/out/w32_resize.h
 @@ -0,0 +1,19 @@

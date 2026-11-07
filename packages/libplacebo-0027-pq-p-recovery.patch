@@ -1,17 +1,17 @@
-From: mpv-ht <mpv-ht@localhost>
-Date: Sun, 13 Sep 2026 00:00:00 -0400
+From 0a44ee14419fb5aa943e48b43901905f9c0e2328 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:54:17 -0500
 Subject: [PATCH] Recover detail consistently in PQ(P), bounded by RGB headroom
 
 Experimental addition after LP0026. Preserve Standard fallback in the R
 feature channel; P exclusively uses PQ(P) from G. Measure recovered first-pass
 RGB for Auto PQ and limit only the extra correction, not the baseline.
 
----
 diff --git a/src/renderer.c b/src/renderer.c
-index abbcf37..4099f2a 100644
+index ca0715612b3abe0edff26e2d8e878ae9e30493b0..1206a8f251b4791a9b9f28046a298f78477cb688 100644
 --- a/src/renderer.c
 +++ b/src/renderer.c
-@@ -2877,6 +2877,7 @@ static pl_tex get_feature_map(struct pass_state *pass)
+@@ -2904,6 +2904,7 @@ static pl_tex get_feature_map(struct pass_state *pass)
      pl_renderer rr = pass->rr;
      const struct pl_color_map_params *cparams = params->color_map_params;
      cparams = PL_DEF(cparams, &pl_color_map_default_params);
@@ -19,7 +19,7 @@ index abbcf37..4099f2a 100644
      if (!cparams->contrast_recovery || cparams->contrast_smoothness <= 1)
          return NULL;
      if (!pass->fbofmt[4])
-@@ -2885,8 +2886,16 @@ static pl_tex get_feature_map(struct pass_state *pass)
+@@ -2912,8 +2913,16 @@ static pl_tex get_feature_map(struct pass_state *pass)
          return NULL;
      if (rr->errors & (PL_RENDER_ERR_SAMPLING | PL_RENDER_ERR_CONTRAST_RECOVERY))
          return NULL;
@@ -38,7 +38,7 @@ index abbcf37..4099f2a 100644
      if (params->lut && params->lut_type == PL_LUT_CONVERSION)
          return NULL; // LUT handles tone mapping
  
-@@ -2895,16 +2904,20 @@ static pl_tex get_feature_map(struct pass_state *pass)
+@@ -2922,16 +2931,20 @@ static pl_tex get_feature_map(struct pass_state *pass)
          return NULL;
  
      const float ratio = cparams->contrast_smoothness;
@@ -62,7 +62,7 @@ index abbcf37..4099f2a 100644
      bool ok = pl_dispatch_finish(rr->dp, pl_dispatch_params(
          .shader = &sh,
          .target = inter_tex,
-@@ -2916,7 +2929,7 @@ static pl_tex get_feature_map(struct pass_state *pass)
+@@ -2943,7 +2956,7 @@ static pl_tex get_feature_map(struct pass_state *pass)
          .tex          = inter_tex,
          .rect         = img->rect,
          .address_mode = PL_TEX_ADDRESS_MIRROR,
@@ -71,7 +71,7 @@ index abbcf37..4099f2a 100644
          .new_w        = cr_w,
          .new_h        = cr_h,
      };
-@@ -2941,7 +2954,8 @@ error:
+@@ -2968,7 +2981,8 @@ error:
  // Exact same-frame reduction. Never infer post-map peak from unrelated
  // source maxima and never use filtered/downsampled samples that miss highlights.
  static pl_tex measure_rgb_ray_peak(struct pass_state *pass,
@@ -81,7 +81,7 @@ index abbcf37..4099f2a 100644
  {
      const struct pl_color_map_params *cp = pass->params->color_map_params;
      pl_renderer rr = pass->rr;
-@@ -2972,7 +2986,8 @@ static pl_tex measure_rgb_ray_peak(struct pass_state *pass,
+@@ -2999,7 +3013,8 @@ static pl_tex measure_rgb_ray_peak(struct pass_state *pass,
      sh_describe(sh, "auto PQ first-stage maxRGB");
      pl_shader_color_map_ex(sh, cp, pl_color_map_args(
          .src = pass->image.color, .dst = dst, .prelinearized = linear,
@@ -91,7 +91,7 @@ index abbcf37..4099f2a 100644
      if (!pl_dispatch_finish(rr->dp, pl_dispatch_params(.shader = &sh, .target = prev)))
          goto error;
  
-@@ -3110,7 +3125,7 @@ static void pass_convert_colors(struct pass_state *pass)
+@@ -3137,7 +3152,7 @@ static void pass_convert_colors(struct pass_state *pass)
  
          // generate HDR feature map if required
          pl_tex feature_map = get_feature_map(pass);
@@ -100,8 +100,24 @@ index abbcf37..4099f2a 100644
          sh = img_sh(pass, img); // Feature/peak extraction may dispatch the input.
  
          // current -> target
+diff --git a/src/shaders.h b/src/shaders.h
+index d8c0f9c77c37c3e6424eadbcdfaeb4a884c3dd32..ec72eb090197ea318c36d46448c7b55d6be411cd 100644
+--- a/src/shaders.h
++++ b/src/shaders.h
+@@ -241,6 +241,11 @@ static inline void sh_describe(pl_shader sh, const char *desc)
+ // the given size requirements. Errors and returns false otherwise.
+ bool sh_require(pl_shader sh, enum pl_shader_sig insig, int w, int h);
+ 
++// Internal dual feature map: native intensity in R, PQ(Perceptual P) in G.
++// Keeping R intact permits the ordinary path when private peak data is absent.
++struct pl_color_space;
++void sh_extract_p_features(pl_shader sh, struct pl_color_space csp);
++
+ struct pl_dovi_metadata;
+ 
+ // Add the NLQ-decoded enhancement-layer residual to the (already reshaped)
 diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
-index 61ead47..fa950c3 100644
+index 5f866b825e21dc58f38b99ee3c3abd31fadfb1f4..687142fac30956a1e0ce7b5d3a4f8f5bb2ac51de 100644
 --- a/src/shaders/colorspace.c
 +++ b/src/shaders/colorspace.c
 @@ -2687,6 +2687,76 @@ void pl_shader_extract_features(pl_shader sh, struct pl_color_space csp)
@@ -181,7 +197,7 @@ index 61ead47..fa950c3 100644
  const struct pl_color_map_params pl_color_map_default_params = { PL_COLOR_MAP_DEFAULTS };
  const struct pl_color_map_params pl_color_map_high_quality_params = { PL_COLOR_MAP_HQ_DEFAULTS };
  
-@@ -3368,6 +3438,11 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+@@ -3371,6 +3441,11 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
              GLSL("float metric_in = "$"(color.rgb);                       \n"
                   "float metric_out = tone_map(metric_in);                 \n",
                   pixel_metric);
@@ -193,19 +209,3 @@ index 61ead47..fa950c3 100644
              GLSL(
                   "float metric_in_v = pow(clamp(metric_in, 0.0, 1.0),    \n"
                   "                          1.0/78.84375);                 \n"
-diff --git a/src/shaders.h b/src/shaders.h
-index d8c0f9c..ec72eb0 100644
---- a/src/shaders.h
-+++ b/src/shaders.h
-@@ -241,6 +241,11 @@ static inline void sh_describe(pl_shader sh, const char *desc)
- // the given size requirements. Errors and returns false otherwise.
- bool sh_require(pl_shader sh, enum pl_shader_sig insig, int w, int h);
- 
-+// Internal dual feature map: native intensity in R, PQ(Perceptual P) in G.
-+// Keeping R intact permits the ordinary path when private peak data is absent.
-+struct pl_color_space;
-+void sh_extract_p_features(pl_shader sh, struct pl_color_space csp);
-+
- struct pl_dovi_metadata;
- 
- // Add the NLQ-decoded enhancement-layer residual to the (already reshaped)

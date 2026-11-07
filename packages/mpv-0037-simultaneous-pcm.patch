@@ -1,28 +1,12 @@
-From 1eff79403879b3c3f448e4f2ae0b509e95718c8f Mon Sep 17 00:00:00 2001
-From: Codex <codex@local>
-Date: Mon, 7 Sep 2026 19:44:39 -0400
+From e4662f90a3144bbe0f8c9d3bd0d4bc186ccbc349 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:52:01 -0500
 Subject: [PATCH] audio: simultaneous decoding and independently synchronized
  PCM output
 
----
- audio/out/ao.c              |  26 +++
- audio/out/ao.h              |   4 +
- audio/out/ao_wasapi.c       |   2 +
- filters/f_decoder_wrapper.c |  41 +++++
- filters/f_decoder_wrapper.h |   2 +
- meson.build                 |   1 +
- options/options.c           |   2 +
- options/options.h           |   2 +
- player/audio.c              |  18 +-
- player/audio_secondary.c    | 349 ++++++++++++++++++++++++++++++++++++
- player/command.c            |   8 +
- player/core.h               |   9 +
- player/playloop.c           |   6 +
- 13 files changed, 469 insertions(+), 1 deletion(-)
- create mode 100644 player/audio_secondary.c
 
 diff --git a/audio/out/ao.c b/audio/out/ao.c
-index 5cb24bda0..be3678e58 100644
+index 5cb24bda0434354d26c0b8e423f931ec513a112e..be3678e580d571486f7821e90be3acc36c6e2b34 100644
 --- a/audio/out/ao.c
 +++ b/audio/out/ao.c
 @@ -213,6 +213,15 @@ static struct ao *ao_init(bool probing, struct mpv_global *global,
@@ -66,7 +50,7 @@ index 5cb24bda0..be3678e58 100644
                          int init_flags,
                          void (*wakeup_cb)(void *ctx), void *wakeup_ctx,
 diff --git a/audio/out/ao.h b/audio/out/ao.h
-index 7f37ef519..eaaff4ce0 100644
+index 7f37ef5192b066e11ea34776547ebb13b94a997d..eaaff4ce0038cd076dfba0c49ac4953fb9d4ac54 100644
 --- a/audio/out/ao.h
 +++ b/audio/out/ao.h
 @@ -60,6 +60,7 @@ enum {
@@ -88,7 +72,7 @@ index 7f37ef519..eaaff4ce0 100644
                     int *samplerate, int *format, struct mp_chmap *channels);
  const char *ao_get_name(struct ao *ao);
 diff --git a/audio/out/ao_wasapi.c b/audio/out/ao_wasapi.c
-index 16d826e09..1f00ec7ba 100644
+index 16d826e09924855d49c6e17cbdbb8c4f20b66190..1f00ec7ba52edc60233dfff6bae58f22bc4b9952 100644
 --- a/audio/out/ao_wasapi.c
 +++ b/audio/out/ao_wasapi.c
 @@ -350,6 +350,8 @@ static int init(struct ao *ao)
@@ -101,7 +85,7 @@ index 16d826e09..1f00ec7ba 100644
      if (state->strict_bitstream && !af_fmt_is_spdif(ao->format)) {
          MP_ERR(ao, "Dual bitstream is enabled but input is PCM. Disable dual output for PCM sources; no PCM fallback is allowed.\n");
 diff --git a/filters/f_decoder_wrapper.c b/filters/f_decoder_wrapper.c
-index b0f046119..fb917cb54 100644
+index b0f046119c0fd3b484663402ce6dbdfeffdde44d..fb917cb540c17c72aaf31f7e12c0abd7bc2d4e92 100644
 --- a/filters/f_decoder_wrapper.c
 +++ b/filters/f_decoder_wrapper.c
 @@ -167,6 +167,7 @@ struct priv {
@@ -217,7 +201,7 @@ index b0f046119..fb917cb54 100644
  
      struct mp_pin *out_pin;
 diff --git a/filters/f_decoder_wrapper.h b/filters/f_decoder_wrapper.h
-index c2ad95a64..88a9349a3 100644
+index c2ad95a642fc9753abb8ff42e8b6cb96231a9c4b..88a9349a3ae1b0ce148d154a43958315d49303be 100644
 --- a/filters/f_decoder_wrapper.h
 +++ b/filters/f_decoder_wrapper.h
 @@ -35,6 +35,8 @@ struct mp_decoder_wrapper {
@@ -230,7 +214,7 @@ index c2ad95a64..88a9349a3 100644
  
  // Create the decoder wrapper for the given stream, plus underlying decoder.
 diff --git a/meson.build b/meson.build
-index 84a660275..afb5cb79f 100644
+index 84a6602759a22432413ae30c3b662813d1fa1ccd..afb5cb79fffec249201e6082a3a5619fce650f88 100644
 --- a/meson.build
 +++ b/meson.build
 @@ -167,6 +167,7 @@ sources = files(
@@ -242,7 +226,7 @@ index 84a660275..afb5cb79f 100644
      'player/command.c',
      'player/configfiles.c',
 diff --git a/options/options.c b/options/options.c
-index cb2e145d5..3d7c3dc7a 100644
+index cb2e145d51bf64559a9ff4bb8dada0f48879a48b..3d7c3dc7aba1617013c03749d1e825936ee73e00 100644
 --- a/options/options.c
 +++ b/options/options.c
 @@ -769,6 +769,8 @@ static const m_option_t mp_opts[] = {
@@ -255,7 +239,7 @@ index cb2e145d5..3d7c3dc7a 100644
      {"audio-stream-silence", OPT_BOOL(audio_stream_silence)},
      {"audio-wait-open", OPT_FLOAT(audio_wait_open), M_RANGE(0, 60)},
 diff --git a/options/options.h b/options/options.h
-index 7934fa4f0..fa48bc7c6 100644
+index 7934fa4f030d9a8972c00de3dbc8288c6e75e4bd..fa48bc7c67e585a0d70526bd50a5237417bfabb2 100644
 --- a/options/options.h
 +++ b/options/options.h
 @@ -200,6 +200,8 @@ typedef struct MPOpts {
@@ -268,7 +252,7 @@ index 7934fa4f0..fa48bc7c6 100644
      bool audio_stream_silence;
      float audio_wait_open;
 diff --git a/player/audio.c b/player/audio.c
-index 87cc427cc..64e5326f4 100644
+index 87cc427cc5f60b02694012d33e6a9bf58644e6aa..64e5326f4fbdbded652ef9237e287a26195d5f69 100644
 --- a/player/audio.c
 +++ b/player/audio.c
 @@ -229,6 +229,7 @@ static void ao_chain_reset_state(struct ao_chain *ao_c)
@@ -354,7 +338,7 @@ index 87cc427cc..64e5326f4 100644
  }
 diff --git a/player/audio_secondary.c b/player/audio_secondary.c
 new file mode 100644
-index 000000000..e11a4f132
+index 0000000000000000000000000000000000000000..e11a4f132d97cefe6e468d1ee7503feed99ee5ad
 --- /dev/null
 +++ b/player/audio_secondary.c
 @@ -0,0 +1,349 @@
@@ -708,7 +692,7 @@ index 000000000..e11a4f132
 +        (s->speed - 1) * 1e6);
 +}
 diff --git a/player/command.c b/player/command.c
-index 8f4018ba0..9f0d4c6ba 100644
+index 3d0317c8f28ae8f1381e4aa96e87e5d0d274ea3d..49893785723c191e161330c99ca65b7a92785d93 100644
 --- a/player/command.c
 +++ b/player/command.c
 @@ -1775,6 +1775,10 @@ static int mp_property_audio_dual_status(void *ctx, struct m_property *prop,
@@ -722,7 +706,7 @@ index 8f4018ba0..9f0d4c6ba 100644
      if (!mpctx->ao || ao_control(mpctx->ao, AOCONTROL_GET_DUAL_STATUS, arg) != CONTROL_OK)
          return M_PROPERTY_UNAVAILABLE;
      return M_PROPERTY_OK;
-@@ -8597,7 +8601,11 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
+@@ -8647,7 +8651,11 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
  
      if (flags & UPDATE_AD && mpctx->ao_chain) {
          uninit_audio_chain(mpctx);
@@ -735,7 +719,7 @@ index 8f4018ba0..9f0d4c6ba 100644
  
      if (flags & UPDATE_VD && mpctx->vo_chain) {
 diff --git a/player/core.h b/player/core.h
-index b7992bbde..dbcfc1256 100644
+index b7992bbdef4dffaf0efd2084a2bd3fb25841d3e6..dbcfc1256afa0ed620b1cc28b6844741d39b79c6 100644
 --- a/player/core.h
 +++ b/player/core.h
 @@ -324,6 +324,7 @@ typedef struct MPContext {
@@ -762,7 +746,7 @@ index b7992bbde..dbcfc1256 100644
  void audio_start_ao(struct MPContext *mpctx);
  
 diff --git a/player/playloop.c b/player/playloop.c
-index d899fba12..b8747715f 100644
+index d899fba1236df3d1e7f114ef5d5efca8d36c3b08..b8747715fb30fdfa7e1b6053f44ba813171f81b9 100644
 --- a/player/playloop.c
 +++ b/player/playloop.c
 @@ -170,6 +170,7 @@ void set_pause_state(struct MPContext *mpctx, bool user_pause)
@@ -785,6 +769,3 @@ index d899fba12..b8747715f 100644
      if (mpctx->video_status == STATUS_READY) {
          mpctx->video_status = STATUS_PLAYING;
          get_relative_time(mpctx);
--- 
-2.54.0.windows.1
-

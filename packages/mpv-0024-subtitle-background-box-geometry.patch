@@ -1,17 +1,11 @@
-From 45a7565d413d0c9ea88183948a773fa793b52fc2 Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Sat, 22 Aug 2026 16:30:00 -0400
+From 5b1ce341796f0be39cfda262b0fe11bbaf181ad3 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:49:53 -0500
 Subject: [PATCH] sub: add fitted rounded background boxes
 
----
- DOCS/man/options.rst |  12 ++
- options/options.c    |   5 +
- options/options.h    |   2 +
- sub/sd_ass.c         | 346 +++++++++++++++++++++++++++++++++++++++++++
- 4 files changed, 365 insertions(+)
 
 diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
-index f4562a3a2..3b256c0f4 100644
+index 0455bf778d127325d4b7391ab1fd46adf5352022..23c1d3b629bb705730c049c42fb99f96072aa072 100644
 --- a/DOCS/man/options.rst
 +++ b/DOCS/man/options.rst
 @@ -2664,6 +2664,18 @@ Subtitles
@@ -34,7 +28,7 @@ index f4562a3a2..3b256c0f4 100644
      Set the text layout engine used by libass.
  
 diff --git a/options/options.c b/options/options.c
-index 2a5373d44..ff01972ec 100644
+index 2a5373d44d7b5185bbbf2ff8bcadaac831756a47..ff01972ecff4ace5654fd9578db9a0b7d9a4453f 100644
 --- a/options/options.c
 +++ b/options/options.c
 @@ -318,6 +318,10 @@ const struct m_sub_options mp_subtitle_sub_opts = {
@@ -57,7 +51,7 @@ index 2a5373d44..ff01972ec 100644
          .teletext_page = 0,
          .ass_vsfilter_color_compat = 1,
 diff --git a/options/options.h b/options/options.h
-index 152426237..fe0c5eee1 100644
+index 1524262379a665c435aa712ad98a8159d7cb39e2..fe0c5eee1fced3695d2ba1fc04e400d580a68011 100644
 --- a/options/options.h
 +++ b/options/options.h
 @@ -115,6 +115,8 @@ struct mp_subtitle_opts {
@@ -70,7 +64,7 @@ index 152426237..fe0c5eee1 100644
      bool sub_use_margins;
      int ass_vsfilter_color_compat;
 diff --git a/sub/sd_ass.c b/sub/sd_ass.c
-index db4d67dac..5a42e5157 100644
+index db4d67daca1c9beee14acfb96713b8c329164d2d..5a42e5157a079d6622f7116454febb2bb7065fbe 100644
 --- a/sub/sd_ass.c
 +++ b/sub/sd_ass.c
 @@ -20,6 +20,7 @@
@@ -448,5 +442,3 @@ index db4d67dac..5a42e5157 100644
  
  done:
      // mangle_colors() modifies the color field, so copy the thing _before_.
--- 
-2.54.0.windows.1

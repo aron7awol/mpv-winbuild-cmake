@@ -1,19 +1,14 @@
-From bcb2e92a734a423b362bd7d966ef0734f89ef746 Mon Sep 17 00:00:00 2001
-From: Aaron <aaronmedeiros@gmail.com>
-Date: Mon, 17 Aug 2026 21:33:59 -0400
+From 8ee0983b72d19a0e326113e502d38c7bc5d7f3a4 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:49:51 -0500
 Subject: [PATCH] vo_gpu_next: expose smoothed peak measurement stats
 
----
- player/command.c        | 4 ++++
- video/mp_image.h        | 2 ++
- video/out/vo_gpu_next.c | 2 ++
- 3 files changed, 8 insertions(+)
 
 diff --git a/player/command.c b/player/command.c
-index 4a5bcfcd8..1d706af82 100644
+index c3064b5375275155f4160ca8074f204ce3d789b6..178ff54296c9eb4debcf1f43953a6ce15d12d617 100644
 --- a/player/command.c
 +++ b/player/command.c
-@@ -2595,6 +2595,10 @@ static int property_imgparams(const struct mp_image_params *p, int action, void
+@@ -2599,6 +2599,10 @@ static int property_imgparams(const struct mp_image_params *p, int action, void
                              .unavailable = !peak->valid},
          {"raw-avg-pq-y", SUB_PROP_FLOAT(peak->raw_avg_pq_y),
                              .unavailable = !peak->valid},
@@ -25,7 +20,7 @@ index 4a5bcfcd8..1d706af82 100644
                              .unavailable = !peak->valid},
          {"raw-avg-rgb-nits", SUB_PROP_FLOAT(peak->raw_avg_rgb),
 diff --git a/video/mp_image.h b/video/mp_image.h
-index ccc620098..67da683c4 100644
+index 3e9df2ad377c15d49c2b4e74470da3d3d6797a51..583e32a497636cfe40f03153fdddd99bef518162 100644
 --- a/video/mp_image.h
 +++ b/video/mp_image.h
 @@ -67,6 +67,8 @@ struct mp_peak_detect_metrics {
@@ -38,10 +33,10 @@ index ccc620098..67da683c4 100644
      float raw_avg_rgb;          // average maxRGB, cd/m^2
      float raw_max_tone_metric;       // percentile private-metric peak
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index 1e3ea02d1..6f2fd0907 100644
+index 5209f42406fd558e4374e053440f2c774eda0722..4c741ac977334872098538a7136fafd4abcc8369 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
-@@ -1848,6 +1848,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1942,6 +1942,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
                  .scene_reset_count   = metrics.scene_reset_count,
                  .raw_max_pq_y        = metrics.raw_max_pq_y,
                  .raw_avg_pq_y        = metrics.raw_avg_pq_y,
@@ -50,5 +45,3 @@ index 1e3ea02d1..6f2fd0907 100644
                  .raw_max_rgb         = metrics.raw_max_rgb,
                  .raw_avg_rgb         = metrics.raw_avg_rgb,
                  .raw_max_tone_metric      = metrics.raw_max_metric,
--- 
-2.54.0.windows.1

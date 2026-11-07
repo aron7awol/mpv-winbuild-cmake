@@ -1,15 +1,8 @@
-From 4dc7b2c6aa30013bf24eb31c0f700208de1d2c29 Mon Sep 17 00:00:00 2001
-From: mpv-ht <mpv-ht@local>
-Date: Wed, 5 Aug 2026 14:50:44 -0400
+From 773ea4ef5fe8e96a28c3e02c9162c06ad0be172d Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:49:47 -0500
 Subject: [PATCH] windows: use cyan mpv-ht application icon
 
----
- etc/mpv-icon-8bit-128x128.png | Bin 22984 -> 24353 bytes
- etc/mpv-icon-8bit-16x16.png   | Bin 759 -> 753 bytes
- etc/mpv-icon-8bit-32x32.png   | Bin 2124 -> 2116 bytes
- etc/mpv-icon-8bit-64x64.png   | Bin 5686 -> 5476 bytes
- etc/mpv-icon.ico              | Bin 270345 -> 75120 bytes
- 5 files changed, 0 insertions(+), 0 deletions(-)
 
 diff --git a/etc/mpv-icon-8bit-128x128.png b/etc/mpv-icon-8bit-128x128.png
 index 184026924669ecf5137752a1572c5d8a972ec4f8..00c87409669a207103472b6ba2127005e5e4574d 100644
@@ -7556,5 +7549,3 @@ zc(UVa5C2Ktv}F(};Uh#0fDv68eR_Jq9SR)2s`Q8dG7yYkwvwv~Mf<$jyWU+NmPgnS
 z6-i~J<-)WG*Ie|0A!m|!@*^`2iT^wNmVt;Xt94eIC&d>%ooB&+udfzy)&{^TJwkN3
 y!nt6?{%s6eN7smz4D;m&t%c|Rhu0}=_7+&dH4$WZHwqPS_h>xUeN?S%8~uMw&{=l?
 
--- 
-2.54.0.windows.1

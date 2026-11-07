@@ -1,6 +1,10 @@
 file(GLOB mpv_patch_files CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/mpv-*.patch")
 list(SORT mpv_patch_files)
+list(LENGTH mpv_patch_files mpv_patch_count)
+if(NOT mpv_patch_count EQUAL 52)
+    message(FATAL_ERROR "Expected 52 consolidated mpv patches; remove stale patches or update the series deliberately")
+endif()
 set(mpv_patch_fingerprint "")
 foreach(mpv_patch IN LISTS mpv_patch_files)
     file(SHA256 "${mpv_patch}" mpv_patch_sha256)

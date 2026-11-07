@@ -1,15 +1,14 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: mpv-ht <mpv-ht@local>
-Date: Sat, 12 Sep 2026 12:00:00 -0400
+From 6384eab23090dd0150febdf2ad09b67f993a8215 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:52:05 -0500
 Subject: [PATCH] vo_gpu_next: expose experimental IPT-path gamut mapper
 
 Experimental opt-in only; existing gamut-mapping defaults are unchanged.
 The direct GPU path avoids hard-boundary interpolation errors in a 3D LUT.
 See analysis/ipt-path-gamut in the mpv-ht packaging repository for tests.
 
----
 diff --git a/video/out/gpu/video.c b/video/out/gpu/video.c
-index 8b14c69a8..31fc93322 100644
+index 8b14c69a8e7568c719809964694e75d0ad4b7a58..31fc933224ae6980f487b9cef19975436e7bca67 100644
 --- a/video/out/gpu/video.c
 +++ b/video/out/gpu/video.c
 @@ -498,7 +498,8 @@ const struct m_sub_options gl_video_conf = {
@@ -23,7 +22,7 @@ index 8b14c69a8..31fc93322 100644
              {"auto", 0},
              {"yes", 1},
 diff --git a/video/out/gpu/video.h b/video/out/gpu/video.h
-index 4161375b8..dc508c1d3 100644
+index 4161375b828cf90ba466327afbc5f8e44707bed4..dc508c1d3670366353f361e8c71034315b01cf7e 100644
 --- a/video/out/gpu/video.h
 +++ b/video/out/gpu/video.h
 @@ -123,6 +123,7 @@ enum gamut_mode {
@@ -35,10 +34,10 @@ index 4161375b8..dc508c1d3 100644
  
  struct gl_tone_map_opts {
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index 4bb42acdb..622eabbee 100644
+index d6ec8a7dab397179cd286bcb139fae69ff242964..2c86e7a74ad6371a82a303eb4d3ad6f24f603ec7 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
-@@ -2921,7 +2921,12 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -3100,7 +3100,12 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
          const struct pl_raw_primaries target_signal =
              *pl_raw_primaries_get(target_color.primaries);
          if (pl_raw_primaries_equal(&source_signal, &target_signal)) {
@@ -52,7 +51,7 @@ index 4bb42acdb..622eabbee 100644
              preserve_source_gamut = true;
          }
      }
-@@ -4745,6 +4750,7 @@ static void update_render_options(struct vo *vo)
+@@ -4933,6 +4938,7 @@ static void update_render_options(struct vo *vo)
          [GAMUT_DARKEN]          = &pl_gamut_map_darken,
          [GAMUT_WARN]            = &pl_gamut_map_highlight,
          [GAMUT_LINEAR]          = &pl_gamut_map_linear,

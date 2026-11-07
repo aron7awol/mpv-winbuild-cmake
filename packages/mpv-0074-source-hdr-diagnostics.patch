@@ -1,24 +1,12 @@
-From 2f5d49e5a976e2a551008d49fa242451ac925913 Mon Sep 17 00:00:00 2001
-From: Codex <noreply@openai.com>
-Date: Wed, 21 Oct 2026 11:18:32 -0400
+From e7801516c4c4e7cac4e91fd961c3409ac9f132e4 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:52:54 -0500
 Subject: [PATCH] video: preserve independent source HDR diagnostic records
 
 Expose original HDR10 BL, DV L6/L1 and HDR10+ records, plus the actual peak detector, without changing renderer metadata or equality. Preserve through copies, AVFrame round trips and dual-track pairing. Let the mpv-ht adapter supply compact shared source rows to native Stats. Add a native copy/round-trip/equality test.
----
- DOCS/man/input.rst           | 43 ++++++++++++++++++
- filters/f_enhancement_pair.c |  6 +++
- player/command.c             | 27 ++++++++++++
- player/lua/stats.lua         | 14 ++++++
- test/meson.build             |  5 +++
- test/source_hdr.c            | 85 ++++++++++++++++++++++++++++++++++++
- video/mp_image.c             | 54 +++++++++++++++++++++++
- video/mp_image.h             | 16 +++++++
- video/out/vo_gpu_next.c      |  1 +
- 9 files changed, 251 insertions(+)
- create mode 100644 test/source_hdr.c
 
 diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
-index bf8377c1e..272168c4d 100644
+index bf8377c1e44f7893462af148261012b941c3c450..272168c4d2247be9559336b54b4a9f66da5694dc 100644
 --- a/DOCS/man/input.rst
 +++ b/DOCS/man/input.rst
 @@ -2980,6 +2980,49 @@ Property list
@@ -72,7 +60,7 @@ index bf8377c1e..272168c4d 100644
          Unsmoothed average CIE Y of the current measured frame (in PQ, 0-1).
  
 diff --git a/filters/f_enhancement_pair.c b/filters/f_enhancement_pair.c
-index bc247e2d0..785e72918 100644
+index bc247e2d0f280e4d2fb3c09792a4526b21ea8ca3..785e729187922aaf413f5cf27a4b27de577de14f 100644
 --- a/filters/f_enhancement_pair.c
 +++ b/filters/f_enhancement_pair.c
 @@ -100,6 +100,12 @@ static struct mp_image *take_head(struct mp_image ***queue, int *num)
@@ -89,7 +77,7 @@ index bc247e2d0..785e72918 100644
          return;
      if (el->params.dovi_el_type != MP_DOVI_EL_NONE)
 diff --git a/player/command.c b/player/command.c
-index 759d763da..55325cd41 100644
+index 759d763dab3a70cb29ee4089bd6d3dd96863e60a..55325cd414c4e1e1fafe762930309d61e64f78b6 100644
 --- a/player/command.c
 +++ b/player/command.c
 @@ -2564,7 +2564,30 @@ static int property_imgparams(const struct mp_image_params *p, int action, void
@@ -135,7 +123,7 @@ index 759d763da..55325cd41 100644
                              .unavailable = !peak->valid},
          {"smoothed-max-pq-y", SUB_PROP_FLOAT(peak->smoothed_max_pq_y),
 diff --git a/player/lua/stats.lua b/player/lua/stats.lua
-index 6796515f7..e250b4fec 100644
+index 6796515f72717f787bcf7247493567ee41b5c040..e250b4feca399a4258163128796c9a620edf9b59 100644
 --- a/player/lua/stats.lua
 +++ b/player/lua/stats.lua
 @@ -812,6 +812,20 @@ local function append_hdr(s, hdr, video_out)
@@ -160,7 +148,7 @@ index 6796515f7..e250b4fec 100644
          return val and math.abs(val - target) > 1e-4
      end
 diff --git a/test/meson.build b/test/meson.build
-index 06da4adc8..633ea1eef 100644
+index 06da4adc850be2bc154fa67aa206ec1204828fb7..633ea1eef9522264b7ebabcc32b136439a970ace 100644
 --- a/test/meson.build
 +++ b/test/meson.build
 @@ -73,6 +73,11 @@ img_utils = static_library('img-utils', 'img_utils.c', include_directories: incd
@@ -177,7 +165,7 @@ index 06da4adc8..633ea1eef 100644
      'audio/chmap_sel.c',
 diff --git a/test/source_hdr.c b/test/source_hdr.c
 new file mode 100644
-index 000000000..529852afd
+index 0000000000000000000000000000000000000000..529852afdd8e8a59015b6787da115029b74e2cfb
 --- /dev/null
 +++ b/test/source_hdr.c
 @@ -0,0 +1,85 @@
@@ -267,18 +255,18 @@ index 000000000..529852afd
 +    return 0;
 +}
 diff --git a/video/mp_image.c b/video/mp_image.c
-index fd188f8b0..072f53fe8 100644
+index 5997dce036ddb12dfce39068a986b4bc3fffea73..3b5933e51ac37f302557be49faa5cf6b30bd1b1a 100644
 --- a/video/mp_image.c
 +++ b/video/mp_image.c
-@@ -563,6 +563,7 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
-     dst->params.sys_orig = src->params.sys_orig;
+@@ -564,6 +564,7 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
+     dst->params.dovi_el_type = src->params.dovi_el_type;
      dst->params.authored_scene_cut = src->params.authored_scene_cut;
      dst->params.hdr10plus_signature = src->params.hdr10plus_signature;
 +    dst->params.source_hdr = src->params.source_hdr;
      dst->params.no_dovi = src->params.no_dovi;
      dst->params.no_enhancement_layer = src->params.no_enhancement_layer;
  
-@@ -908,6 +909,7 @@ void mp_image_params_update_dynamic(struct mp_image_params *dst,
+@@ -909,6 +910,7 @@ void mp_image_params_update_dynamic(struct mp_image_params *dst,
      dst->dovi_el_type = src->dovi_el_type;
      dst->authored_scene_cut = src->authored_scene_cut;
      dst->hdr10plus_signature = src->hdr10plus_signature;
@@ -286,7 +274,7 @@ index fd188f8b0..072f53fe8 100644
      // Don't overwrite peak-detected HDR metadata if available.
      float max_pq_y = dst->color.hdr.max_pq_y;
      float avg_pq_y = dst->color.hdr.avg_pq_y;
-@@ -1192,6 +1194,31 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
+@@ -1193,6 +1195,31 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
          .dhp = (void *)(dhp ? dhp->data : NULL),
      });
  
@@ -318,7 +306,7 @@ index fd188f8b0..072f53fe8 100644
      sd = av_frame_get_side_data(src, AV_FRAME_DATA_A53_CC);
      if (sd)
          dst->a53_cc = sd->buf;
-@@ -1204,6 +1231,22 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
+@@ -1205,6 +1232,22 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
      if (sd) {
  #ifdef PL_HAVE_LAV_DOLBY_VISION
          const AVDOVIMetadata *metadata = (const AVDOVIMetadata *)sd->buf->data;
@@ -341,7 +329,7 @@ index fd188f8b0..072f53fe8 100644
          // MEL can carry LINEAR_DZ NLQ with trivial coefficients: zero
          // offsets, slopes and thresholds, and normalized vdr_in_max = 1
          // in all three components. NLQ presence alone does not imply FEL.
-@@ -1251,6 +1294,9 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
+@@ -1252,6 +1295,9 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
  
      sd = av_frame_get_side_data(src, AV_FRAME_DATA_DOVI_RPU_BUFFER);
      if (sd) {
@@ -351,7 +339,7 @@ index fd188f8b0..072f53fe8 100644
          pl_hdr_metadata_from_dovi_rpu(&dst->params.color.hdr, sd->buf->data,
                                        sd->buf->size);
      }
-@@ -1259,6 +1305,14 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
+@@ -1260,6 +1306,14 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
      if (sd)
          dst->film_grain = sd->buf;
  
@@ -367,7 +355,7 @@ index fd188f8b0..072f53fe8 100644
          sd = src->side_data[n];
          struct mp_ff_side_data mpsd = {
 diff --git a/video/mp_image.h b/video/mp_image.h
-index 583e32a49..6a81593b9 100644
+index 583e32a497636cfe40f03153fdddd99bef518162..6a81593b91dd5cec1fa6f0e7324382ef358f9bd6 100644
 --- a/video/mp_image.h
 +++ b/video/mp_image.h
 @@ -56,11 +56,26 @@ enum mp_authored_scene_cut {
@@ -406,7 +394,7 @@ index 583e32a49..6a81593b9 100644
      // Flags for f_enhancement_pair.c to not inherit flags from EL.
      bool no_dovi;
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index dba7bb8c3..4d37061b9 100644
+index dba7bb8c31832097bfeda7eee04684857ba0ad6e..4d37061b951e761249aa296791c18a8f879e055b 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
 @@ -3442,6 +3442,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)

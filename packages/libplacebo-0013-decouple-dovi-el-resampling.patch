@@ -1,18 +1,15 @@
-From 0c701ace59ba2306ff880296c73e69e1f1085c43 Mon Sep 17 00:00:00 2001
-From: mpv-ht <mpv-ht@localhost>
-Date: Sun, 16 Aug 2026 21:27:38 -0400
-Subject: [PATCH] renderer: use staged Dolby Vision EL reference resampling
+From 998ee261694741834b120afde331435c989c77ea Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Sat, 7 Nov 2026 16:53:00 -0500
+Subject: [PATCH] renderer: reconstruct Dolby Vision EL with reference
+ resampling and precision
 
----
- meson.build                      |   1 +
- src/filters.c                    | 123 +++++++++++++++++++++++++++
- src/include/libplacebo/filters.h |  12 +++
- src/renderer.c                   | 138 ++++++++++++++++++++++++++-----
- src/tests/filters.c              |  18 ++++
- 5 files changed, 271 insertions(+), 21 deletions(-)
+Consolidates the published .76 changes without modifying the final source.
+Original: libplacebo-0013-decouple-dovi-el-resampling.patch
+Original: libplacebo-0038-fel-reconstruction-precision.patch
 
 diff --git a/meson.build b/meson.build
-index d73bbfbc..2d675a07 100644
+index d73bbfbc07fb02d38fba6d3ced9fe6aec6dff37f..2d675a0789bd77991a96f0bdc7165744e641c59b 100644
 --- a/meson.build
 +++ b/meson.build
 @@ -12,6 +12,7 @@ project('libplacebo', ['c', 'cpp'],
@@ -24,7 +21,7 @@ index d73bbfbc..2d675a07 100644
        '372': 'add pl_{renderer_,}get_peak_detect_metrics',
        '371': 'input frame.hdr.max_luma is now respecte when frame has ICC profile',
 diff --git a/src/filters.c b/src/filters.c
-index 0cbc5731..9cc06e7e 100644
+index 0cbc57315773bac3b14247b99f2c16f93d8a4197..9cc06e7e4a0c62ed7c8e4dbbde25ea2c48e3dbac 100644
 --- a/src/filters.c
 +++ b/src/filters.c
 @@ -601,6 +601,110 @@ const struct pl_filter_function pl_filter_function_spline64 = {
@@ -165,7 +162,7 @@ index 0cbc5731..9cc06e7e 100644
      .name        = "bilinear",
      .description = "Bilinear",
 diff --git a/src/include/libplacebo/filters.h b/src/include/libplacebo/filters.h
-index 248f7bbb..3542b116 100644
+index 248f7bbb412d55610664c9872ce5c9495cd7608f..3542b1165b47961f89679312b905499391350d05 100644
 --- a/src/include/libplacebo/filters.h
 +++ b/src/include/libplacebo/filters.h
 @@ -160,6 +160,14 @@ PL_API extern const struct pl_filter_function pl_filter_function_spline64;
@@ -195,10 +192,10 @@ index 248f7bbb..3542b116 100644
  // Backwards compatibility
  #define pl_filter_triangle          pl_filter_bilinear
 diff --git a/src/renderer.c b/src/renderer.c
-index 63280ecd..55e470d4 100644
+index 2b896cba7b8b95041cdee234116c6f9029b7d0a9..d251694209a4c8186bce73cb90b02e379b21ae2f 100644
 --- a/src/renderer.c
 +++ b/src/renderer.c
-@@ -614,9 +614,16 @@ enum sampler_dir {
+@@ -614,9 +614,32 @@ enum sampler_dir {
  enum sampler_usage {
      SAMPLER_MAIN,
      SAMPLER_PLANE,
@@ -212,10 +209,26 @@ index 63280ecd..55e470d4 100644
 +    return usage == SAMPLER_EL_LUMA || usage == SAMPLER_EL_CHROMA;
 +}
 +
++// BL and EL values used for FEL reconstruction are codes, not display RGB.
++// Rounding them to FP16 between filter passes can lose a reconstructed 12-bit
++// level even in an otherwise flat region. Keep this requirement local to
++// FEL reconstruction. Fall back to the normal FBO choice on GPUs without a
++// suitable FP32 render target.
++static pl_fmt dovi_fbo_format(struct pass_state *pass, int components)
++{
++    for (int c = components; c <= 4; c++) {
++        pl_fmt fmt = pl_find_fmt(pass->rr->gpu, PL_FMT_FLOAT, c, 32, 0,
++                                PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_LINEAR);
++        if (fmt)
++            return fmt;
++    }
++    return NULL;
++}
++
  struct sampler_info {
      const struct pl_filter_config *config; // if applicable
      enum sampler_usage usage;
-@@ -660,14 +667,32 @@ static struct sampler_info sample_src_info(struct pass_state *pass,
+@@ -660,14 +683,32 @@ static struct sampler_info sample_src_info(struct pass_state *pass,
      case SAMPLER_DOWN:
          if (usage == SAMPLER_LOWPASS) {
              info.config = &pl_filter_bicubic;
@@ -250,7 +263,38 @@ index 63280ecd..55e470d4 100644
              info.config = params->plane_upscaler;
          } else {
              pl_assert(usage != SAMPLER_LOWPASS);
-@@ -1891,8 +1916,10 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
+@@ -722,6 +763,10 @@ static void dispatch_sampler(struct pass_state *pass, pl_shader sh,
+ 
+     pl_renderer rr = pass->rr;
+     struct sampler_info info = sample_src_info(pass, src, usage);
++    const bool fel_plane = usage == SAMPLER_PLANE &&
++        pass->image.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION &&
++        pass->image.enhancement_layer && pass->image.repr.dovi &&
++        pass->image.repr.dovi->nlq_active;
+     pl_shader_obj *lut = NULL;
+     switch (info.dir) {
+     case SAMPLER_NOOP:
+@@ -795,6 +840,8 @@ static void dispatch_sampler(struct pass_state *pass, pl_shader sh,
+             .w  = src1.new_w,
+             .h  = src1.new_h,
+             .comps = src->components,
++            .fmt = sampler_is_el(usage) || fel_plane
++                 ? dovi_fbo_format(pass, src->components) : NULL,
+         };
+ 
+         src2.tex = img_tex(pass, &img);
+@@ -1882,6 +1929,10 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
+           rly = lry >= 1 ? roundf(lry) : 1.0 / roundf(1.0 / lry);
+ 
+     struct pl_color_repr el_repr = el->repr;
++    // NLQ offsets/slopes use residual code / (2^el_depth - 1), regardless
++    // of the carrier's video-range flag. Retain storage depth and bit shift,
++    // but normalize to this full code domain (as for the Dolby Vision BL).
++    el_repr.levels = PL_COLOR_LEVELS_FULL;
+     float el_scale = pl_color_repr_normalize(&el_repr);
+ 
+ #pragma GLSL vec4 color = vec4(0.0), tmp;
+@@ -1891,8 +1942,10 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
          if (!plane->texture)
              continue;
  
@@ -263,7 +307,7 @@ index 63280ecd..55e470d4 100644
          float rx = (float) plane->texture->params.w / el_ref->params.w,
                ry = (float) plane->texture->params.h / el_ref->params.h;
          float rrx = rlx * (rx >= 1 ? roundf(rx) : 1.0 / roundf(1.0 / rx)),
-@@ -1900,19 +1927,92 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
+@@ -1900,19 +1953,93 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
          float sx = layer_x + plane->shift_x / rlx,
                sy = layer_y + plane->shift_y / rly;
  
@@ -315,6 +359,7 @@ index 63280ecd..55e470d4 100644
 +                .w     = spatial_w,
 +                .h     = spatial_h,
 +                .comps = plane->components,
++                .fmt   = dovi_fbo_format(pass, plane->components),
 +            };
 +            pl_tex spatial_tex = img_tex(pass, &spatial);
 +            if (!spatial_tex) {
@@ -369,7 +414,7 @@ index 63280ecd..55e470d4 100644
  
          PL_TRACE(rr, "EL plane %d: %dx%d -> %dx%d (EL ref %dx%d, BL ref %dx%d) "
                   "shift {%.3f %.3f} rect {%.3f %.3f %.3f %.3f}",
-@@ -1921,10 +2021,6 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
+@@ -1921,10 +2048,6 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
                   ref_tex->params.w, ref_tex->params.h, sx, sy,
                   src.rect.x0, src.rect.y0, src.rect.x1, src.rect.y1);
  
@@ -381,7 +426,7 @@ index 63280ecd..55e470d4 100644
          pl_dispatch_abort(rr->dp, &plane_sh);
          if (!sub) {
 diff --git a/src/tests/filters.c b/src/tests/filters.c
-index 89e7820a..9450e3f7 100644
+index 89e7820a92a775572f5c47c16b306fc8e3381df3..9450e3f738355d7c3dea99ffee87029034a3b448 100644
 --- a/src/tests/filters.c
 +++ b/src/tests/filters.c
 @@ -6,6 +6,24 @@ int main()
@@ -409,5 +454,3 @@ index 89e7820a..9450e3f7 100644
      for (int i = 0; i < pl_num_filter_functions; i++) {
          const struct pl_filter_function *fun = pl_filter_functions[i];
          if (fun->opaque)
--- 
-2.54.0.windows.1
