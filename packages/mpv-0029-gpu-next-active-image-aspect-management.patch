@@ -1,9 +1,13 @@
-From 1547da721af18183dfbf75f2f39334ea0b1fe0b4 Mon Sep 17 00:00:00 2001
+From f3288abfde5c9c08622359b9ee1ea28cf13c7a3e Mon Sep 17 00:00:00 2001
 From: mpv-ht development <mpv-ht@localhost>
 Date: Sat, 7 Nov 2026 16:51:58 -0500
 Subject: [PATCH] gpu-next: detect active images and compose stable framing
 
-Consolidates the published .76 changes without modifying the final source.
+Combines the active-image detection, ordered history and manual framing changes.
+Corroborate both horizontal edges before accepting the legacy row fallback,
+so an isolated diagonal subject cannot seed a false centered crop/history.
+Keeps the existing codec-residue tolerance and asynchronous no-wait path.
+
 Original: 0029-gpu-next-active-image-aspect-management.patch
 Original: 0066-active-image-ordered-history.patch
 Original: 0067-active-image-manual-framing.patch
@@ -95,7 +99,7 @@ index f9c0365a29cd11cff0f92e2cc5be12841d5d5906..62532521d554c8c594df2521225419c1
  enum mp_content_type {
      MP_CONTENT_NONE, // used for force-window
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
-index 9915da25ba914893b6e7044a84aa77978be03ad8..1e2943cac93c5351cca340d77072337cd0369501 100644
+index 9915da25ba914893b6e7044a84aa77978be03ad8..20d758efad96b1c3e55c07be6badba1b4f5d7eac 100644
 --- a/video/out/vo_gpu_next.c
 +++ b/video/out/vo_gpu_next.c
 @@ -23,6 +23,8 @@
@@ -229,7 +233,7 @@ index 9915da25ba914893b6e7044a84aa77978be03ad8..1e2943cac93c5351cca340d77072337c
  };
  
  #if PL_API_VER >= 367
-@@ -1029,6 +1104,1203 @@ static bool upload_planes_sw(struct vo *vo, pl_gpu gpu, struct mp_image *mpi,
+@@ -1029,6 +1104,1225 @@ static bool upload_planes_sw(struct vo *vo, pl_gpu gpu, struct mp_image *mpi,
      return true;
  }
  
@@ -582,6 +586,28 @@ index 9915da25ba914893b6e7044a84aa77978be03ad8..1e2943cac93c5351cca340d77072337c
 +            } else {
 +                centered = legacy_centered;
 +                boundary_found = legacy_found;
++                // Without a spatially supported horizontal boundary, a small
++                // subject on black can end the row search on just one edge.
++                // Do not mirror that isolated edge into a new centered crop.
++                // Confirm picture independently at both ends within the same
++                // eight-row residue tolerance used by the asymmetric veto.
++                // This is spatial corroboration, not a temporal settling delay.
++                bool top_picture = false, bottom_picture = false;
++                int first = MPMAX(0, centered - 8);
++                int last = MPMIN(height / 2 - 1, centered + 8);
++                for (int y = first; boundary_found && y <= last; y++) {
++                    top_picture |= data->rows[y][1] > matte_ceiling &&
++                                   data->bright[y] > noise_pixels;
++                    int by = height - 1 - y;
++                    bottom_picture |= data->rows[by][1] > matte_ceiling &&
++                                      data->bright[by] > noise_pixels;
++                }
++                if (boundary_found && (!top_picture || !bottom_picture)) {
++                    MP_TRACE(p, "Active image unpaired row boundary frame=%" PRIu64
++                             " boundary=%d picture=%d/%d.\n", tag - 1,
++                             centered, top_picture, bottom_picture);
++                    boundary_found = false;
++                }
 +            }
 +            result.boundary_exact = legacy_found;
 +            bool asymmetric = boundary_found &&
@@ -1433,7 +1459,7 @@ index 9915da25ba914893b6e7044a84aa77978be03ad8..1e2943cac93c5351cca340d77072337c
  static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src,
                        struct pl_frame *frame)
  {
-@@ -1178,6 +2450,8 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
+@@ -1178,6 +2472,8 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
      update_lut(p, &p->next_opts->image_lut);
      frame->lut = p->next_opts->image_lut.lut;
      frame->lut_type = p->next_opts->image_lut.type;
@@ -1442,7 +1468,7 @@ index 9915da25ba914893b6e7044a84aa77978be03ad8..1e2943cac93c5351cca340d77072337c
      return true;
  }
  
-@@ -1227,8 +2501,11 @@ static void update_options(struct vo *vo)
+@@ -1227,8 +2523,11 @@ static void update_options(struct vo *vo)
  {
      struct priv *p = vo->priv;
      pl_options pars = p->pars;
@@ -1454,7 +1480,7 @@ index 9915da25ba914893b6e7044a84aa77978be03ad8..1e2943cac93c5351cca340d77072337c
      if (changed) {
          update_render_options(vo);
          // Cached intermediates were produced with the previous options.
-@@ -1345,15 +2622,10 @@ static void apply_target_options(struct priv *p, struct pl_frame *target,
+@@ -1345,15 +2644,10 @@ static void apply_target_options(struct priv *p, struct pl_frame *target,
      target->icc = p->icc_profile;
  }
  
@@ -1473,7 +1499,7 @@ index 9915da25ba914893b6e7044a84aa77978be03ad8..1e2943cac93c5351cca340d77072337c
  
      // mpv gives us rotated/flipped rects, libplacebo expects unrotated
      pl_rect2df_rotate(&frame->crop, -frame->rotation);
-@@ -1368,6 +2640,47 @@ static void apply_crop(struct pl_frame *frame, struct mp_rect crop,
+@@ -1368,6 +2662,47 @@ static void apply_crop(struct pl_frame *frame, struct mp_rect crop,
      }
  }
  
@@ -1521,7 +1547,7 @@ index 9915da25ba914893b6e7044a84aa77978be03ad8..1e2943cac93c5351cca340d77072337c
  static bool set_colorspace_hint(struct priv *p, struct pl_color_space *hint)
  {
      struct ra_swapchain *sw = p->ra_ctx->swapchain;
-@@ -1515,6 +2828,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1515,6 +2850,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
              p->last_pts = 0.0;
              p->last_id = 0;
              reset_authored_scene_state(p);
@@ -1529,7 +1555,7 @@ index 9915da25ba914893b6e7044a84aa77978be03ad8..1e2943cac93c5351cca340d77072337c
              p->want_reset = false;
              pl_renderer_flush_cache(p->rr);
          }
-@@ -1809,11 +3123,15 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1809,11 +3145,15 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
      }
  
      struct pl_frame_mix mix = {0};
@@ -1545,7 +1571,7 @@ index 9915da25ba914893b6e7044a84aa77978be03ad8..1e2943cac93c5351cca340d77072337c
              .vsync_duration = can_interpolate ? frame->ideal_frame_vsync_duration : 0,
              .interpolation_threshold = opts->interpolation_threshold,
              .drift_compensation = 0,
-@@ -1848,6 +3166,34 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1848,6 +3188,34 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
              break;
          }
  
@@ -1580,7 +1606,7 @@ index 9915da25ba914893b6e7044a84aa77978be03ad8..1e2943cac93c5351cca340d77072337c
          // Update source crop and overlays on all existing frames. We
          // technically own the `pl_frame` struct so this is kosher. This could
          // be partially avoided by instead flushing the queue on resizes, but
-@@ -1859,7 +3205,16 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1859,7 +3227,16 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
  #if PL_API_VER >= 367
              apply_dovi_enhancement_layer(p, image, fp);
  #endif
@@ -1598,7 +1624,7 @@ index 9915da25ba914893b6e7044a84aa77978be03ad8..1e2943cac93c5351cca340d77072337c
              if (opts->blend_subs) {
                  if (frame->redraw)
                      p->osd_sync++;
-@@ -1902,6 +3257,43 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -1902,6 +3279,43 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
              ((uint64_t *) mix.signatures)[i] ^= fp->osd_sync << 48;
          }
  
@@ -1642,7 +1668,7 @@ index 9915da25ba914893b6e7044a84aa77978be03ad8..1e2943cac93c5351cca340d77072337c
          // Update dynamic hook parameters
          for (int i = 0; i < pars->params.num_hooks; i++)
              update_hook_opts_dynamic(vo, p, p->hooks[i], frame->current);
-@@ -2385,8 +3777,25 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
+@@ -2385,8 +3799,25 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
          target.color.transfer = PL_COLOR_TRC_GAMMA22;
      }
  
@@ -1670,7 +1696,7 @@ index 9915da25ba914893b6e7044a84aa77978be03ad8..1e2943cac93c5351cca340d77072337c
      update_tm_viz(&pars->color_map_params, &target);
  
      struct pl_color_map_params automatic_color_map;
-@@ -2608,6 +4017,46 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -2608,6 +4039,46 @@ static int control(struct vo *vo, uint32_t request, void *data)
          return VO_TRUE;
      }
  
@@ -1717,7 +1743,7 @@ index 9915da25ba914893b6e7044a84aa77978be03ad8..1e2943cac93c5351cca340d77072337c
      case VOCTRL_SCREENSHOT:
          video_screenshot(vo, data);
          return true;
-@@ -2847,11 +4296,22 @@ static void uninit(struct vo *vo)
+@@ -2847,11 +4318,22 @@ static void uninit(struct vo *vo)
  {
      struct priv *p = vo->priv;
  
@@ -1740,7 +1766,7 @@ index 9915da25ba914893b6e7044a84aa77978be03ad8..1e2943cac93c5351cca340d77072337c
      for (int i = 0; i < MP_ARRAY_SIZE(p->osd_state.entries); i++)
          pl_tex_destroy(p->gpu, &p->osd_state.entries[i].tex);
      for (int i = 0; i < p->num_sub_tex; i++)
-@@ -2947,6 +4407,11 @@ static int preinit(struct vo *vo)
+@@ -2947,6 +4429,11 @@ static int preinit(struct vo *vo)
      pl_gpu_set_cache(p->gpu, p->shader_cache.cache);
      p->rr = pl_renderer_create(p->pllog, p->gpu);
      p->queue = pl_queue_create(p->gpu);
@@ -1752,7 +1778,7 @@ index 9915da25ba914893b6e7044a84aa77978be03ad8..1e2943cac93c5351cca340d77072337c
      p->osd_fmt[SUBBITMAP_LIBASS] = pl_find_named_fmt(p->gpu, "r8");
      p->osd_fmt[SUBBITMAP_BGRA] = pl_find_named_fmt(p->gpu, "bgra8");
      p->osd_sync = 1;
-@@ -3301,7 +4766,11 @@ static void update_render_options(struct vo *vo)
+@@ -3301,7 +4788,11 @@ static void update_render_options(struct vo *vo)
      // Request as many frames as required from the decoder, depending on the
      // speed VPS/FPS ratio libplacebo may need more frames. Request frames up to
      // ratio of 1/2, but only if anti aliasing is enabled.
