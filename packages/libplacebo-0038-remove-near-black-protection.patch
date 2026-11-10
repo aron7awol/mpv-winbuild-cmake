@@ -1,0 +1,183 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Tue, 10 Nov 2026 12:00:00 -0500
+Subject: [PATCH] shaders: remove near-black protection from histogram shaping
+
+Remove the protected anchor and shadow taper. Histogram shaping now always
+uses the former protect_shadows=false path, including down to black.
+Retain black/peak endpoints, gain limits and smooth overbrightening bounds.
+
+---
+diff --git a/src/include/libplacebo/shaders/colorspace.h b/src/include/libplacebo/shaders/colorspace.h
+--- a/src/include/libplacebo/shaders/colorspace.h
++++ b/src/include/libplacebo/shaders/colorspace.h
+@@ -357,9 +357,6 @@
+     // Defaults off. At full retention above-source gain is bounded to 2x.
+     float hstm_strength;
+     float hstm_overbrightening;
+-    // Retain the near-black base slope and fade shaping in from 0.1 to 1 nit.
+-    // False allows redistribution down to black; source/peak limits still apply.
+-    bool hstm_near_black_protection;
+ 
+     // --- Tone mapping options
+ 
+@@ -470,7 +467,6 @@
+     .gamut_constants        = { PL_GAMUT_MAP_CONSTANTS },       \
+     .tone_constants         = { PL_TONE_MAP_CONSTANTS },        \
+     .metadata               = PL_HDR_METADATA_ANY,              \
+-    .hstm_near_black_protection = true,                         \
+     .ambient_gamma          = 1.0f,                             \
+     .lut3d_size             = {48, 32, 256},                    \
+     .lut_size               = 256,                              \
+@@ -494,7 +490,7 @@
+ // or from the exact analytic fast path. This is not a final RGB transfer curve.
+ #define PL_TONE_CURVE_SAMPLES 256
+ struct pl_tone_curve {
+-    bool valid, identity, hstm_active, near_black_protection;
++    bool valid, identity, hstm_active;
+     enum pl_tone_map_metric metric;
+     const char *function;
+     float source_peak, target_peak, strength, overbrightening;
+diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
+--- a/src/shaders/colorspace.c
++++ b/src/shaders/colorspace.c
+@@ -2996,7 +2996,6 @@
+     const struct pl_tone_map_params *tone;
+     const float *hist;
+     float strength, brightening;
+-    bool protect_shadows;
+     struct sh_color_map_obj *record;
+ };
+ 
+@@ -3028,7 +3027,7 @@
+         base[i] = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, out[i]);
+     }
+     hstm_shape_curve(ctx->hist, input, base, base, scratch, n,
+-                     ctx->strength, ctx->brightening, ctx->protect_shadows);
++                     ctx->strength, ctx->brightening);
+     for (int i = 0; i < n; i++)
+         out[i] = pl_hdr_rescale(PL_HDR_NITS, PL_HDR_PQ, base[i]);
+     pl_free(tmp);
+@@ -3051,7 +3050,6 @@
+     out->hstm_active = hstm;
+     out->strength = params->hstm_strength;
+     out->overbrightening = params->hstm_overbrightening;
+-    out->near_black_protection = params->hstm_near_black_protection;
+     out->source_peak = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, tone->input_max);
+     out->target_peak = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, tone->output_max);
+     out->display_peak = out->target_peak;
+@@ -3347,7 +3345,6 @@
+             pl_hash_merge(&hstm_signature, pl_var_hash(obj->peak.hstm_hist[i]));
+         pl_hash_merge(&hstm_signature, pl_var_hash(params->hstm_strength));
+         pl_hash_merge(&hstm_signature, pl_var_hash(params->hstm_overbrightening));
+-        pl_hash_merge(&hstm_signature, pl_var_hash(params->hstm_near_black_protection));
+     }
+     bool can_fast = !params->force_tone_mapping_lut && !hstm_active;
+     if (!args->state) {
+@@ -3484,7 +3481,6 @@
+                 .tone = &tone, .hist = hstm_active ? obj->peak.hstm_hist : NULL,
+                 .strength = params->hstm_strength,
+                 .brightening = params->hstm_overbrightening,
+-                .protect_shadows = params->hstm_near_black_protection,
+                 .record = curve ? obj : NULL,
+             };
+             if (hstm_active) sh_describe(sh, "HSTM(P)");
+diff --git a/src/shaders/hstm.h b/src/shaders/hstm.h
+--- a/src/shaders/hstm.h
++++ b/src/shaders/hstm.h
+@@ -67,25 +67,13 @@
+     return (hist[lo] + (p - lo) * (hist[hi] - hist[lo])) * HSTM_BINS;
+ }
+ 
+-/* Bring in slope redistribution over one decade of input brightness. Both
+- * derivatives of the quintic vanish at the ends, avoiding a new corner where
+- * near-black protection starts or ends. This blends positive slopes, not the
+- * completed curves: blending the latter can introduce a negative slope. */
+-static inline float hstm_shadow_weight(float nits)
+-{
+-    if (nits <= 0.1f) return 0;
+-    if (nits >= 1.0f) return 1;
+-    const float t = log10f(nits / 0.1f);
+-    return hstm_clamp(t*t*t * (t * (6*t - 15) + 10), 0, 1);
+-}
+-
+ /* C1 soft minimum in log brightness, with compact support around a crossing.
+  * A hard min makes a corner whenever the shaped curve meets the source-gain
+  * limit. Round below that limit instead; never relax the brightness bound.
+  *
+  * The radius depends symmetrically on the mean, not min(a,b), which would put
+- * another cusp at a == b. Its value AND derivative vanish at the protected
+- * anchor and peak, retaining their values/slopes. With radius = span/2 *
++ * another cusp at a == b. Its value AND derivative vanish at the
++ * black and peak endpoints, retaining their values/slopes. With radius = span/2 *
+  * t^2*(1-t)^2, |dr/dmean| <= 0.097: both partial derivatives of this smooth min
+  * stay nonnegative. Thus two monotonic curves cannot produce a reversal.
+  * Outside this small neighborhood the original minimum is returned exactly. */
+@@ -108,8 +96,7 @@
+ 
+ /* input/base/out contain linear P in nits on the same monotonic input grid.
+  * Redistribute the base curve's log-brightness increments, then normalize its
+- * endpoints. Positive bounded weights preserve order. Near-black retains its
+- * base slope, with a smooth transition to full redistribution from 0.1 to 1 nit.
++ * endpoints. Positive bounded weights preserve order, including down to black.
+  * Above-source retention is a separate final operation. Limits use smooth
+  * shoulders, slightly dimming either side of a crossing without changing
+  * values outside that neighborhood. At 100%, maximum gain is 2x (one stop).
+@@ -117,8 +104,7 @@
+ static inline void hstm_shape_curve(const float hist[HSTM_BINS],
+                                     const float *input, const float *base,
+                                     float *out, float *scratch, int n,
+-                                    float strength, float brightening,
+-                                    bool protect_shadows)
++                                    float strength, float brightening)
+ {
+     if (n < 2) return;
+     strength = hstm_clamp(strength, 0, 1);
+@@ -127,8 +113,7 @@
+         for (int i = 0; i < n; i++) out[i] = base[i];
+         return;
+     }
+-    int anchor = 0;
+-    while (protect_shadows && anchor + 1 < n && input[anchor + 1] <= 0.1f) anchor++;
++    const int anchor = 0;
+     const float lower = hstm_coord(base[anchor]);
+     scratch[anchor] = 0;
+     float previous = lower, shaped_span = 0;
+@@ -139,31 +124,22 @@
+         // Log softens large populations; clamp bounds local slope allocation.
+         const float weight = hstm_clamp(0.5f + log1pf(8.0f*density) / logf(9.0f),
+                                         0.5f, 4.0f);
+-        const float span = (current - previous) *
+-            (protect_shadows ? hstm_shadow_weight(p) : 1);
++        const float span = current - previous;
+         shaped_span += span;
+         scratch[i] = scratch[i - 1] + span * weight;
+         previous = current;
+     }
+-    // Normalize only the redistributed span. Scaling the complete curve would
+-    // change the protected slope at the anchor and recreate the original kink.
++    // Normalize the redistributed span, retaining both endpoint values.
+     const float scale = scratch[n - 1] > 1e-12f
+         ? shaped_span / scratch[n - 1] : 0;
+     const float ceiling = base[n - 1];
+     const float limit_lower = hstm_coord(fminf(base[anchor], input[anchor]));
+     const float limit_upper = hstm_coord(ceiling);
+-    float fixed = lower;
+-    previous = lower;
++
+     for (int i = 0; i < n; i++) {
+         float candidate = base[i];
+         if (i > anchor) {
+-            // Retain previous before writing out[i], since base may alias out.
+-            const float current = fmaxf(previous, hstm_coord(base[i]));
+-            const float p = sqrtf(fmaxf(input[i - 1], 0) * fmaxf(input[i], 0));
+-            if (protect_shadows)
+-                fixed += (current - previous) * (1 - hstm_shadow_weight(p));
+-            const float target = fixed + scratch[i] * scale;
+-            previous = current;
++            const float target = lower + scratch[i] * scale;
+             candidate = hstm_nits(hstm_coord(base[i]) * (1 - strength)
+                                   + strength * target);
+         }
+-- 
+2.51.0

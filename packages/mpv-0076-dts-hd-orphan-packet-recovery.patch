@@ -1,0 +1,111 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Tue, 10 Nov 2026 10:00:00 -0500
+Subject: [PATCH] audio: recover from isolated unpaired DTS-HD packets
+
+An unpaired DTS-HD extension is rejected by the SPDIF muxer before any
+burst is written. Do not fail the entire passthrough decoder for this
+specific INVALIDDATA case; discard the packet and request another.
+Retain the next successful packet's PTS and the existing bitstream format.
+
+Bound consecutive skips at 32. If another unpaired packet follows, log
+an actionable error and send EOF once, allowing video to keep playing
+without silently draining an unsupported extension-only soundtrack.
+Reset the counter and terminal state on seek. Other codec, I/O, allocation
+and partial-output failures keep their existing behavior.
+
+Validated with real DTS-HD/X packet fixtures: startup and midstream
+orphans, the skip boundary, EOF, looping, seek recovery, video after the
+limit, and unchanged passthrough/PCM carrier comparisons.
+---
+diff --git a/audio/decode/ad_spdif.c b/audio/decode/ad_spdif.c
+index 0bce4c603026b0aa9e6dd4e1db13bdcf89757829..1d4476c6dec225bf683bbaa63175e99423bd24fd 100644
+--- a/audio/decode/ad_spdif.c
++++ b/audio/decode/ad_spdif.c
+@@ -39,6 +39,7 @@
+ 
+ #define OUTBUF_SIZE 65536
+ #define TRUEHD_MAJOR_SYNC_WARN_INTERVAL 6000
++#define DTS_HD_MAX_SKIPPED_PACKETS 32
+ 
+ struct spdifContext {
+     struct mp_log   *log;
+@@ -54,6 +55,8 @@ struct spdifContext {
+     int              codec_profile;
+     int              codec_rate;
+     unsigned int     dropped_startup_packets;
++    unsigned int     skipped_dts_hd_packets;
++    bool             dts_hd_recovery_failed;
+     struct mp_aframe *fmt;
+     int              sstride;
+     struct mp_aframe_pool *pool;
+@@ -112,6 +115,8 @@ static void ad_spdif_reset(struct mp_filter *da)
+ 
+     close_lavf_context(spdif_ctx, false);
+     spdif_ctx->dropped_startup_packets = 0;
++    spdif_ctx->skipped_dts_hd_packets = 0;
++    spdif_ctx->dts_hd_recovery_failed = false;
+ }
+ 
+ static bool truehd_has_major_sync(const AVPacket *pkt)
+@@ -354,6 +359,12 @@ static void ad_spdif_process(struct mp_filter *da)
+ {
+     struct spdifContext *spdif_ctx = da->priv;
+ 
++    // A stream which never yields a usable burst must not be drained forever
++    // or leave the player waiting for audio. EOF was already sent on failure;
++    // sending it repeatedly would spin the graph. A reset permits a fresh try.
++    if (spdif_ctx->dts_hd_recovery_failed)
++        return;
++
+     if (!mp_pin_can_transfer_data(da->ppins[1], da->ppins[0]))
+         return;
+ 
+@@ -407,9 +418,36 @@ static void ad_spdif_process(struct mp_filter *da)
+     int ret = av_write_frame(spdif_ctx->lavf_ctx, spdif_ctx->avpkt);
+     avio_flush(spdif_ctx->lavf_ctx->pb);
+     if (ret < 0) {
++        // FFmpeg rejects an unpaired DTS-HD extension before emitting a burst.
++        // Trying the next packet is safe for this specific case. Do not apply
++        // this recovery to other codecs, write failures, or partial output.
++        if (ret == AVERROR_INVALIDDATA && spdif_ctx->codec_id == AV_CODEC_ID_DTS &&
++            spdif_ctx->avpkt->size >= 9 &&
++            AV_RB32(spdif_ctx->avpkt->data) == 0x64582025 &&
++            !spdif_ctx->out_buffer_len && !spdif_ctx->lavf_ctx->pb->error)
++        {
++            if (spdif_ctx->skipped_dts_hd_packets < DTS_HD_MAX_SKIPPED_PACKETS) {
++                if (!spdif_ctx->skipped_dts_hd_packets) {
++                    MP_WARN(da, "Skipping unpaired DTS-HD packet; trying the next packet.\n");
++                }
++                spdif_ctx->skipped_dts_hd_packets++;
++                drop_packet = true;
++            } else {
++                MP_ERR(da, "DTS-HD passthrough could not recover after %u skipped "
++                       "packets; ending audio. Select another audio track or "
++                       "disable bitstreaming.\n", spdif_ctx->skipped_dts_hd_packets);
++                spdif_ctx->dts_hd_recovery_failed = true;
++            }
++            goto done;
++        }
+         MP_ERR(da, "spdif mux error: '%s'\n", mp_strerror(AVUNERROR(ret)));
+         goto done;
+     }
++    if (spdif_ctx->skipped_dts_hd_packets) {
++        MP_VERBOSE(da, "DTS-HD passthrough recovered after skipping %u packet(s).\n",
++                   spdif_ctx->skipped_dts_hd_packets);
++        spdif_ctx->skipped_dts_hd_packets = 0;
++    }
+     if (spdif_ctx->dropped_startup_packets) {
+         MP_VERBOSE(da, "dropped %u TrueHD packet%s before major sync\n",
+                    spdif_ctx->dropped_startup_packets,
+@@ -437,6 +475,8 @@ done:
+     talloc_free(mpkt);
+     if (out) {
+         mp_pin_in_write(da->ppins[1], MAKE_FRAME(MP_FRAME_AUDIO, out));
++    } else if (spdif_ctx->dts_hd_recovery_failed) {
++        mp_pin_in_write(da->ppins[1], MP_EOF_FRAME);
+     } else if (drop_packet) {
+         mp_filter_internal_mark_progress(da);
+     } else {
+-- 
+2.51.0

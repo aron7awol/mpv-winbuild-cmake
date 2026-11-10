@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Tue, 10 Nov 2026 12:00:00 -0500
+Subject: [PATCH] video: retire near-black protection
+
+Remove the control and tone-curve flag. Accept the old command-line/config
+key only as a deprecated ignored input, without a mutable runtime property.
+This keeps old configurations loadable while the renderer always follows
+the previous protection-Off behavior.
+
+---
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -7839,12 +7839,6 @@
+     processing can still change brightness. Has no effect at zero HSTM
+     strength. (``--vo=gpu-next`` only)
+ 
+-``--tone-mapping-hstm-near-black-protection=<yes|no>``
+-    Preserve the base curve below 0.1 input nits and smoothly introduce
+-    histogram slope redistribution through 1 nit (default: ``yes``).
+-    ``no`` allows Contrast Shaping down to black. Both choices preserve zero
+-    and retain the normal source-gain and peak limits. Has no effect when
+-    Contrast Shaping is inactive. (``--vo=gpu-next`` only)
+ 
+ ``--tone-mapping-ambient-gamma=<0.5..1.5>``
+     Applies an exponent to the mapped target-PQ brightness coordinate after
+diff --git a/player/command.c b/player/command.c
+--- a/player/command.c
++++ b/player/command.c
+@@ -2849,7 +2849,6 @@
+         {"input-peak", SUB_PROP_DOUBLE(v.source_peak)}, {"target-peak", SUB_PROP_DOUBLE(v.target_peak)},
+         {"display-peak", SUB_PROP_DOUBLE(v.display_peak)},
+         {"strength", SUB_PROP_DOUBLE(v.strength)}, {"overbrightening", SUB_PROP_DOUBLE(v.overbrightening)},
+-        {"near-black-protection", SUB_PROP_BOOL(v.near_black_protection)},
+         {"input", SUB_PROP_STR(input)}, {"base", SUB_PROP_STR(base)}, {"output", SUB_PROP_STR(output)},
+         {0}
+     };
+diff --git a/video/out/gpu/video.c b/video/out/gpu/video.c
+--- a/video/out/gpu/video.c
++++ b/video/out/gpu/video.c
+@@ -399,7 +399,6 @@
+     .gamma = 1.0f,
+     .tone_map = {
+         .curve = TONE_MAPPING_AUTO,
+-        .hstm_near_black_protection = true,
+         .ambient_gamma = 1.0,
+         .curve_param = NAN,
+         .max_boost = 1.0,
+@@ -481,7 +480,10 @@
+             {"maxrgb-adaptive", TONE_MAPPING_METRIC_MAXRGB_RGB})},
+         {"tone-mapping-hstm-strength", OPT_FLOAT(tone_map.hstm_strength), M_RANGE(0, 100)},
+         {"tone-mapping-hstm-overbrightening", OPT_FLOAT(tone_map.hstm_overbrightening), M_RANGE(0, 100)},
+-        {"tone-mapping-hstm-near-black-protection", OPT_BOOL(tone_map.hstm_near_black_protection)},
++        {"tone-mapping-hstm-near-black-protection",
++            OPT_BOOL(tone_map.removed_hstm_near_black_protection),
++            .flags = M_OPT_NOPROP,
++            .deprecation_message = "Ignored; near-black protection has been removed"},
+         {"tone-mapping-auto-pq-second-pass", OPT_BOOL(tone_map.auto_pq_second_pass)},
+         {"tone-mapping-p-constrained-curve", OPT_BOOL(tone_map.p_constrained_curve)},
+         {"tone-mapping-highlight-overshoot", OPT_FLOAT(tone_map.highlight_overshoot), M_RANGE(0, 100)},
+diff --git a/video/out/gpu/video.h b/video/out/gpu/video.h
+--- a/video/out/gpu/video.h
++++ b/video/out/gpu/video.h
+@@ -126,7 +126,7 @@
+     int curve;
+     int metric;
+     float hstm_strength, hstm_overbrightening;
+-    bool hstm_near_black_protection;
++    bool removed_hstm_near_black_protection; // Legacy config input; never used.
+     bool auto_pq_second_pass;
+     bool p_constrained_curve;
+     float highlight_overshoot;
+diff --git a/video/out/vo.h b/video/out/vo.h
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -538,7 +538,7 @@
+ // async_probe_mutex guards this small independent snapshot as well.
+ #define MP_TONE_CURVE_SAMPLES 256
+ struct vo_tone_curve {
+-    bool enabled, valid, identity, shaped, near_black_protection;
++    bool enabled, valid, identity, shaped;
+     int metric;
+     int64_t sequence;
+     double pts;
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -3428,7 +3428,6 @@
+         curve.display_peak = native_curve.display_peak;
+         curve.strength = native_curve.strength;
+         curve.overbrightening = native_curve.overbrightening;
+-        curve.near_black_protection = native_curve.near_black_protection;
+         memcpy(curve.input, native_curve.input, sizeof(curve.input));
+         memcpy(curve.base, native_curve.base, sizeof(curve.base));
+         memcpy(curve.output, native_curve.output, sizeof(curve.output));
+@@ -5035,7 +5034,6 @@
+     }
+     pars->color_map_params.hstm_strength = opts->tone_map.hstm_strength / 100.0f;
+     pars->color_map_params.hstm_overbrightening = opts->tone_map.hstm_overbrightening / 100.0f;
+-    pars->color_map_params.hstm_near_black_protection = opts->tone_map.hstm_near_black_protection;
+     pars->color_map_params.ambient_gamma = opts->tone_map.ambient_gamma;
+     pars->color_map_params.hlg_reference_peak = opts->tone_map.hlg_reference_peak;
+     pars->color_map_params.hard_clip_hdr_target = opts->target_peak > 0;
+-- 
+2.51.0
