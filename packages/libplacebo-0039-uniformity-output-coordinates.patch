@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000039 Mon Sep 17 00:00:00 2001
+From: mpv-ht <mpv-ht@local>
+Date: Wed, 11 Nov 2026 00:00:00 -0500
+Subject: [PATCH] custom shaders: expose output canvas geometry for panel correction
+
+Keep spatial panel correction anchored to the physical output rectangle after
+automatic aspect changes. Expose canvas dimensions, destination and hook
+rectangles. Guard the v1 PQ BT.2020 correction against incompatible signals.
+
+---
+diff --git a/src/include/libplacebo/shaders/custom.h b/src/include/libplacebo/shaders/custom.h
+--- a/src/include/libplacebo/shaders/custom.h
++++ b/src/include/libplacebo/shaders/custom.h
+@@ -231,6 +231,11 @@
+     // May be NULL when persistent textures are unsupported.
+     bool (*recreate_persistent_tex)(void *priv, pl_tex *tex,
+                                     int width, int height);
++
++    // Full output canvas, including letterbox/pillarbox borders. These are
++    // physical output coordinates, unlike target_size (the image rectangle).
++    int output_width, output_height;
++    int output_rotation; // clockwise quarter turns
+ };
+ 
+ struct pl_hook_res {
+diff --git a/src/renderer.c b/src/renderer.c
+--- a/src/renderer.c
++++ b/src/renderer.c
+@@ -1186,6 +1186,9 @@
+             .components = img->comps,
+             .src_rect = pass->ref_rect,
+             .dst_rect = pass->dst_rect,
++            .output_width = pass->target.planes[pass->dst_ref].texture->params.w,
++            .output_height = pass->target.planes[pass->dst_ref].texture->params.h,
++            .output_rotation = pass->rotation,
+         };
+ 
+         // TODO: Add some sort of `test` API function to the hooks that allows
+diff --git a/src/shaders/custom_mpv.c b/src/shaders/custom_mpv.c
+--- a/src/shaders/custom_mpv.c
++++ b/src/shaders/custom_mpv.c
+@@ -1430,6 +1430,33 @@
+         }));
+ 
+         float tex_off[2] = { params->src_rect.x0, params->src_rect.y0 };
++        // Display-fixed corrections must not follow the cropped video image.
++        // Expose the actual renderer geometry for this frame, including auto
++        // aspect changes which are not represented in mpv's OSD dimensions.
++        float output_size[2] = { params->output_width, params->output_height };
++        float output_rect[4] = { params->dst_rect.x0, params->dst_rect.y0,
++                                params->dst_rect.x1, params->dst_rect.y1 };
++        float hook_rect[4] = { ctx.hooked.rect.x0, ctx.hooked.rect.y0,
++                              ctx.hooked.rect.x1, ctx.hooked.rect.y1 };
++        GLSLH("#define MPV_HT_OUTPUT_COORDS 1 \n");
++        GLSLH("#define output_size "$" \n", sh_var(sh, (struct pl_shader_var) {
++            .var = pl_var_vec2("output_size"), .data = output_size, .dynamic = true,
++        }));
++        GLSLH("#define output_rect "$" \n", sh_var(sh, (struct pl_shader_var) {
++            .var = pl_var_vec4("output_rect"), .data = output_rect, .dynamic = true,
++        }));
++        GLSLH("#define hook_rect "$" \n", sh_var(sh, (struct pl_shader_var) {
++            .var = pl_var_vec4("hook_rect"), .data = hook_rect, .dynamic = true,
++        }));
++        // v1 correction files describe full-range BT.2020 PQ RGB only. Guard
++        // in the renderer as well as Lua to cover file/VO transition frames.
++        bool mura_compatible = params->stage == PL_HOOK_OUTPUT &&
++            params->output_rotation == 0 &&
++            params->color.transfer == PL_COLOR_TRC_PQ &&
++            params->color.primaries == PL_COLOR_PRIM_BT_2020 &&
++            params->repr.sys == PL_COLOR_SYSTEM_RGB &&
++            params->repr.levels == PL_COLOR_LEVELS_FULL;
++        GLSLH("#define MPV_HT_MURA_COMPATIBLE %d \n", mura_compatible);
+         GLSLH("#define tex_offset "$" \n", sh_var(sh, (struct pl_shader_var) {
+             .var = pl_var_vec2("tex_offset"),
+             .data = tex_off,
