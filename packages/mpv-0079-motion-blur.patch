@@ -1,0 +1,303 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mpv-ht <mpv-ht@localhost>
+Date: Fri, 13 Nov 2026 12:00:00 -0500
+Subject: [PATCH] gpu-next: add cadence-preserving Motion blur
+
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -204,6 +204,9 @@
+     struct osd_state osd_state;
+ 
+     uint64_t last_id;
++    uint64_t motion_blur_frame_id;
++    double motion_blur_first_vsync;
++    struct voctrl_motion_blur motion_blur_status;
+     uint64_t osd_sync;
+     double last_pts;
+     bool is_interpolated;
+@@ -292,6 +295,9 @@
+     float background_blur_radius;
+     float corner_rounding;
+     bool inter_preserve;
++    int motion_blur_strength;
++    int motion_blur_settle_ms;
++    int motion_blur_curve;
+     struct user_lut lut;
+     struct user_lut image_lut;
+     struct user_lut target_lut;
+@@ -367,6 +373,10 @@
+         {"background-blur-radius", OPT_FLOAT(background_blur_radius)},
+         {"corner-rounding", OPT_FLOAT(corner_rounding), M_RANGE(0, 1)},
+         {"interpolation-preserve", OPT_BOOL(inter_preserve)},
++        {"motion-blur", OPT_INT(motion_blur_strength), M_RANGE(0, 100)},
++        {"motion-blur-settle-ms", OPT_INT(motion_blur_settle_ms), M_RANGE(0, 32)},
++        {"motion-blur-curve", OPT_CHOICE(motion_blur_curve,
++            {"exponential", 0}, {"smooth", 1})},
+         {"lut", OPT_STRING(lut.opt), .flags = M_OPT_FILE},
+         {"lut-type", OPT_CHOICE_C(lut.type, lut_types)},
+         {"image-lut", OPT_STRING(image_lut.opt), .flags = M_OPT_FILE},
+@@ -402,6 +412,7 @@
+         .border_background = BACKGROUND_COLOR,
+         .background_blur_radius = 16.0f,
+         .inter_preserve = true,
++        .motion_blur_settle_ms = 20,
+         .image_subs_hdr_peak = 1000,
+         .target_hint = -1,
+         .target_hint_strict = true,
+@@ -415,6 +426,7 @@
+ };
+ 
+ #include "analyzer_async_bridge.h"
++#include "motion_blur_response.h"
+ 
+ static pl_buf get_dr_buf(struct priv *p, const uint8_t *ptr)
+ {
+@@ -2869,15 +2881,29 @@
+     const struct gl_video_opts *opts = p->opts_cache->opts;
+     bool will_redraw = frame->display_synced && frame->num_vsyncs > 1;
+     bool cache_frame = will_redraw || frame->still || p->paused;
+-    bool can_interpolate = opts->interpolation && frame->display_synced &&
++    double motion_blur_hz = frame->vsync_interval > 0 ? 1 / frame->vsync_interval : 0;
++    double motion_blur_fps = frame->approx_duration > 0 ? 1 / frame->approx_duration : 0;
++    bool motion_blur = p->next_opts->motion_blur_strength > 0 &&
++               p->next_opts->motion_blur_settle_ms > 0 && frame->display_synced &&
++               !frame->still && !p->paused && motion_blur_hz > 118 && motion_blur_hz < 122 &&
++               motion_blur_fps > 23.5 && motion_blur_fps < 24.5;
++    if (!motion_blur) p->motion_blur_frame_id = 0;
++    if (motion_blur && p->motion_blur_frame_id != frame->frame_id) {
++        p->motion_blur_frame_id = frame->frame_id;
++        p->motion_blur_first_vsync = frame->ideal_frame_vsync;
++    }
++    bool can_interpolate = (opts->interpolation || motion_blur) && frame->display_synced &&
+                            !frame->still && frame->num_frames > 1 && !p->paused;
+-    double pts_offset = can_interpolate ? frame->ideal_frame_vsync : 0;
++    // Keep the original presentation cadence. Motion blur only fades
++    // the previous image after the scheduled current frame has arrived.
++    double pts_offset = can_interpolate && !motion_blur ? frame->ideal_frame_vsync : 0;
+     params.info_callback = info_callback;
+     params.info_priv = vo;
+     params.skip_caching_single_frame = !cache_frame;
+     params.preserve_mixing_cache = p->next_opts->inter_preserve && !frame->still;
+-    if (frame->still || p->paused)
++    if (frame->still || p->paused || motion_blur)
+         params.frame_mixer = NULL;
++    if (motion_blur) params.preserve_mixing_cache = false;
+ 
+     if (frame->current && frame->current->params.vflip) {
+         pl_matrix2x2 m = { .m = {{1, 0}, {0, -1}}, };
+@@ -3206,7 +3232,7 @@
+     }
+     stats_time_start(p->stats, "osd-update");
+     update_overlays(vo, p->osd_res,
+-                    (frame->current && opts->blend_subs) ? OSD_DRAW_OSD_ONLY : 0,
++                    (frame->current && opts->blend_subs && !motion_blur) ? OSD_DRAW_OSD_ONLY : 0,
+                     PL_OVERLAY_COORDS_DST_FRAME, &p->osd_state, &target, frame->current,
+                     frame->current ? frame->current->params.stereo3d : 0, get_ref_luma(p));
+     stats_time_end(p->stats, "osd-update");
+@@ -3231,10 +3257,12 @@
+         // Update queue state
+         struct pl_queue_params qparams = *pl_queue_params(
+             .pts = frame->current->pts + pts_offset,
+-            .radius = pl_frame_mix_radius(&params),
++            .radius = motion_blur ? 1.1f : pl_frame_mix_radius(&params),
+             .prefetch_frames = p->next_opts->active_image_detection ? 4 : 0,
+             .vsync_duration = can_interpolate ? frame->ideal_frame_vsync_duration : 0,
+-            .interpolation_threshold = opts->interpolation_threshold,
++            // Held source PTS is intentional for Motion blur; retain the
++            // past frame even when the queue estimates a 1:1 update ratio.
++            .interpolation_threshold = motion_blur ? -1 : opts->interpolation_threshold,
+             .drift_compensation = 0,
+         );
+ 
+@@ -3316,7 +3344,7 @@
+             } else {
+                 apply_crop(image, src, vo->params->w, vo->params->h);
+             }
+-            if (opts->blend_subs) {
++            if (opts->blend_subs && !motion_blur) {
+                 if (frame->redraw)
+                     p->osd_sync++;
+                 if (fp->osd_sync < p->osd_sync) {
+@@ -3406,10 +3434,60 @@
+     analyzer_xy_prepare(p,&target,
+         libass_overlay_color(p,&(struct sub_bitmaps){0},frame->current,get_ref_luma(p)));
+ 
++    // Restrict the mix to the scheduled current frame and its immediate
++    // predecessor. Never introduce a future motion position or blend a drop,
++    // authored scene boundary, seek, pause, or changed aperture.
++    const struct pl_frame *motion_blur_images[2];
++    uint64_t motion_blur_signatures[2];
++    float motion_blur_timestamps[2];
++    float motion_blur_weight = -1.0f;
++    if (motion_blur && mix.num_frames) {
++        int cur = -1, prev = -1;
++        for (int i = 0; i < mix.num_frames; i++) {
++            const struct mp_image *mpi = mix.frames[i]->user_data;
++            const struct frame_priv *fp = mpi->priv;
++            if (fp->causal_scene_tag == frame->frame_id + 1) cur = i;
++            if (fp->causal_scene_tag == frame->frame_id) prev = i;
++        }
++        double dt = frame->ideal_frame_vsync_duration;
++        int slot = dt > 0 ? (int) llround((frame->ideal_frame_vsync - p->motion_blur_first_vsync) / dt) : -1;
++        // Model the light emitted throughout each physical refresh interval.
++        // The source clock identifies the slot; wall time sets pixel settling.
++        double interval_ms = frame->vsync_interval * 1000.0;
++        float weight = motion_blur_response_weight(p->next_opts->motion_blur_strength,
++            p->next_opts->motion_blur_settle_ms, p->next_opts->motion_blur_curve,
++            slot * interval_ms, interval_ms);
++        bool pair = cur >= 0 && prev >= 0 && weight > 0 &&
++                    !((struct frame_priv *) ((struct mp_image *) mix.frames[cur]->user_data)->priv)->authored_scene_cut;
++        if (cur >= 0) {
++            int indices[2] = {pair ? prev : cur, cur};
++            int count = pair ? 2 : 1;
++            for (int i = 0; i < count; i++) {
++                int n = indices[i];
++                motion_blur_images[i] = mix.frames[n];
++                motion_blur_signatures[i] = mix.signatures[n];
++                motion_blur_timestamps[i] = mix.timestamps[n];
++            }
++            mix.num_frames = count;
++            mix.frames = motion_blur_images;
++            mix.signatures = motion_blur_signatures;
++            mix.timestamps = motion_blur_timestamps;
++            if (pair) motion_blur_weight = weight;
++        }
++        MP_DBG(vo, "Motion blur frame=%"PRIu64" slot=%d previous=%.6f hz=%.3f fps=%.5f\n",
++               frame->frame_id, slot, motion_blur_weight >= 0 ? motion_blur_weight : 0.0f, motion_blur_hz, motion_blur_fps);
++    }
++
+     // Render frame
+     analyzer_output_prepare(p, &target);
+     stats_time_start(p->stats, "render");
+-    bool render_ok = pl_render_image_mix(p->rr, &mix, &target, &params);
++    bool render_ok = motion_blur_weight >= 0
++        ? pl_render_image_mix_response(p->rr, &mix, &target, &params, motion_blur_weight)
++        : pl_render_image_mix(p->rr, &mix, &target, &params);
++    p->motion_blur_status = (struct voctrl_motion_blur) {
++        .active = motion_blur && render_ok, .hz = motion_blur_hz, .fps = motion_blur_fps,
++        .previous_weight = motion_blur_weight >= 0 ? motion_blur_weight : 0,
++    };
+     stats_time_end(p->stats, "render");
+     struct vo_tone_curve curve = {
+         .enabled = p->next_opts->analyzer_tone_curve,
+@@ -4137,6 +4215,10 @@
+         return true;
+     }
+ 
++    case VOCTRL_GET_MOTION_BLUR:
++        *(struct voctrl_motion_blur *) data = p->motion_blur_status;
++        return VO_TRUE;
++
+     case VOCTRL_GET_RENDER_FORMATS: {
+         struct voctrl_render_formats *out = data;
+         pl_fmt formats[4] = {0};
+@@ -4956,7 +5038,8 @@
+     // asynchronous frame analysis. With detection disabled, preserve mpv's
+     // original current-plus-one-future-frame baseline. Temporal interpolation
+     // may already require a wider decoder queue in either mode.
+-    int req_frames = p->next_opts->active_image_detection ? 3 : 2;
++    int req_frames = (p->next_opts->active_image_detection ||
++                      p->next_opts->motion_blur_strength > 0) ? 3 : 2;
+     if (pars->params.frame_mixer) {
+         req_frames += ceilf(pars->params.frame_mixer->kernel->radius) *
+                       (pars->params.skip_anti_aliasing ? 1 : 2);
+diff --git a/video/out/vo.h b/video/out/vo.h
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -87,6 +87,7 @@
+ 
+     // Effective gpu-next intermediate and output texture formats.
+     VOCTRL_GET_RENDER_FORMATS,          // struct voctrl_render_formats*
++    VOCTRL_GET_MOTION_BLUR,             // struct voctrl_motion_blur*
+ 
+     // Active image bounds measured inside an encoded video frame.
+     VOCTRL_GET_ACTIVE_IMAGE,            // struct voctrl_active_image*
+@@ -146,6 +147,11 @@
+ 
+ #define VO_RENDER_FORMAT_NAME_MAX 32
+ #define VO_RENDER_FORMAT_CHAIN_MAX 80
++struct voctrl_motion_blur {
++    bool active;
++    double hz, fps, previous_weight;
++};
++
+ struct voctrl_render_formats {
+     char precision[VO_RENDER_FORMAT_NAME_MAX];
+     char internal[VO_RENDER_FORMAT_CHAIN_MAX];
+diff --git a/player/command.c b/player/command.c
+--- a/player/command.c
++++ b/player/command.c
+@@ -2778,6 +2778,24 @@
+     return property_imgparams(&p, action, arg);
+ }
+ 
++static int mp_property_motion_blur(void *ctx, struct m_property *prop,
++                                   int action, void *arg)
++{
++    MPContext *mpctx = ctx;
++    struct voctrl_motion_blur v = {0};
++    if (!mpctx->video_out || vo_control(mpctx->video_out,
++            VOCTRL_GET_MOTION_BLUR, &v) != VO_TRUE)
++        return M_PROPERTY_UNAVAILABLE;
++    struct m_sub_property props[] = {
++        {"active", SUB_PROP_BOOL(v.active)},
++        {"display-hz", SUB_PROP_DOUBLE(v.hz)},
++        {"source-fps", SUB_PROP_DOUBLE(v.fps)},
++        {"previous-weight", SUB_PROP_DOUBLE(v.previous_weight)},
++        {0}
++    };
++    return m_property_read_sub(props, action, arg);
++}
++
+ static int mp_property_gpu_render_formats(void *ctx, struct m_property *prop,
+                                           int action, void *arg)
+ {
+@@ -5111,6 +5129,7 @@
+     {"video-target-params", mp_property_tgt_imgparams},
+     {"video-out-params", mp_property_vo_imgparams},
+     {"gpu-render-formats", mp_property_gpu_render_formats},
++    {"motion-blur-status", mp_property_motion_blur},
+     {"video-active-image", mp_property_video_active_image},
+     {"output-capture", mp_property_output_capture},
+     {"analyzer-async-result", mp_property_async_probe},
+diff --git a/video/out/motion_blur_response.h b/video/out/motion_blur_response.h
+new file mode 100644
+--- /dev/null
++++ b/video/out/motion_blur_response.h
+@@ -0,0 +1,35 @@
++// Local Motion blur prototype. Generic curves, not a measured panel model.
++#ifndef MPV_HT_MOTION_BLUR_RESPONSE_H
++#define MPV_HT_MOTION_BLUR_RESPONSE_H
++#include <math.h>
++
++// Integral of the previous-pixel fraction from 0 to x, for 0 <= x <= 1.
++// Smooth is the complement of cubic smoothstep. Exponential is a first-order
++// decay normalized from 100% to 0% over its nominal 99%-settled interval.
++static inline double motion_blur_response_integral(double x, int curve)
++{
++    if (curve == 1)
++        return x - x*x*x + 0.5*x*x*x*x;
++    const double a = 4.605170185988091368; // ln(100)
++    return (-expm1(-a*x) / a - 0.01*x) / 0.99;
++}
++
++// Average light over the output refresh, not a point sample at refresh start.
++// All times are wall-clock milliseconds. T is full settling time, NOT GtG
++// 10-90%. Limiting T to 32 ms settles before the next supported 24p frame,
++// so two source frames suffice without accumulated multi-frame trails.
++static inline double motion_blur_response_weight(double strength, double settle_ms,
++                                         int curve, double elapsed_ms,
++                                         double interval_ms)
++{
++    if (!isfinite(strength) || !isfinite(settle_ms) || !isfinite(elapsed_ms) ||
++        !isfinite(interval_ms) || strength <= 0 || settle_ms <= 0 ||
++        elapsed_ms < 0 || interval_ms <= 0 || elapsed_ms >= settle_ms)
++        return 0;
++    double a = elapsed_ms / settle_ms;
++    double b = fmin((elapsed_ms + interval_ms) / settle_ms, 1.0);
++    double average = settle_ms / interval_ms *
++        (motion_blur_response_integral(b, curve) - motion_blur_response_integral(a, curve));
++    return fmin(strength / 100.0, 1.0) * fmin(fmax(average, 0.0), 1.0);
++}
++#endif

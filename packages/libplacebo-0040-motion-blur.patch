@@ -1,0 +1,192 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mpv-ht <mpv-ht@localhost>
+Date: Fri, 13 Nov 2026 12:00:00 -0500
+Subject: [PATCH] renderer: add current/previous display-linear response mixing
+
+diff --git a/src/renderer.c b/src/renderer.c
+--- a/src/renderer.c
++++ b/src/renderer.c
+@@ -98,6 +98,7 @@
+     // Frame cache (for frame mixing / interpolation)
+     PL_ARRAY(struct cached_frame) frames;
+     PL_ARRAY(pl_tex) frame_fbos;
++    pl_tex motion_blur_cut_tex;
+     // Causal diagnostics own all GPU/readback state. They must never share
+     // the live tone-map state, even when peak detection is enabled.
+     pl_shader_obj causal_state;
+@@ -181,6 +182,7 @@
+     pl_tex_destroy(rr->gpu, &rr->causal_linear_tex);
+     pl_tex_destroy(rr->gpu, &rr->causal_proxy_tex);
+     pl_tex_destroy(rr->gpu, &rr->hlg_measure_tex);
++    pl_tex_destroy(rr->gpu, &rr->motion_blur_cut_tex);
+     pcurve_destroy(rr->gpu, &rr->p_curve_state);
+ 
+     // Free all shader resource objects
+@@ -4677,9 +4679,10 @@
+ 
+ #define MAX_MIX_FRAMES 16
+ 
+-bool pl_render_image_mix(pl_renderer rr, const struct pl_frame_mix *images,
+-                         const struct pl_frame *ptarget,
+-                         const struct pl_render_params *params)
++static bool render_image_mix(pl_renderer rr, const struct pl_frame_mix *images,
++                             const struct pl_frame *ptarget,
++                             const struct pl_render_params *params,
++                             float motion_blur_previous_weight)
+ {
+     if (!images->num_frames)
+         return pl_render_image(rr, NULL, ptarget, params);
+@@ -4693,7 +4696,13 @@
+     for (int i = 0; i < images->num_frames - 1; i++)
+         require(images->timestamps[i] <= images->timestamps[i+1]);
+ 
+-    const struct pl_frame *refimg = pl_frame_mix_nearest(images);
++    bool motion_blur = motion_blur_previous_weight >= 0.0f;
++    if (motion_blur) {
++        require(images->num_frames == 2);
++        require(isfinite(motion_blur_previous_weight) && motion_blur_previous_weight <= 1.0f);
++    }
++    const struct pl_frame *refimg = motion_blur ? images->frames[1]
++                                      : pl_frame_mix_nearest(images);
+     struct pass_state pass = {
+         .rr = rr,
+         .params = params,
+@@ -4742,7 +4751,7 @@
+     }
+ 
+     // Traverse the input frames and determine/prepare the ones we need
+-    bool single_frame = !params->frame_mixer || images->num_frames == 1;
++    bool single_frame = !motion_blur && (!params->frame_mixer || images->num_frames == 1);
+ retry:
+     for (int i = 0; i < images->num_frames; i++) {
+         uint64_t sig = images->signatures[i];
+@@ -4758,7 +4767,9 @@
+         }
+ 
+         float weight;
+-        if (single_frame) {
++        if (motion_blur) {
++            weight = i == 0 ? motion_blur_previous_weight : 1.0f - motion_blur_previous_weight;
++        } else if (single_frame) {
+ 
+             // Only render the refimg, ignore others
+             if (img == refimg) {
+@@ -4820,7 +4831,7 @@
+         // also exclude the reference image from this optimization to ensure
+         // that we always have at least one frame.
+         const float cutoff = 1e-3;
+-        if (fabsf(weight) <= cutoff && img != refimg) {
++        if (!motion_blur && fabsf(weight) <= cutoff && img != refimg) {
+             PL_TRACE(rr, "   -> Skipping: weight (%f) below threshold (%f)",
+                      weight, cutoff);
+             continue;
+@@ -4987,6 +4998,41 @@
+         goto retry;
+     }
+ 
++    // Detect large image changes entirely on the GPU. One 16x9 comparison
++    // produces a 1x1 mask; there is no CPU readback or per-output-pixel grid.
++    // This is a heuristic for untagged cuts, not a semantic scene detector.
++    bool motion_blur_guard = motion_blur && fidx == 2;
++    if (motion_blur_guard) {
++        if (!pl_tex_recreate(rr->gpu, &rr->motion_blur_cut_tex, pl_tex_params(
++                .w = 1, .h = 1, .format = pass.fbofmt[4],
++                .sampleable = true, .renderable = true)))
++            goto fallback;
++        pl_shader sh = pl_dispatch_begin(rr->dp);
++        sh_describe(sh, "Motion blur scene guard");
++        sh->output = PL_SHADER_SIG_COLOR;
++        sh->output_w = sh->output_h = 1;
++        ident_t prev = sh_bind(sh, frames[0].tex, PL_TEX_ADDRESS_CLAMP,
++                              PL_TEX_SAMPLE_NEAREST, "motion_blur_prev", NULL, NULL, NULL);
++        ident_t next = sh_bind(sh, frames[1].tex, PL_TEX_ADDRESS_CLAMP,
++                              PL_TEX_SAMPLE_NEAREST, "motion_blur_next", NULL, NULL, NULL);
++        GLSL("vec4 color; { float total = 0.0; float changed = 0.0;\n"
++             "for (int y = 0; y < 9; ++y) { for (int x = 0; x < 16; ++x) {\n"
++             "vec2 uv = (vec2(x, y) + 0.5) / vec2(16.0, 9.0);\n"
++             "vec3 a = textureLod("$", uv, 0.0).rgb;\n"
++             "vec3 b = textureLod("$", uv, 0.0).rgb;\n", prev, next);
++        if (frames[0].color.transfer == PL_COLOR_TRC_LINEAR) {
++            GLSL("a = pow(max(a, vec3(0.0)) / (1.0 + abs(a)), vec3(0.333333));\n"
++                 "b = pow(max(b, vec3(0.0)) / (1.0 + abs(b)), vec3(0.333333));\n");
++        }
++        GLSL("vec3 d = abs(a - b); float delta = max(d.r, max(d.g, d.b));\n"
++             "total += delta; changed += step(0.10, delta); } }\n"
++             "float cut = float(total / 144.0 > 0.18 || changed / 144.0 > 0.70);\n"
++             "color = vec4(cut); }\n");
++        if (!pl_dispatch_finish(rr->dp, pl_dispatch_params(
++                .shader = &sh, .target = rr->motion_blur_cut_tex)))
++            goto fallback;
++    }
++
+     // Sample and mix the output color
+     pass_begin_frame(&pass);
+     pass.info.count = fidx;
+@@ -5012,6 +5058,12 @@
+     if (mixing) {
+         mix_csp.transfer = PL_COLOR_TRC_LINEAR;
+         GLSL("vec4 mix_color = vec4(0.0); \n");
++    }
++
++    if (motion_blur_guard) {
++        ident_t mask = sh_bind(sh, rr->motion_blur_cut_tex, PL_TEX_ADDRESS_CLAMP,
++                              PL_TEX_SAMPLE_NEAREST, "motion_blur_cut", NULL, NULL, NULL);
++        GLSL("float motion_blur_cut = textureLod("$", vec2(0.5), 0.0).r;\n", mask);
+     }
+ 
+     int comps = 0;
+@@ -5047,7 +5099,12 @@
+ 
+         if (mixing) {
+             float weight = weights[i] / wsum;
+-            GLSL("mix_color += vec4("$") * color; \n", SH_FLOAT_DYN(weight));
++            if (motion_blur_guard) {
++                GLSL("mix_color += mix("$", "$", motion_blur_cut) * color; \n",
++                     SH_FLOAT_DYN(weight), SH_FLOAT(i == 1 ? 1.0f : 0.0f));
++            } else {
++                GLSL("mix_color += vec4("$") * color; \n", SH_FLOAT_DYN(weight));
++            }
+         }
+         comps = PL_MAX(comps, frames[i].comps);
+     }
+@@ -5096,6 +5153,21 @@
+     return false;
+ }
+ 
++bool pl_render_image_mix(pl_renderer rr, const struct pl_frame_mix *images,
++                         const struct pl_frame *target,
++                         const struct pl_render_params *params)
++{
++    return render_image_mix(rr, images, target, params, -1.0f);
++}
++
++bool pl_render_image_mix_response(pl_renderer rr, const struct pl_frame_mix *images,
++                             const struct pl_frame *target,
++                             const struct pl_render_params *params,
++                             float previous_weight)
++{
++    return render_image_mix(rr, images, target, params, previous_weight);
++}
++
+ void pl_frames_infer_mix(pl_renderer rr, const struct pl_frame_mix *mix,
+                          struct pl_frame *target, struct pl_frame *out_ref)
+ {
+diff --git a/src/include/libplacebo/renderer.h b/src/include/libplacebo/renderer.h
+--- a/src/include/libplacebo/renderer.h
++++ b/src/include/libplacebo/renderer.h
+@@ -913,6 +913,15 @@
+                                 const struct pl_frame *target,
+                                 const struct pl_render_params *params);
+ 
++// mpv-ht display response mixing. Exactly two images, previous then current; the
++// current image is the reference and fallback. Mix in display-linear light,
++// with a conservative GPU scene-change guard. No existing struct ABI changes.
++PL_API bool pl_render_image_mix_response(pl_renderer rr,
++                                    const struct pl_frame_mix *images,
++                                    const struct pl_frame *target,
++                                    const struct pl_render_params *params,
++                                    float previous_weight);
++
+ // Analog of `pl_frame_infer` corresponding to `pl_render_image_mix`. This
+ // function will *not* mutate the frames contained in `mix`, and instead
+ // return an adjusted copy of the "reference" frame for that image mix in
