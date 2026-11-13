@@ -1,0 +1,31 @@
+From 95bacd154216a439d94fe4a89a75e6a189a97251 Mon Sep 17 00:00:00 2001
+From: mpv-ht development <mpv-ht@localhost>
+Date: Thu, 12 Nov 2026 21:27:29 -0500
+Subject: [PATCH] gpu-next: keep SDR reference white in rendered screenshots
+
+Scaled and window screenshots must keep the source reference white used by live playback. Clearing it reverts SDR carried in PQ to the 203-nit libplacebo fallback even when playback explicitly uses 100 nits. Source-resolution screenshots remain display-independent.
+---
+ video/out/vo_gpu_next.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index a75de75bc..6e92ab2a1 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -3820,9 +3820,10 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
+     struct pl_frame image = *(struct pl_frame *) mix.frames[0];
+     struct mp_image *mpi = image.user_data;
+ 
+-    // Clear reference luminance before taking a screenshot, we want screenshot
+-    // to be independent of the system reference luminance.
+-    if (!pl_color_transfer_is_hdr(image.color.transfer))
++    // Source screenshots are independent of the display's SDR white. Rendered
++    // (scaled/window) screenshots must keep the same white as live playback,
++    // including SDR carried in PQ, or they fall back to a different SDR peak.
++    if (!args->scaled && !pl_color_transfer_is_hdr(image.color.transfer))
+         image.color.hdr.max_luma = 0;
+ 
+     struct mp_rect src = p->src, dst = p->dst;
+-- 
+2.54.0.windows.1
+
